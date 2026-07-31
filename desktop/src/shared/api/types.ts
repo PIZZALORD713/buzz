@@ -103,27 +103,13 @@ export type AddChannelMembersResult = {
   }>;
 };
 
-export type Identity = {
-  pubkey: string;
-  displayName: string;
-  /** The app booted in identity-lost recovery because migration found no OS keyring key.
-   * Mutually exclusive with `locked`; route to nsec re-import. */
-  lost?: boolean;
-  /** The app is temporarily using an ephemeral key because the OS keyring is unreachable.
-   * The real key still exists; unlock externally and relaunch. Mutually exclusive with `lost`. */
-  locked?: boolean;
-  /** True when the boot-time Phase 2 reset attempted a wipe but verification
-   *  failed. Identity resolution was skipped; the sentinel is preserved so
-   *  the next relaunch retries the wipe automatically. */
-  resetFailed?: boolean;
-};
+export type { Identity, IdentityStorage } from "./identityTypes";
 
 export type Profile = {
   pubkey: string;
   displayName: string | null;
-  /** Relay-authoritative display identity bound to this pubkey. */
+  /** Relay-authoritative name, trusted until `verifiedNameExpiresAt`. */
   verifiedName?: string | null;
-  /** Unix timestamp (seconds) after which `verifiedName` is no longer trusted. */
   verifiedNameExpiresAt?: number | null;
   avatarUrl: string | null;
   about: string | null;
@@ -138,9 +124,8 @@ export type Profile = {
 
 export type UserProfileSummary = {
   displayName: string | null;
-  /** Relay-authoritative display identity bound to this pubkey. */
+  /** Relay-authoritative name, trusted until `verifiedNameExpiresAt`. */
   verifiedName?: string | null;
-  /** Unix timestamp (seconds) after which `verifiedName` is no longer trusted. */
   verifiedNameExpiresAt?: number | null;
   /** Kind-0 `name` field, kept separate from `displayName` so @mention text
    * can be matched against either alias (agents/CLI resolve mentions against
@@ -576,22 +561,10 @@ export type AcpRuntime = AcpRuntimeCatalogEntry & {
   binaryPath: string;
 };
 
-export type InstallStepResult = {
-  step: string;
-  command: string;
-  success: boolean;
-  stdout: string;
-  stderr: string;
-  exitCode: number | null;
-  hint?: string;
-};
-
-export type InstallRuntimeResult = {
-  success: boolean;
-  steps: InstallStepResult[];
-  restartedCount: number;
-  failedRestartCount: number;
-};
+export type {
+  InstallRuntimeResult,
+  InstallStepResult,
+} from "./installTypes";
 
 export type AcpAuthMethod = {
   id: string;
@@ -1009,10 +982,9 @@ export type ThreadRepliesResponse = {
 };
 
 /**
- * Composite backward keyset cursor for channel-timeline paging via
- * `getChannelMessagesBefore`. The relay orders `created_at DESC, id ASC`; the
- * event-id tiebreak advances through a second denser than one page. A timestamp-
- * only cursor would re-return the same slice forever.
+ * Composite backward cursor for `getChannelMessagesBefore`, ordered
+ * `created_at DESC, id ASC`. The event id advances through dense seconds;
+ * a timestamp-only cursor would re-return the same slice forever.
  */
 export type ChannelPageCursor = {
   createdAt: number;
