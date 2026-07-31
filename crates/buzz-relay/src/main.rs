@@ -350,6 +350,9 @@ async fn main() -> anyhow::Result<()> {
         let audit_pool = sqlx::postgres::PgPoolOptions::new()
             .max_connections(5)
             .min_connections(1)
+            .after_connect(|connection, _meta| {
+                Box::pin(buzz_db::apply_runtime_connection_timeouts(connection))
+            })
             .connect(&config.database_url)
             .await
             .map_err(|e| anyhow::anyhow!("Audit DB connection failed: {e}"))?;
@@ -404,6 +407,9 @@ async fn main() -> anyhow::Result<()> {
         .as_deref()
         .unwrap_or(&config.database_url);
     let search_pool = sqlx::postgres::PgPoolOptions::new()
+        .after_connect(|connection, _meta| {
+            Box::pin(buzz_db::apply_runtime_connection_timeouts(connection))
+        })
         .connect(search_db_url)
         .await
         .map_err(|e| anyhow::anyhow!("Search DB connection failed: {e}"))?;

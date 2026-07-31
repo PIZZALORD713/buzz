@@ -65,6 +65,27 @@ use uuid::Uuid;
 
 use buzz_core::{CommunityId, StoredEvent};
 
+/// Maximum time a runtime query may execute before Postgres cancels it.
+pub const RUNTIME_STATEMENT_TIMEOUT: &str = "30s";
+/// Maximum time a runtime query may wait to acquire a lock.
+pub const RUNTIME_LOCK_TIMEOUT: &str = "5s";
+
+/// Apply the runtime safety limits shared by writer, reader, audit, and search
+/// pools.
+pub async fn apply_runtime_connection_timeouts(
+    connection: &mut PgConnection,
+) -> std::result::Result<(), sqlx::Error> {
+    sqlx::query(
+        "SELECT set_config('statement_timeout', $1, false), \
+                set_config('lock_timeout', $2, false)",
+    )
+    .bind(RUNTIME_STATEMENT_TIMEOUT)
+    .bind(RUNTIME_LOCK_TIMEOUT)
+    .execute(connection)
+    .await?;
+    Ok(())
+}
+
 fn event_replacement_lock_key(
     community_id: CommunityId,
     kind: i32,
@@ -682,18 +703,19 @@ impl Db {
             .acquire_timeout(Duration::from_secs(config.acquire_timeout_secs))
             .max_lifetime(Duration::from_secs(config.max_lifetime_secs))
             .idle_timeout(Duration::from_secs(config.idle_timeout_secs));
-        if arm_floor_guard {
-            options = options.after_connect(|conn, _meta| {
-                Box::pin(async move {
+        options = options.after_connect(move |conn, _meta| {
+            Box::pin(async move {
+                apply_runtime_connection_timeouts(conn).await?;
+                if arm_floor_guard {
                     // `SET` cannot take bind parameters; `set_config` can.
                     sqlx::query("SELECT set_config('buzz.created_at_floor', $1, false)")
                         .bind(replica_fence::CREATED_AT_FLOOR_SECS.to_string())
                         .execute(conn)
                         .await?;
-                    Ok(())
-                })
-            });
-        }
+                }
+                Ok(())
+            })
+        });
         Ok(options.connect(url).await?)
     }
 
@@ -8325,7 +8347,18 @@ mod tests {
         .expect("connect armed Db");
         let cid = CommunityId::from_uuid(community);
 
-        // Perci nit: assert the effective session value, not the intent.
+        // Assert the effective session values, not only pool-builder intent.
+        let statement_timeout: String = sqlx::query_scalar("SHOW statement_timeout")
+            .fetch_one(&db.pool)
+            .await
+            .expect("SHOW statement_timeout");
+        let lock_timeout: String = sqlx::query_scalar("SHOW lock_timeout")
+            .fetch_one(&db.pool)
+            .await
+            .expect("SHOW lock_timeout");
+        assert_eq!(statement_timeout, RUNTIME_STATEMENT_TIMEOUT);
+        assert_eq!(lock_timeout, RUNTIME_LOCK_TIMEOUT);
+
         let effective: String = sqlx::query_scalar("SHOW buzz.created_at_floor")
             .fetch_one(&db.pool)
             .await
