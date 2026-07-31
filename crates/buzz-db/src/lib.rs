@@ -749,6 +749,9 @@ impl Db {
             .acquire_timeout(Self::READER_ACQUIRE_TIMEOUT)
             .max_lifetime(Duration::from_secs(config.max_lifetime_secs))
             .idle_timeout(Duration::from_secs(config.idle_timeout_secs))
+            .after_connect(|connection, _meta| {
+                Box::pin(apply_runtime_connection_timeouts(connection))
+            })
             .connect_lazy(url)?)
     }
 
@@ -8339,7 +8342,8 @@ mod tests {
         let idx = base.rfind('/').expect("db url has a path segment");
         let scratch_url = format!("{}/{}", &base[..idx], name);
         let db = Db::new(&DbConfig {
-            database_url: scratch_url,
+            database_url: scratch_url.clone(),
+            read_database_url: Some(scratch_url),
             max_connections: 2,
             ..DbConfig::default()
         })
@@ -8358,6 +8362,18 @@ mod tests {
             .expect("SHOW lock_timeout");
         assert_eq!(statement_timeout, RUNTIME_STATEMENT_TIMEOUT);
         assert_eq!(lock_timeout, RUNTIME_LOCK_TIMEOUT);
+
+        let read_pool = db.read_pool.as_ref().expect("read pool configured");
+        let reader_statement_timeout: String = sqlx::query_scalar("SHOW statement_timeout")
+            .fetch_one(read_pool)
+            .await
+            .expect("SHOW reader statement_timeout");
+        let reader_lock_timeout: String = sqlx::query_scalar("SHOW lock_timeout")
+            .fetch_one(read_pool)
+            .await
+            .expect("SHOW reader lock_timeout");
+        assert_eq!(reader_statement_timeout, RUNTIME_STATEMENT_TIMEOUT);
+        assert_eq!(reader_lock_timeout, RUNTIME_LOCK_TIMEOUT);
 
         let effective: String = sqlx::query_scalar("SHOW buzz.created_at_floor")
             .fetch_one(&db.pool)
