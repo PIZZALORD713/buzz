@@ -15,3 +15,4 @@ thiserror   = { workspace = true }
 
 [dev-dependencies]
 tokio       = { workspace = true }
+buzz-db     = { workspace = true }
