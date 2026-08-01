@@ -96,13 +96,17 @@ pub(crate) fn start(
 ) -> Result<LocalRelayRuntime, String> {
     let relay_port = requested_port.unwrap_or(free_loopback_port()?);
     let owner_pubkey = keys.public_key().to_hex();
+    let data_dir = local_data_dir(app, &owner_pubkey)?;
+    let relay_keys = load_or_create_relay_keys(&data_dir)?;
     let config = LocalRelayConfig {
         relay_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), relay_port),
         health_port: free_loopback_port()?,
         metrics_port: free_loopback_port()?,
-        data_dir: local_data_dir(app, &owner_pubkey)?,
+        data_dir,
         owner_pubkey,
-        relay_private_key: keys.secret_key().to_secret_hex(),
+        // Relay-originated events must have a separate service identity. The
+        // human key authorizes membership only and is never passed to the child.
+        relay_private_key: relay_keys.secret_key().to_secret_hex(),
     };
     let url = config.url();
     let media_dir = config.data_dir.join("media");
@@ -223,6 +227,26 @@ fn sqlite_url(path: &Path) -> String {
     format!("sqlite://{}", path.display())
 }
 
+/// Load the relay's service identity from its identity-scoped nest, or create
+/// it once with the same atomic, owner-only file semantics used for private
+/// desktop identities. This key signs relay-originated metadata; it is never
+/// the human/owner key supplied by `apply_workspace`.
+fn load_or_create_relay_keys(data_dir: &Path) -> Result<Keys, String> {
+    let path = data_dir.join("relay-service.key");
+    if path.exists() {
+        let value = std::fs::read_to_string(&path)
+            .map_err(|e| format!("read local relay service key: {e}"))?;
+        return Keys::parse(value.trim())
+            .map_err(|e| format!("parse local relay service key: {e}"));
+    }
+
+    std::fs::create_dir_all(data_dir).map_err(|e| format!("create local relay data dir: {e}"))?;
+    let keys = Keys::generate();
+    crate::app_state::save_key_file(&path, &keys)
+        .map_err(|e| format!("persist local relay service key: {e}"))?;
+    Ok(keys)
+}
+
 fn free_loopback_port() -> Result<u16, String> {
     let listener =
         TcpListener::bind("127.0.0.1:0").map_err(|e| format!("pick local relay port: {e}"))?;
@@ -256,7 +280,8 @@ fn relay_binary() -> Result<PathBuf, String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        is_local_relay_url, local_relay_url, sqlite_url, LocalRelayConfig, LOCAL_RELAY_SENTINEL,
+        is_local_relay_url, load_or_create_relay_keys, local_relay_url, sqlite_url,
+        LocalRelayConfig, LOCAL_RELAY_SENTINEL,
     };
     use std::{
         collections::HashMap,
@@ -279,6 +304,27 @@ mod tests {
         assert!(!is_local_relay_url("ws://127.0.0.1:4317"));
         assert!(!is_local_relay_url("ws://localhost:4317"));
         assert!(!is_local_relay_url("wss://127.0.0.1:4317"));
+    }
+
+    #[test]
+    fn relay_service_key_is_durable_and_distinct_from_owner_identity() {
+        let directory = tempfile::tempdir().expect("temp data dir");
+        let owner = nostr::Keys::generate();
+        let first = load_or_create_relay_keys(directory.path()).expect("create service key");
+        let second = load_or_create_relay_keys(directory.path()).expect("reload service key");
+
+        assert_ne!(first.public_key(), owner.public_key());
+        assert_eq!(first.public_key(), second.public_key());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(directory.path().join("relay-service.key"))
+                .expect("service key metadata")
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o600);
+        }
     }
 
     #[test]

@@ -14,6 +14,11 @@ export function isLocalCommunityRelayUrl(relayUrl: string): boolean {
   return relayUrl === LOCAL_COMMUNITY_RELAY_URL;
 }
 
+/** Stored local sentinel is never a network endpoint. */
+export function hasCommunityNetworkEndpoint(relayUrl: string): boolean {
+  return !isLocalCommunityRelayUrl(relayUrl);
+}
+
 /**
  * Expand a leading `~` to the user's home directory. The backend rejects
  * `~`-prefixed paths (`std::fs` does not expand the shell tilde), so the UI

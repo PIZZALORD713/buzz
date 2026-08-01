@@ -2,6 +2,7 @@ import { useQueries, useQuery } from "@tanstack/react-query";
 
 import { fetchCommunityIcon } from "@/shared/api/communityProfile";
 
+import { isLocalCommunityRelayUrl } from "./communityStorage";
 import type { Community } from "./types";
 import {
   loadCachedCommunityIcon,
@@ -22,9 +23,13 @@ async function fetchIconForCommunity(
 }
 
 function iconQueryOptions(community: Community) {
+  const local = isLocalCommunityRelayUrl(community.relayUrl);
   return {
     queryKey: communityIconQueryKey(community.relayUrl),
     queryFn: () => fetchIconForCommunity(community),
+    // A local sentinel is storage-only and has no HTTP origin. Its active
+    // relay is resolved privately by desktop; inactive local mode is stopped.
+    enabled: !local,
     // Cached icon renders immediately; the fetch still runs and replaces it.
     placeholderData: loadCachedCommunityIcon(community.relayUrl),
     staleTime: ICON_STALE_MS,
@@ -55,6 +60,7 @@ export function useCommunityIcons(
 
 /** Icon of the ACTIVE community, for settings preview. */
 export function useActiveCommunityIcon(relayUrl: string | undefined) {
+  const local = relayUrl !== undefined && isLocalCommunityRelayUrl(relayUrl);
   return useQuery({
     queryKey: communityIconQueryKey(relayUrl ?? ""),
     queryFn: async () => {
@@ -62,7 +68,7 @@ export function useActiveCommunityIcon(relayUrl: string | undefined) {
       if (relayUrl) saveCachedCommunityIcon(relayUrl, icon);
       return icon;
     },
-    enabled: relayUrl !== undefined,
+    enabled: relayUrl !== undefined && !local,
     staleTime: ICON_STALE_MS,
   });
 }

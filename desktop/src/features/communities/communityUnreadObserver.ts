@@ -19,6 +19,7 @@ import {
   mutedChannelIdsFromStore,
   parseMutePayload,
 } from "@/features/sidebar/lib/channelMutesStorage";
+import { hasCommunityNetworkEndpoint } from "@/features/communities/communityStorage";
 import type { Community } from "@/features/communities/types";
 import { withReadOnlyRelayClient } from "@/shared/api/readOnlyRelayClient";
 import type { RelaySubscriptionFilter } from "@/shared/api/relayClientShared";
@@ -148,6 +149,12 @@ export async function pollCommunityUnread(
   community: Community,
   pubkey: string,
 ): Promise<CommunityUnreadObserverResult> {
+  // Local mode owns exactly one active sidecar. An inactive local community has
+  // no durable network endpoint: its stored sentinel must never reach a relay
+  // client. The active workspace already receives ordinary unread handling.
+  if (!hasCommunityNetworkEndpoint(community.relayUrl)) {
+    return { hasUnread: false, mentionCount: 0 };
+  }
   return withReadOnlyRelayClient(community.relayUrl, (client) =>
     fetchCommunityUnread({ client, pubkey }),
   );

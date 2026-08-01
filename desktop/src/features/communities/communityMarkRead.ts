@@ -1,4 +1,5 @@
 import { READ_STATE_MAX_PLAINTEXT_BYTES } from "@/features/channels/readState/readStateFormat";
+import { hasCommunityNetworkEndpoint } from "@/features/communities/communityStorage";
 import type { Community } from "@/features/communities/types";
 import { fetchObservedChannels } from "@/features/communities/communityUnreadObserver";
 import { withReadOnlyRelayClient } from "@/shared/api/readOnlyRelayClient";
@@ -120,6 +121,9 @@ export async function markCommunityRead(
   community: Community,
   pubkey: string,
 ): Promise<void> {
+  // The sentinel is storage-only. Inactive local communities do not run a
+  // sidecar, so they cannot receive a background read-state publication.
+  if (!hasCommunityNetworkEndpoint(community.relayUrl)) return;
   await withReadOnlyRelayClient(community.relayUrl, (client) =>
     publishCommunityReadState({
       client,

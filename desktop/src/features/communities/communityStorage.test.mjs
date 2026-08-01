@@ -4,6 +4,7 @@ import test from "node:test";
 import {
   clearCommunityStorage,
   deriveCommunityName,
+  hasCommunityNetworkEndpoint,
   initFirstCommunity,
   isLocalCommunityRelayUrl,
   LOCAL_COMMUNITY_NAME,
@@ -61,6 +62,8 @@ test("only the local sentinel identifies the desktop-managed workspace", () => {
   );
   assert.equal(isLocalCommunityRelayUrl("ws://127.0.0.1:4317"), false);
   assert.equal(isLocalCommunityRelayUrl("ws://localhost:4317"), false);
+  assert.equal(hasCommunityNetworkEndpoint(LOCAL_COMMUNITY_RELAY_URL), false);
+  assert.equal(hasCommunityNetworkEndpoint("ws://127.0.0.1:4317"), true);
 });
 
 test("signed-build relay defaults auto-connect during first-run onboarding", () => {
