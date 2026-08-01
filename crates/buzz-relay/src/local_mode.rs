@@ -140,13 +140,18 @@ async fn serve_socket(socket: WebSocket, state: LocalState) {
                                 continue;
                             }
                         };
-                        let inserted = sqlx::query("INSERT OR IGNORE INTO events (id, event_json) VALUES (?, ?)")
+                        let inserted = match sqlx::query("INSERT OR IGNORE INTO events (id, event_json) VALUES (?, ?)")
                             .bind(&id)
                             .bind(event_json)
                             .execute(&state.db)
                             .await
-                            .map(|result| result.rows_affected() == 1)
-                            .unwrap_or(false);
+                        {
+                            Ok(result) => result.rows_affected() == 1,
+                            Err(error) => {
+                                let _ = tx.send(Message::Text(RelayMessage::ok(&id, false, &format!("error: {error}")).into())).await;
+                                continue;
+                            }
+                        };
                         if inserted { let _ = state.fanout.send(event); }
                         let _ = tx.send(Message::Text(RelayMessage::ok(&id, true, if inserted { "" } else { "duplicate" }).into())).await;
                     }
