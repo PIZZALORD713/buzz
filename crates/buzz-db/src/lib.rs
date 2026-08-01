@@ -4774,8 +4774,21 @@ impl Db {
         ttl_secs: u64,
         max_uses: Option<i32>,
     ) -> Result<relay_invite::MintedInvite> {
-        relay_invite::mint_relay_invite(self.pg_pool()?, community, created_by, ttl_secs, max_uses)
-            .await
+        match &self.backend {
+            DbBackend::SQLite(pool) => {
+                sqlite::mint_relay_invite(pool, community, created_by, ttl_secs, max_uses).await
+            }
+            DbBackend::Postgres => {
+                relay_invite::mint_relay_invite(
+                    self.pg_pool()?,
+                    community,
+                    created_by,
+                    ttl_secs,
+                    max_uses,
+                )
+                .await
+            }
+        }
     }
 
     /// Delete one bounded batch of invites expired before `cutoff`.
@@ -4783,7 +4796,12 @@ impl Db {
         &self,
         cutoff: chrono::DateTime<chrono::Utc>,
     ) -> Result<u64> {
-        relay_invite::reap_expired_relay_invites(self.pg_pool()?, cutoff).await
+        match &self.backend {
+            DbBackend::SQLite(pool) => sqlite::reap_expired_relay_invites(pool, cutoff).await,
+            DbBackend::Postgres => {
+                relay_invite::reap_expired_relay_invites(self.pg_pool()?, cutoff).await
+            }
+        }
     }
 
     /// Atomically claims a v2 relay invite. The full redemption (membership
@@ -4798,14 +4816,28 @@ impl Db {
         claimer_pubkey: &str,
         policy_version: Option<&str>,
     ) -> Result<relay_invite::ClaimOutcome> {
-        relay_invite::claim_relay_invite(
-            self.pg_pool()?,
-            community,
-            token_hash,
-            claimer_pubkey,
-            policy_version,
-        )
-        .await
+        match &self.backend {
+            DbBackend::SQLite(pool) => {
+                sqlite::claim_relay_invite(
+                    pool,
+                    community,
+                    token_hash,
+                    claimer_pubkey,
+                    policy_version,
+                )
+                .await
+            }
+            DbBackend::Postgres => {
+                relay_invite::claim_relay_invite(
+                    self.pg_pool()?,
+                    community,
+                    token_hash,
+                    claimer_pubkey,
+                    policy_version,
+                )
+                .await
+            }
+        }
     }
 
     /// Sidecar an accepted product-feedback event, idempotent by event id.

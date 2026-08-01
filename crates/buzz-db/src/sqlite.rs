@@ -273,7 +273,22 @@ pub(crate) async fn migrate(pool: &SqlitePool) -> Result<()> {
         tx.commit().await?;
         version = 6;
     }
-    if version != 6 {
+    if version < 8 {
+        let mut tx = pool.begin().await?;
+        for statement in [
+            "CREATE TABLE IF NOT EXISTS relay_invites (community_id TEXT NOT NULL, id TEXT NOT NULL, token_hash BLOB NOT NULL, max_uses INTEGER, use_count INTEGER NOT NULL DEFAULT 0, expires_at INTEGER NOT NULL, created_by TEXT NOT NULL, PRIMARY KEY (community_id, id), UNIQUE (community_id, token_hash), FOREIGN KEY (community_id) REFERENCES communities(id) ON DELETE CASCADE)",
+            "CREATE INDEX IF NOT EXISTS idx_relay_invites_expires ON relay_invites (expires_at)",
+            "CREATE TABLE IF NOT EXISTS join_policy_acceptances (community_id TEXT NOT NULL, pubkey TEXT NOT NULL, policy_version TEXT NOT NULL, accepted_at INTEGER NOT NULL DEFAULT (unixepoch()), PRIMARY KEY (community_id, pubkey, policy_version), FOREIGN KEY (community_id) REFERENCES communities(id) ON DELETE CASCADE)",
+        ] {
+            sqlx::query(statement).execute(&mut *tx).await?;
+        }
+        sqlx::query("UPDATE schema_version SET version = 8 WHERE singleton = 1")
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        version = 8;
+    }
+    if version != 8 {
         return Err(crate::DbError::InvalidData(format!(
             "unsupported SQLite schema version {version}"
         )));
@@ -1216,6 +1231,112 @@ fn api_token_record(row: sqlx::sqlite::SqliteRow) -> Result<crate::ApiTokenRecor
         revoked_at: optional_timestamp(row.try_get("revoked_at")?)?,
     })
 }
+pub(crate) async fn mint_relay_invite(
+    pool: &SqlitePool,
+    community: CommunityId,
+    created_by: &str,
+    ttl_secs: u64,
+    max_uses: Option<i32>,
+) -> Result<crate::relay_invite::MintedInvite> {
+    if !(buzz_core::invite::MIN_INVITE_TTL_SECS..=buzz_core::invite::MAX_INVITE_TTL_SECS)
+        .contains(&ttl_secs)
+        || max_uses.is_some_and(|n| !(1..=buzz_core::invite::MAX_INVITE_USES).contains(&n))
+    {
+        return Err(crate::DbError::InvalidData(
+            "invalid relay invite parameters".into(),
+        ));
+    }
+    let secret: [u8; buzz_core::invite::V2_SECRET_LEN] = rand::random();
+    let code = buzz_core::invite::encode_v2_code(&secret);
+    let hash = buzz_core::invite::hash_v2_code(&code);
+    let expires_at = chrono::Utc::now() + chrono::Duration::seconds(ttl_secs as i64);
+    let id = Uuid::new_v4();
+    sqlx::query("INSERT INTO relay_invites (community_id, id, token_hash, max_uses, expires_at, created_by) VALUES (?1, ?2, ?3, ?4, ?5, ?6)")
+        .bind(community.as_uuid().to_string()).bind(id.to_string()).bind(hash.as_slice()).bind(max_uses).bind(expires_at.timestamp()).bind(created_by).execute(pool).await?;
+    Ok(crate::relay_invite::MintedInvite {
+        code,
+        expires_at,
+        max_uses,
+        uses_remaining: max_uses,
+        invite_id: id,
+    })
+}
+
+pub(crate) async fn reap_expired_relay_invites(
+    pool: &SqlitePool,
+    cutoff: chrono::DateTime<chrono::Utc>,
+) -> Result<u64> {
+    Ok(sqlx::query("DELETE FROM relay_invites WHERE rowid IN (SELECT rowid FROM relay_invites WHERE expires_at < ?1 ORDER BY expires_at LIMIT 1000)").bind(cutoff.timestamp()).execute(pool).await?.rows_affected())
+}
+
+pub(crate) async fn claim_relay_invite(
+    pool: &SqlitePool,
+    community: CommunityId,
+    token_hash: &[u8; 32],
+    claimer: &str,
+    policy_version: Option<&str>,
+) -> Result<crate::relay_invite::ClaimOutcome> {
+    let mut tx = pool.begin().await?;
+    let row = sqlx::query("SELECT id, max_uses, use_count, expires_at FROM relay_invites WHERE community_id = ?1 AND token_hash = ?2")
+        .bind(community.as_uuid().to_string()).bind(token_hash.as_slice()).fetch_optional(&mut *tx).await?;
+    let Some(row) = row else {
+        tx.rollback().await?;
+        return Ok(crate::relay_invite::ClaimOutcome::Invalid);
+    };
+    let id: String = row.get("id");
+    let max_uses: Option<i32> = row.try_get("max_uses")?;
+    let use_count: i32 = row.get("use_count");
+    let expires_at: i64 = row.get("expires_at");
+    if expires_at <= chrono::Utc::now().timestamp() {
+        tx.rollback().await?;
+        return Ok(crate::relay_invite::ClaimOutcome::Expired);
+    }
+    let remaining = || max_uses.map(|n| n - use_count);
+    let existing =
+        sqlx::query("SELECT 1 FROM relay_members WHERE community_id = ?1 AND pubkey = ?2")
+            .bind(community.as_uuid().to_string())
+            .bind(claimer)
+            .fetch_optional(&mut *tx)
+            .await?
+            .is_some();
+    if existing {
+        if let Some(version) = policy_version {
+            sqlx::query("INSERT INTO join_policy_acceptances (community_id, pubkey, policy_version) VALUES (?1, ?2, ?3) ON CONFLICT DO NOTHING").bind(community.as_uuid().to_string()).bind(claimer).bind(version).execute(&mut *tx).await?;
+        }
+        tx.commit().await?;
+        return Ok(crate::relay_invite::ClaimOutcome::AlreadyMember {
+            use_count,
+            uses_remaining: remaining(),
+        });
+    }
+    if max_uses.is_some_and(|n| use_count >= n) {
+        tx.rollback().await?;
+        return Ok(crate::relay_invite::ClaimOutcome::Exhausted);
+    }
+    let inserted = sqlx::query("INSERT INTO relay_members (community_id, pubkey, role, added_by) VALUES (?1, lower(?2), 'member', 'invite') ON CONFLICT DO NOTHING").bind(community.as_uuid().to_string()).bind(claimer).execute(&mut *tx).await?.rows_affected() > 0;
+    if let Some(version) = policy_version {
+        sqlx::query("INSERT INTO join_policy_acceptances (community_id, pubkey, policy_version) VALUES (?1, ?2, ?3) ON CONFLICT DO NOTHING").bind(community.as_uuid().to_string()).bind(claimer).bind(version).execute(&mut *tx).await?;
+    }
+    if !inserted {
+        tx.commit().await?;
+        return Ok(crate::relay_invite::ClaimOutcome::AlreadyMember {
+            use_count,
+            uses_remaining: remaining(),
+        });
+    }
+    let new_count = use_count + 1;
+    sqlx::query("UPDATE relay_invites SET use_count = ?1 WHERE community_id = ?2 AND id = ?3")
+        .bind(new_count)
+        .bind(community.as_uuid().to_string())
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(crate::relay_invite::ClaimOutcome::Joined {
+        use_count: new_count,
+        uses_remaining: max_uses.map(|n| n - new_count),
+    })
+}
 pub(crate) async fn repo_name_owner(
     pool: &SqlitePool,
     community: CommunityId,
@@ -1903,7 +2024,7 @@ mod tests {
                 .fetch_one(&upgraded)
                 .await
                 .unwrap(),
-            6
+            8
         );
         for (table, column) in [
             ("channels", "participant_hash"),
@@ -2030,7 +2151,7 @@ mod tests {
                 .fetch_one(&upgraded)
                 .await
                 .unwrap(),
-            6
+            8
         );
         assert_eq!(
             sqlx::query_scalar::<_, i64>(
