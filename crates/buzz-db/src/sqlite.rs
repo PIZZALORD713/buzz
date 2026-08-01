@@ -121,6 +121,16 @@ CREATE INDEX IF NOT EXISTS idx_events_community_kind
 CREATE INDEX IF NOT EXISTS idx_events_channel_created
     ON events (community_id, channel_id, created_at DESC);
 
+CREATE TABLE IF NOT EXISTS pubkey_allowlist (
+    community_id TEXT NOT NULL,
+    pubkey BLOB NOT NULL,
+    added_by BLOB NOT NULL,
+    added_at INTEGER NOT NULL DEFAULT (unixepoch()),
+    note TEXT,
+    PRIMARY KEY (community_id, pubkey),
+    FOREIGN KEY (community_id) REFERENCES communities(id) ON DELETE CASCADE
+);
+
 CREATE TABLE IF NOT EXISTS reactions (
     community_id TEXT NOT NULL,
     event_created_at INTEGER NOT NULL,
@@ -3968,6 +3978,89 @@ pub(crate) async fn is_agent_owner(
     .await? != 0)
 }
 
+pub(crate) async fn is_pubkey_allowed(
+    pool: &SqlitePool,
+    community: CommunityId,
+    pubkey: &[u8],
+) -> Result<bool> {
+    Ok(sqlx::query_scalar::<_, i64>(
+        "SELECT count(*) FROM pubkey_allowlist WHERE community_id = ?1 AND pubkey = ?2",
+    )
+    .bind(community.as_uuid().to_string())
+    .bind(pubkey)
+    .fetch_one(pool)
+    .await?
+        != 0)
+}
+
+pub(crate) async fn has_allowlist_entries(
+    pool: &SqlitePool,
+    community: CommunityId,
+) -> Result<bool> {
+    Ok(sqlx::query_scalar::<_, i64>(
+        "SELECT count(*) FROM pubkey_allowlist WHERE community_id = ?1",
+    )
+    .bind(community.as_uuid().to_string())
+    .fetch_one(pool)
+    .await?
+        != 0)
+}
+
+pub(crate) async fn add_to_allowlist(
+    pool: &SqlitePool,
+    community: CommunityId,
+    pubkey: &[u8],
+    added_by: &[u8],
+    note: Option<&str>,
+) -> Result<bool> {
+    Ok(sqlx::query("INSERT INTO pubkey_allowlist (community_id,pubkey,added_by,note) VALUES (?1,?2,?3,?4) ON CONFLICT DO NOTHING")
+        .bind(community.as_uuid().to_string())
+        .bind(pubkey)
+        .bind(added_by)
+        .bind(note)
+        .execute(pool)
+        .await?
+        .rows_affected() == 1)
+}
+
+pub(crate) async fn remove_from_allowlist(
+    pool: &SqlitePool,
+    community: CommunityId,
+    pubkey: &[u8],
+) -> Result<bool> {
+    Ok(
+        sqlx::query("DELETE FROM pubkey_allowlist WHERE community_id = ?1 AND pubkey = ?2")
+            .bind(community.as_uuid().to_string())
+            .bind(pubkey)
+            .execute(pool)
+            .await?
+            .rows_affected()
+            == 1,
+    )
+}
+
+pub(crate) async fn list_allowlist(
+    pool: &SqlitePool,
+    community: CommunityId,
+) -> Result<Vec<crate::AllowlistEntry>> {
+    sqlx::query("SELECT pubkey,added_by,added_at,note FROM pubkey_allowlist WHERE community_id = ?1 ORDER BY added_at DESC")
+        .bind(community.as_uuid().to_string())
+        .fetch_all(pool)
+        .await?
+        .into_iter()
+        .map(|row| {
+            let added_at: i64 = row.try_get("added_at")?;
+            Ok(crate::AllowlistEntry {
+                pubkey: row.try_get("pubkey")?,
+                added_by: row.try_get("added_by")?,
+                added_at: chrono::DateTime::from_timestamp(added_at, 0)
+                    .ok_or(crate::DbError::InvalidTimestamp(added_at))?,
+                note: row.try_get("note")?,
+            })
+        })
+        .collect()
+}
+
 pub(crate) async fn is_relay_member(
     pool: &SqlitePool,
     community: CommunityId,
@@ -4487,6 +4580,40 @@ mod tests {
         );
         upgraded.close().await;
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn allowlist_is_idempotent_and_community_scoped() {
+        let pool = connect("sqlite::memory:").await.unwrap();
+        let a = ensure_configured_community(&pool, "allowlist-a.example")
+            .await
+            .unwrap()
+            .id;
+        let b = ensure_configured_community(&pool, "allowlist-b.example")
+            .await
+            .unwrap()
+            .id;
+        let pubkey = vec![1_u8; 32];
+        let actor = vec![2_u8; 32];
+        assert!(!has_allowlist_entries(&pool, a).await.unwrap());
+        assert!(add_to_allowlist(&pool, a, &pubkey, &actor, Some("a-only"))
+            .await
+            .unwrap());
+        assert!(
+            !add_to_allowlist(&pool, a, &pubkey, &actor, Some("duplicate"))
+                .await
+                .unwrap()
+        );
+        assert!(is_pubkey_allowed(&pool, a, &pubkey).await.unwrap());
+        assert!(!is_pubkey_allowed(&pool, b, &pubkey).await.unwrap());
+        assert!(has_allowlist_entries(&pool, a).await.unwrap());
+        assert!(!has_allowlist_entries(&pool, b).await.unwrap());
+        let entries = list_allowlist(&pool, a).await.unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].note.as_deref(), Some("a-only"));
+        assert!(!remove_from_allowlist(&pool, b, &pubkey).await.unwrap());
+        assert!(remove_from_allowlist(&pool, a, &pubkey).await.unwrap());
+        assert!(!has_allowlist_entries(&pool, a).await.unwrap());
     }
 
     #[tokio::test]
