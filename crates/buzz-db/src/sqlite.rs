@@ -2949,6 +2949,464 @@ pub(crate) async fn get_member_role(
         .bind(community.as_uuid().to_string()).bind(channel_id.to_string()).bind(pubkey).fetch_optional(pool).await?)
 }
 
+pub(crate) async fn create_channel(
+    pool: &SqlitePool,
+    community: CommunityId,
+    name: &str,
+    channel_type: crate::channel::ChannelType,
+    visibility: crate::channel::ChannelVisibility,
+    description: Option<&str>,
+    created_by: &[u8],
+    ttl_seconds: Option<i32>,
+) -> Result<crate::channel::ChannelRecord> {
+    let id = Uuid::new_v4();
+    create_channel_with_id(
+        pool,
+        community,
+        id,
+        name,
+        channel_type,
+        visibility,
+        description,
+        created_by,
+        ttl_seconds,
+    )
+    .await
+    .map(|(r, _)| r)
+}
+
+pub(crate) async fn get_canvas(
+    pool: &SqlitePool,
+    community: CommunityId,
+    channel_id: Uuid,
+) -> Result<Option<String>> {
+    Ok(sqlx::query_scalar(
+        "SELECT canvas FROM channels WHERE community_id = ?1 AND id = ?2 AND deleted_at IS NULL",
+    )
+    .bind(community.as_uuid().to_string())
+    .bind(channel_id.to_string())
+    .fetch_optional(pool)
+    .await?
+    .flatten())
+}
+
+pub(crate) async fn set_canvas(
+    pool: &SqlitePool,
+    community: CommunityId,
+    channel_id: Uuid,
+    canvas: Option<&str>,
+) -> Result<()> {
+    let n = sqlx::query("UPDATE channels SET canvas = ?1, updated_at = unixepoch() WHERE community_id = ?2 AND id = ?3 AND deleted_at IS NULL")
+        .bind(canvas).bind(community.as_uuid().to_string()).bind(channel_id.to_string()).execute(pool).await?.rows_affected();
+    if n == 0 {
+        return Err(crate::DbError::ChannelNotFound(channel_id));
+    }
+    Ok(())
+}
+
+pub(crate) async fn remove_member(
+    pool: &SqlitePool,
+    community: CommunityId,
+    channel_id: Uuid,
+    pubkey: &[u8],
+    actor: &[u8],
+) -> Result<()> {
+    let mut tx = pool.begin().await?;
+    let cid = community.as_uuid().to_string();
+    let chid = channel_id.to_string();
+    let is_self = pubkey == actor;
+    if !is_self {
+        let actor_role: Option<String> = sqlx::query_scalar("SELECT cm.role FROM channel_members cm JOIN channels c ON c.id=cm.channel_id AND c.community_id=?1 WHERE cm.channel_id=?2 AND cm.pubkey=?3 AND cm.removed_at IS NULL AND c.deleted_at IS NULL")
+            .bind(&cid).bind(&chid).bind(actor).fetch_optional(&mut *tx).await?;
+        let agent_owner: i64 = sqlx::query_scalar("SELECT count(*) FROM users WHERE community_id=?1 AND pubkey=?2 AND agent_owner_pubkey=?3")
+            .bind(&cid).bind(pubkey).bind(actor).fetch_one(&mut *tx).await?;
+        let elevated = matches!(actor_role.as_deref(), Some("owner" | "admin"));
+        if !elevated && agent_owner == 0 {
+            return Err(crate::DbError::AccessDenied(
+                "only owners/admins or the agent's owner may remove other members".into(),
+            ));
+        }
+    }
+    let target_role: Option<String> = sqlx::query_scalar(
+        "SELECT role FROM channel_members WHERE channel_id=?1 AND pubkey=?2 AND removed_at IS NULL",
+    )
+    .bind(&chid)
+    .bind(pubkey)
+    .fetch_optional(&mut *tx)
+    .await?;
+    if target_role.is_none() {
+        return Err(crate::DbError::MemberNotFound(channel_id));
+    }
+    if target_role.as_deref() == Some("owner") {
+        let count: i64 = sqlx::query_scalar("SELECT count(*) FROM channel_members WHERE channel_id=?1 AND role='owner' AND removed_at IS NULL").bind(&chid).fetch_one(&mut *tx).await?;
+        if count <= 1 {
+            return Err(crate::DbError::AccessDenied(
+                "cannot remove the last owner — transfer ownership first".into(),
+            ));
+        }
+    }
+    let n = sqlx::query("UPDATE channel_members SET removed_at=unixepoch() WHERE channel_id=?1 AND pubkey=?2 AND removed_at IS NULL").bind(&chid).bind(pubkey).execute(&mut *tx).await?.rows_affected();
+    if n == 0 {
+        return Err(crate::DbError::MemberNotFound(channel_id));
+    }
+    tx.commit().await?;
+    Ok(())
+}
+
+pub(crate) async fn membership_pairs(
+    pool: &SqlitePool,
+    community: CommunityId,
+    channel_ids: &[Uuid],
+    pubkeys: &[Vec<u8>],
+) -> Result<Vec<(Uuid, Vec<u8>)>> {
+    if channel_ids.is_empty() || pubkeys.is_empty() {
+        return Ok(Vec::new());
+    }
+    let ids = channel_ids
+        .iter()
+        .map(|_| "?")
+        .collect::<Vec<_>>()
+        .join(",");
+    let keys = pubkeys.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+    let sql = format!("SELECT cm.channel_id,cm.pubkey FROM channel_members cm JOIN channels c ON c.id=cm.channel_id AND c.community_id=? AND c.deleted_at IS NULL WHERE cm.channel_id IN ({ids}) AND cm.pubkey IN ({keys}) AND cm.removed_at IS NULL");
+    let mut q = sqlx::query(sqlx::AssertSqlSafe(sql)).bind(community.as_uuid().to_string());
+    for id in channel_ids {
+        q = q.bind(id.to_string());
+    }
+    for pk in pubkeys {
+        q = q.bind(pk);
+    }
+    let mut out = Vec::new();
+    for r in q.fetch_all(pool).await? {
+        let id: String = r.try_get("channel_id")?;
+        out.push((
+            Uuid::parse_str(&id).map_err(|e| crate::DbError::InvalidData(e.to_string()))?,
+            r.try_get("pubkey")?,
+        ));
+    }
+    Ok(out)
+}
+
+pub(crate) async fn get_members_bulk(
+    pool: &SqlitePool,
+    community: CommunityId,
+    channel_ids: &[Uuid],
+) -> Result<Vec<crate::channel::MemberRecord>> {
+    if channel_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let ids = channel_ids
+        .iter()
+        .map(|_| "?")
+        .collect::<Vec<_>>()
+        .join(",");
+    let sql=format!("SELECT cm.channel_id,cm.pubkey,cm.role,cm.joined_at,cm.invited_by,cm.removed_at FROM channel_members cm JOIN channels c ON c.id=cm.channel_id AND c.community_id=? AND c.deleted_at IS NULL WHERE cm.channel_id IN ({ids}) AND cm.removed_at IS NULL ORDER BY cm.joined_at ASC");
+    let mut q = sqlx::query(sqlx::AssertSqlSafe(sql)).bind(community.as_uuid().to_string());
+    for id in channel_ids {
+        q = q.bind(id.to_string());
+    }
+    q.fetch_all(pool)
+        .await?
+        .into_iter()
+        .map(member_record)
+        .collect()
+}
+
+pub(crate) async fn list_channels(
+    pool: &SqlitePool,
+    community: CommunityId,
+    visibility: Option<&str>,
+) -> Result<Vec<crate::channel::ChannelRecord>> {
+    let mut sql = "SELECT * FROM channels WHERE community_id=? AND deleted_at IS NULL".to_string();
+    if visibility.is_some() {
+        sql.push_str(" AND visibility=?");
+    }
+    sql.push_str(" ORDER BY created_at DESC LIMIT 1000");
+    let mut q = sqlx::query(sqlx::AssertSqlSafe(sql)).bind(community.as_uuid().to_string());
+    if let Some(v) = visibility {
+        q = q.bind(v);
+    }
+    q.fetch_all(pool)
+        .await?
+        .into_iter()
+        .map(channel_record)
+        .collect()
+}
+
+pub(crate) async fn get_accessible_channels(
+    pool: &SqlitePool,
+    community: CommunityId,
+    pubkey: &[u8],
+    visibility: Option<&str>,
+    member_only: Option<bool>,
+) -> Result<Vec<crate::channel::AccessibleChannel>> {
+    let mut sql="SELECT c.*, (cm.channel_id IS NOT NULL) AS is_member FROM channels c LEFT JOIN channel_members cm ON cm.channel_id=c.id AND cm.pubkey=? AND cm.removed_at IS NULL WHERE c.community_id=? AND c.deleted_at IS NULL AND (c.channel_type != 'dm' OR cm.hidden_at IS NULL)".to_string();
+    if member_only == Some(true) {
+        sql.push_str(" AND cm.channel_id IS NOT NULL");
+    } else {
+        sql.push_str(" AND (c.visibility='open' OR cm.channel_id IS NOT NULL)");
+    }
+    if visibility.is_some() {
+        sql.push_str(" AND c.visibility=?");
+    }
+    sql.push_str(" ORDER BY CASE c.channel_type WHEN 'stream' THEN 0 WHEN 'forum' THEN 1 WHEN 'dm' THEN 2 ELSE 3 END,c.name LIMIT 1000");
+    let mut q = sqlx::query(sqlx::AssertSqlSafe(sql))
+        .bind(pubkey)
+        .bind(community.as_uuid().to_string());
+    if let Some(v) = visibility {
+        q = q.bind(v);
+    }
+    let mut out = Vec::new();
+    for r in q.fetch_all(pool).await? {
+        let m = r.try_get::<i64, _>("is_member")? != 0;
+        out.push(crate::channel::AccessibleChannel {
+            channel: channel_record(r)?,
+            is_member: m,
+        });
+    }
+    Ok(out)
+}
+
+pub(crate) async fn get_bot_members(
+    pool: &SqlitePool,
+    community: CommunityId,
+) -> Result<Vec<crate::channel::BotMemberRecord>> {
+    let rows=sqlx::query("SELECT cm.pubkey,u.display_name FROM channel_members cm LEFT JOIN users u ON u.community_id=? AND u.pubkey=cm.pubkey JOIN channels c ON c.id=cm.channel_id AND c.deleted_at IS NULL WHERE c.community_id=? AND cm.role='bot' AND cm.removed_at IS NULL GROUP BY cm.pubkey,u.display_name LIMIT 1000").bind(community.as_uuid().to_string()).bind(community.as_uuid().to_string()).fetch_all(pool).await?;
+    let mut out = Vec::new();
+    for r in rows {
+        let pk = r.try_get("pubkey")?;
+        let chans=sqlx::query("SELECT c.name,c.id FROM channel_members cm JOIN channels c ON c.id=cm.channel_id WHERE c.community_id=? AND cm.pubkey=? AND cm.role='bot' AND cm.removed_at IS NULL AND c.deleted_at IS NULL ORDER BY c.name").bind(community.as_uuid().to_string()).bind(&pk).fetch_all(pool).await?;
+        let channels = chans
+            .into_iter()
+            .map(|x| {
+                Ok(crate::channel::BotChannelEntry {
+                    name: x.try_get("name")?,
+                    id: x.try_get("id")?,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        out.push(crate::channel::BotMemberRecord {
+            pubkey: pk,
+            display_name: r.try_get("display_name")?,
+            agent_type: None,
+            capabilities: None,
+            channels,
+        });
+    }
+    Ok(out)
+}
+
+pub(crate) async fn get_users_bulk(
+    pool: &SqlitePool,
+    community: CommunityId,
+    pubkeys: &[Vec<u8>],
+) -> Result<Vec<crate::channel::UserRecord>> {
+    if pubkeys.is_empty() {
+        return Ok(Vec::new());
+    }
+    let keys = pubkeys.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+    let mut q=sqlx::query(sqlx::AssertSqlSafe(format!("SELECT pubkey,display_name,avatar_url,nip05_handle FROM users WHERE community_id=? AND pubkey IN ({keys})"))).bind(community.as_uuid().to_string());
+    for pk in pubkeys {
+        q = q.bind(pk);
+    }
+    q.fetch_all(pool)
+        .await?
+        .into_iter()
+        .map(|r| {
+            Ok(crate::channel::UserRecord {
+                pubkey: r.try_get("pubkey")?,
+                display_name: r.try_get("display_name")?,
+                avatar_url: r.try_get("avatar_url")?,
+                nip05_handle: r.try_get("nip05_handle")?,
+            })
+        })
+        .collect()
+}
+
+fn channel_not_found_if_zero(n: u64, id: Uuid) -> Result<()> {
+    if n == 0 {
+        Err(crate::DbError::ChannelNotFound(id))
+    } else {
+        Ok(())
+    }
+}
+
+pub(crate) async fn update_channel(
+    pool: &SqlitePool,
+    community: CommunityId,
+    id: Uuid,
+    mut u: crate::channel::ChannelUpdate,
+) -> Result<crate::channel::ChannelRecord> {
+    if u.name.is_none()
+        && u.description.is_none()
+        && u.visibility.is_none()
+        && u.ttl_seconds.is_none()
+    {
+        return Err(crate::DbError::InvalidData(
+            "at least one field must be provided for update".into(),
+        ));
+    }
+    if let Some(n) = u.name.as_mut() {
+        *n = buzz_core::channel::canonical_channel_name(n).to_owned();
+        if n.trim().is_empty() {
+            return Err(crate::DbError::InvalidData(
+                "channel name is required".into(),
+            ));
+        }
+    }
+    let mut sets = Vec::new();
+    if u.name.is_some() {
+        sets.push("name=?");
+    }
+    if u.description.is_some() {
+        sets.push("description=?");
+    }
+    if u.visibility.is_some() {
+        sets.push("visibility=?");
+    }
+    if u.ttl_seconds.is_some() {
+        sets.push("ttl_seconds=?");
+        sets.push("ttl_deadline=CASE WHEN ? IS NULL THEN NULL ELSE unixepoch()+? END");
+    }
+    sets.push("updated_at=unixepoch()");
+    let mut q = sqlx::query(sqlx::AssertSqlSafe(format!(
+        "UPDATE channels SET {} WHERE community_id=? AND id=? AND deleted_at IS NULL",
+        sets.join(",")
+    )));
+    if let Some(v) = &u.name {
+        q = q.bind(v);
+    }
+    if let Some(v) = &u.description {
+        q = q.bind(v);
+    }
+    if let Some(v) = &u.visibility {
+        q = q.bind(v);
+    }
+    if let Some(v) = u.ttl_seconds {
+        q = q.bind(v).bind(v).bind(v);
+    }
+    q = q.bind(community.as_uuid().to_string()).bind(id.to_string());
+    channel_not_found_if_zero(q.execute(pool).await?.rows_affected(), id)?;
+    get_channel(pool, community, id).await
+}
+
+pub(crate) async fn set_topic(
+    pool: &SqlitePool,
+    c: CommunityId,
+    id: Uuid,
+    v: &str,
+    by: &[u8],
+) -> Result<()> {
+    let n=sqlx::query("UPDATE channels SET topic=?,topic_set_by=?,topic_set_at=unixepoch(),updated_at=unixepoch() WHERE community_id=? AND id=? AND deleted_at IS NULL").bind(v).bind(by).bind(c.as_uuid().to_string()).bind(id.to_string()).execute(pool).await?.rows_affected();
+    channel_not_found_if_zero(n, id)
+}
+pub(crate) async fn set_purpose(
+    pool: &SqlitePool,
+    c: CommunityId,
+    id: Uuid,
+    v: &str,
+    by: &[u8],
+) -> Result<()> {
+    let n=sqlx::query("UPDATE channels SET purpose=?,purpose_set_by=?,purpose_set_at=unixepoch(),updated_at=unixepoch() WHERE community_id=? AND id=? AND deleted_at IS NULL").bind(v).bind(by).bind(c.as_uuid().to_string()).bind(id.to_string()).execute(pool).await?.rows_affected();
+    channel_not_found_if_zero(n, id)
+}
+pub(crate) async fn archive_channel(pool: &SqlitePool, c: CommunityId, id: Uuid) -> Result<()> {
+    let row = sqlx::query_scalar::<_, Option<i64>>(
+        "SELECT archived_at FROM channels WHERE community_id=? AND id=? AND deleted_at IS NULL",
+    )
+    .bind(c.as_uuid().to_string())
+    .bind(id.to_string())
+    .fetch_optional(pool)
+    .await?;
+    match row {
+        None => Err(crate::DbError::ChannelNotFound(id)),
+        Some(Some(_)) => Err(crate::DbError::AccessDenied(
+            "channel is already archived".into(),
+        )),
+        Some(None) => {
+            sqlx::query("UPDATE channels SET archived_at=unixepoch() WHERE community_id=? AND id=? AND archived_at IS NULL AND deleted_at IS NULL").bind(c.as_uuid().to_string()).bind(id.to_string()).execute(pool).await?;
+            Ok(())
+        }
+    }
+}
+pub(crate) async fn unarchive_channel(pool: &SqlitePool, c: CommunityId, id: Uuid) -> Result<()> {
+    let row = sqlx::query_scalar::<_, Option<i64>>(
+        "SELECT archived_at FROM channels WHERE community_id=? AND id=? AND deleted_at IS NULL",
+    )
+    .bind(c.as_uuid().to_string())
+    .bind(id.to_string())
+    .fetch_optional(pool)
+    .await?;
+    match row {
+        None => Err(crate::DbError::ChannelNotFound(id)),
+        Some(None) => Err(crate::DbError::AccessDenied(
+            "channel is not archived".into(),
+        )),
+        Some(Some(_)) => {
+            sqlx::query("UPDATE channels SET archived_at=NULL,ttl_deadline=CASE WHEN ttl_seconds IS NULL THEN ttl_deadline ELSE unixepoch()+ttl_seconds END WHERE community_id=? AND id=? AND deleted_at IS NULL").bind(c.as_uuid().to_string()).bind(id.to_string()).execute(pool).await?;
+            Ok(())
+        }
+    }
+}
+pub(crate) async fn soft_delete_channel(
+    pool: &SqlitePool,
+    c: CommunityId,
+    id: Uuid,
+) -> Result<bool> {
+    Ok(sqlx::query("UPDATE channels SET deleted_at=unixepoch() WHERE community_id=? AND id=? AND deleted_at IS NULL").bind(c.as_uuid().to_string()).bind(id.to_string()).execute(pool).await?.rows_affected()>0)
+}
+pub(crate) async fn get_member_count(pool: &SqlitePool, c: CommunityId, id: Uuid) -> Result<i64> {
+    Ok(sqlx::query_scalar("SELECT count(*) FROM channel_members cm JOIN channels ch ON ch.id=cm.channel_id AND ch.community_id=? WHERE cm.channel_id=? AND cm.removed_at IS NULL").bind(c.as_uuid().to_string()).bind(id.to_string()).fetch_one(pool).await?)
+}
+pub(crate) async fn get_member_counts_bulk(
+    pool: &SqlitePool,
+    c: CommunityId,
+    ids: &[Uuid],
+) -> Result<std::collections::HashMap<Uuid, i64>> {
+    if ids.is_empty() {
+        return Ok(std::collections::HashMap::new());
+    }
+    let ph = ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+    let mut q=sqlx::query(sqlx::AssertSqlSafe(format!("SELECT cm.channel_id,count(*) cnt FROM channel_members cm JOIN channels ch ON ch.id=cm.channel_id AND ch.community_id=? WHERE cm.channel_id IN ({ph}) AND cm.removed_at IS NULL GROUP BY cm.channel_id"))).bind(c.as_uuid().to_string());
+    for id in ids {
+        q = q.bind(id.to_string());
+    }
+    let mut out = std::collections::HashMap::new();
+    for r in q.fetch_all(pool).await? {
+        let id: String = r.try_get("channel_id")?;
+        out.insert(
+            Uuid::parse_str(&id).map_err(|e| crate::DbError::InvalidData(e.to_string()))?,
+            r.try_get("cnt")?,
+        );
+    }
+    Ok(out)
+}
+pub(crate) async fn reap_expired_ephemeral_channels(
+    pool: &SqlitePool,
+) -> Result<Vec<crate::channel::ReapedEphemeralChannel>> {
+    let rows=sqlx::query("SELECT ch.community_id,c.host,ch.id FROM channels ch JOIN communities c ON c.id=ch.community_id WHERE ch.ttl_seconds IS NOT NULL AND ch.ttl_deadline<unixepoch() AND ch.archived_at IS NULL AND ch.deleted_at IS NULL AND c.archived_at IS NULL").fetch_all(pool).await?;
+    let mut out = Vec::new();
+    for r in rows {
+        let cid: String = r.try_get("community_id")?;
+        let id: String = r.try_get("id")?;
+        sqlx::query(
+            "UPDATE channels SET archived_at=unixepoch() WHERE id=? AND archived_at IS NULL",
+        )
+        .bind(&id)
+        .execute(pool)
+        .await?;
+        out.push(crate::channel::ReapedEphemeralChannel {
+            community_id: CommunityId::from_uuid(
+                Uuid::parse_str(&cid).map_err(|e| crate::DbError::InvalidData(e.to_string()))?,
+            ),
+            host: r.try_get("host")?,
+            channel_id: Uuid::parse_str(&id)
+                .map_err(|e| crate::DbError::InvalidData(e.to_string()))?,
+        });
+    }
+    Ok(out)
+}
+
 fn timestamp(value: i64) -> Result<chrono::DateTime<chrono::Utc>> {
     chrono::DateTime::from_timestamp(value, 0).ok_or(crate::DbError::InvalidTimestamp(value))
 }
@@ -3168,6 +3626,107 @@ pub(crate) async fn add_relay_member(
     .execute(pool)
     .await?
     .rows_affected() == 1)
+}
+
+pub(crate) async fn claim_relay_membership(
+    pool: &SqlitePool,
+    community: CommunityId,
+    pubkey: &str,
+    role: &str,
+    policy_version: Option<&str>,
+) -> Result<bool> {
+    let mut tx = pool.begin().await?;
+    let inserted = sqlx::query(
+        "INSERT INTO relay_members (community_id, pubkey, role, added_by) VALUES (?1, lower(?2), ?3, 'invite') ON CONFLICT DO NOTHING",
+    )
+    .bind(community.as_uuid().to_string())
+    .bind(pubkey)
+    .bind(role)
+    .execute(&mut *tx)
+    .await?
+    .rows_affected()
+        == 1;
+    if let Some(version) = policy_version {
+        sqlx::query("INSERT INTO join_policy_acceptances (community_id, pubkey, policy_version) VALUES (?1, lower(?2), ?3) ON CONFLICT DO NOTHING")
+            .bind(community.as_uuid().to_string())
+            .bind(pubkey)
+            .bind(version)
+            .execute(&mut *tx)
+            .await?;
+    }
+    tx.commit().await?;
+    Ok(inserted)
+}
+
+pub(crate) async fn has_join_policy_acceptance(
+    pool: &SqlitePool,
+    community: CommunityId,
+    pubkey: &str,
+    policy_version: &str,
+) -> Result<bool> {
+    Ok(sqlx::query_scalar::<_, i64>(
+        "SELECT count(*) FROM join_policy_acceptances WHERE community_id = ?1 AND pubkey = lower(?2) AND policy_version = ?3",
+    )
+    .bind(community.as_uuid().to_string())
+    .bind(pubkey)
+    .bind(policy_version)
+    .fetch_one(pool)
+    .await?
+        != 0)
+}
+
+pub(crate) async fn remove_relay_member(
+    pool: &SqlitePool,
+    community: CommunityId,
+    pubkey: &str,
+    expected_role: Option<&str>,
+) -> Result<crate::relay_members::RemoveResult> {
+    use crate::relay_members::RemoveResult;
+    let result = if let Some(role) = expected_role {
+        sqlx::query("DELETE FROM relay_members WHERE community_id = ?1 AND pubkey = lower(?2) AND role = ?3")
+            .bind(community.as_uuid().to_string())
+            .bind(pubkey)
+            .bind(role)
+            .execute(pool)
+            .await?
+    } else {
+        sqlx::query("DELETE FROM relay_members WHERE community_id = ?1 AND pubkey = lower(?2) AND role <> 'owner'")
+            .bind(community.as_uuid().to_string())
+            .bind(pubkey)
+            .execute(pool)
+            .await?
+    };
+    if result.rows_affected() == 1 {
+        return Ok(RemoveResult::Removed);
+    }
+    let role = sqlx::query_scalar::<_, String>(
+        "SELECT role FROM relay_members WHERE community_id = ?1 AND pubkey = lower(?2)",
+    )
+    .bind(community.as_uuid().to_string())
+    .bind(pubkey)
+    .fetch_optional(pool)
+    .await?;
+    Ok(match role.as_deref() {
+        None => RemoveResult::NotFound,
+        Some("owner") => RemoveResult::IsOwner,
+        Some(_) if expected_role.is_some() => RemoveResult::RoleMismatch,
+        Some(_) => RemoveResult::NotFound,
+    })
+}
+
+pub(crate) async fn update_relay_member_role(
+    pool: &SqlitePool,
+    community: CommunityId,
+    pubkey: &str,
+    new_role: &str,
+) -> Result<bool> {
+    Ok(sqlx::query("UPDATE relay_members SET role = ?3, updated_at = unixepoch() WHERE community_id = ?1 AND pubkey = lower(?2) AND role <> 'owner'")
+        .bind(community.as_uuid().to_string())
+        .bind(pubkey)
+        .bind(new_role)
+        .execute(pool)
+        .await?
+        .rows_affected() == 1)
 }
 
 pub(crate) async fn bootstrap_owner(
@@ -4331,6 +4890,70 @@ mod tests {
             .await
             .unwrap();
         assert!(get_workflow_run(&pool, community, run_id).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn relay_member_mutations_preserve_policy_owner_and_role_contracts() {
+        use crate::relay_members::RemoveResult;
+
+        let pool = connect(":memory:").await.unwrap();
+        let community = ensure_configured_community(&pool, "members.example")
+            .await
+            .unwrap()
+            .id;
+        bootstrap_owner(&pool, community, "OWNER").await.unwrap();
+
+        assert!(
+            claim_relay_membership(&pool, community, "ALICE", "member", Some("v1"))
+                .await
+                .unwrap()
+        );
+        assert!(
+            !claim_relay_membership(&pool, community, "alice", "member", Some("v1"))
+                .await
+                .unwrap()
+        );
+        assert!(has_join_policy_acceptance(&pool, community, "ALICE", "v1")
+            .await
+            .unwrap());
+        assert_eq!(
+            remove_relay_member(&pool, community, "alice", Some("admin"))
+                .await
+                .unwrap(),
+            RemoveResult::RoleMismatch
+        );
+        assert!(update_relay_member_role(&pool, community, "alice", "admin")
+            .await
+            .unwrap());
+        assert_eq!(
+            remove_relay_member(&pool, community, "alice", Some("member"))
+                .await
+                .unwrap(),
+            RemoveResult::RoleMismatch
+        );
+        assert_eq!(
+            remove_relay_member(&pool, community, "alice", Some("admin"))
+                .await
+                .unwrap(),
+            RemoveResult::Removed
+        );
+        assert_eq!(
+            remove_relay_member(&pool, community, "owner", None)
+                .await
+                .unwrap(),
+            RemoveResult::IsOwner
+        );
+        assert!(
+            !update_relay_member_role(&pool, community, "owner", "member")
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            remove_relay_member(&pool, community, "missing", None)
+                .await
+                .unwrap(),
+            RemoveResult::NotFound
+        );
     }
 
     #[tokio::test]

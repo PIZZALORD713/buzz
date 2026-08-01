@@ -2340,17 +2340,34 @@ impl Db {
         created_by: &[u8],
         ttl_seconds: Option<i32>,
     ) -> Result<channel::ChannelRecord> {
-        channel::create_channel(
-            self.pg_pool()?,
-            community_id,
-            name,
-            channel_type,
-            visibility,
-            description,
-            created_by,
-            ttl_seconds,
-        )
-        .await
+        match &self.backend {
+            DbBackend::SQLite(pool) => {
+                sqlite::create_channel(
+                    pool,
+                    community_id,
+                    name,
+                    channel_type,
+                    visibility,
+                    description,
+                    created_by,
+                    ttl_seconds,
+                )
+                .await
+            }
+            DbBackend::Postgres => {
+                channel::create_channel(
+                    self.pg_pool()?,
+                    community_id,
+                    name,
+                    channel_type,
+                    visibility,
+                    description,
+                    created_by,
+                    ttl_seconds,
+                )
+                .await
+            }
+        }
     }
 
     /// Creates a channel with a client-supplied UUID.
@@ -2416,7 +2433,12 @@ impl Db {
         community_id: CommunityId,
         channel_id: Uuid,
     ) -> Result<Option<String>> {
-        channel::get_canvas(self.pg_pool()?, community_id, channel_id).await
+        match &self.backend {
+            DbBackend::SQLite(pool) => sqlite::get_canvas(pool, community_id, channel_id).await,
+            DbBackend::Postgres => {
+                channel::get_canvas(self.pg_pool()?, community_id, channel_id).await
+            }
+        }
     }
 
     /// Sets or clears the canvas content for a channel.
@@ -2426,7 +2448,14 @@ impl Db {
         channel_id: Uuid,
         canvas: Option<&str>,
     ) -> Result<()> {
-        channel::set_canvas(self.pg_pool()?, community_id, channel_id, canvas).await
+        match &self.backend {
+            DbBackend::SQLite(pool) => {
+                sqlite::set_canvas(pool, community_id, channel_id, canvas).await
+            }
+            DbBackend::Postgres => {
+                channel::set_canvas(self.pg_pool()?, community_id, channel_id, canvas).await
+            }
+        }
     }
 
     /// Adds a member to a channel.
@@ -2461,14 +2490,21 @@ impl Db {
         pubkey: &[u8],
         actor_pubkey: &[u8],
     ) -> Result<()> {
-        channel::remove_member(
-            self.pg_pool()?,
-            community_id,
-            channel_id,
-            pubkey,
-            actor_pubkey,
-        )
-        .await
+        match &self.backend {
+            DbBackend::SQLite(pool) => {
+                sqlite::remove_member(pool, community_id, channel_id, pubkey, actor_pubkey).await
+            }
+            DbBackend::Postgres => {
+                channel::remove_member(
+                    self.pg_pool()?,
+                    community_id,
+                    channel_id,
+                    pubkey,
+                    actor_pubkey,
+                )
+                .await
+            }
+        }
     }
 
     /// Returns `true` if the pubkey is an active member.
@@ -2496,7 +2532,14 @@ impl Db {
         channel_ids: &[Uuid],
         pubkeys: &[Vec<u8>],
     ) -> Result<Vec<(Uuid, Vec<u8>)>> {
-        channel::membership_pairs(self.pg_pool()?, community_id, channel_ids, pubkeys).await
+        match &self.backend {
+            DbBackend::SQLite(pool) => {
+                sqlite::membership_pairs(pool, community_id, channel_ids, pubkeys).await
+            }
+            DbBackend::Postgres => {
+                channel::membership_pairs(self.pg_pool()?, community_id, channel_ids, pubkeys).await
+            }
+        }
     }
 
     /// Returns all active members of a channel.
@@ -2519,7 +2562,14 @@ impl Db {
         community_id: CommunityId,
         channel_ids: &[Uuid],
     ) -> Result<Vec<channel::MemberRecord>> {
-        channel::get_members_bulk(self.pg_pool()?, community_id, channel_ids).await
+        match &self.backend {
+            DbBackend::SQLite(pool) => {
+                sqlite::get_members_bulk(pool, community_id, channel_ids).await
+            }
+            DbBackend::Postgres => {
+                channel::get_members_bulk(self.pg_pool()?, community_id, channel_ids).await
+            }
+        }
     }
 
     /// Get all channel IDs accessible to a pubkey.
@@ -2544,7 +2594,12 @@ impl Db {
         community_id: CommunityId,
         visibility: Option<&str>,
     ) -> Result<Vec<channel::ChannelRecord>> {
-        channel::list_channels(self.pg_pool()?, community_id, visibility).await
+        match &self.backend {
+            DbBackend::SQLite(pool) => sqlite::list_channels(pool, community_id, visibility).await,
+            DbBackend::Postgres => {
+                channel::list_channels(self.pg_pool()?, community_id, visibility).await
+            }
+        }
     }
 
     /// Returns full channel records for all channels a user can access.
@@ -2555,14 +2610,28 @@ impl Db {
         visibility_filter: Option<&str>,
         member_only: Option<bool>,
     ) -> Result<Vec<channel::AccessibleChannel>> {
-        channel::get_accessible_channels(
-            self.pg_pool()?,
-            community_id,
-            pubkey,
-            visibility_filter,
-            member_only,
-        )
-        .await
+        match &self.backend {
+            DbBackend::SQLite(pool) => {
+                sqlite::get_accessible_channels(
+                    pool,
+                    community_id,
+                    pubkey,
+                    visibility_filter,
+                    member_only,
+                )
+                .await
+            }
+            DbBackend::Postgres => {
+                channel::get_accessible_channels(
+                    self.pg_pool()?,
+                    community_id,
+                    pubkey,
+                    visibility_filter,
+                    member_only,
+                )
+                .await
+            }
+        }
     }
 
     /// Returns all bot-role members with their aggregated channel names in one community.
@@ -2570,7 +2639,10 @@ impl Db {
         &self,
         community_id: CommunityId,
     ) -> Result<Vec<channel::BotMemberRecord>> {
-        channel::get_bot_members(self.pg_pool()?, community_id).await
+        match &self.backend {
+            DbBackend::SQLite(pool) => sqlite::get_bot_members(pool, community_id).await,
+            DbBackend::Postgres => channel::get_bot_members(self.pg_pool()?, community_id).await,
+        }
     }
 
     /// Bulk-fetch user records by pubkey.
@@ -2579,7 +2651,12 @@ impl Db {
         community_id: CommunityId,
         pubkeys: &[Vec<u8>],
     ) -> Result<Vec<channel::UserRecord>> {
-        channel::get_users_bulk(self.pg_pool()?, community_id, pubkeys).await
+        match &self.backend {
+            DbBackend::SQLite(pool) => sqlite::get_users_bulk(pool, community_id, pubkeys).await,
+            DbBackend::Postgres => {
+                channel::get_users_bulk(self.pg_pool()?, community_id, pubkeys).await
+            }
+        }
     }
 
     /// Updates a channel's name and/or description.
@@ -2589,7 +2666,14 @@ impl Db {
         channel_id: Uuid,
         updates: channel::ChannelUpdate,
     ) -> Result<channel::ChannelRecord> {
-        channel::update_channel(self.pg_pool()?, community_id, channel_id, updates).await
+        match &self.backend {
+            DbBackend::SQLite(pool) => {
+                sqlite::update_channel(pool, community_id, channel_id, updates).await
+            }
+            DbBackend::Postgres => {
+                channel::update_channel(self.pg_pool()?, community_id, channel_id, updates).await
+            }
+        }
     }
 
     /// Sets the topic for a channel.
@@ -2600,7 +2684,14 @@ impl Db {
         topic: &str,
         set_by: &[u8],
     ) -> Result<()> {
-        channel::set_topic(self.pg_pool()?, community_id, channel_id, topic, set_by).await
+        match &self.backend {
+            DbBackend::SQLite(pool) => {
+                sqlite::set_topic(pool, community_id, channel_id, topic, set_by).await
+            }
+            DbBackend::Postgres => {
+                channel::set_topic(self.pg_pool()?, community_id, channel_id, topic, set_by).await
+            }
+        }
     }
 
     /// Sets the purpose for a channel.
@@ -2611,12 +2702,27 @@ impl Db {
         purpose: &str,
         set_by: &[u8],
     ) -> Result<()> {
-        channel::set_purpose(self.pg_pool()?, community_id, channel_id, purpose, set_by).await
+        match &self.backend {
+            DbBackend::SQLite(pool) => {
+                sqlite::set_purpose(pool, community_id, channel_id, purpose, set_by).await
+            }
+            DbBackend::Postgres => {
+                channel::set_purpose(self.pg_pool()?, community_id, channel_id, purpose, set_by)
+                    .await
+            }
+        }
     }
 
     /// Archives a channel.
     pub async fn archive_channel(&self, community_id: CommunityId, channel_id: Uuid) -> Result<()> {
-        channel::archive_channel(self.pg_pool()?, community_id, channel_id).await
+        match &self.backend {
+            DbBackend::SQLite(pool) => {
+                sqlite::archive_channel(pool, community_id, channel_id).await
+            }
+            DbBackend::Postgres => {
+                channel::archive_channel(self.pg_pool()?, community_id, channel_id).await
+            }
+        }
     }
 
     /// Unarchives a channel.
@@ -2625,7 +2731,14 @@ impl Db {
         community_id: CommunityId,
         channel_id: Uuid,
     ) -> Result<()> {
-        channel::unarchive_channel(self.pg_pool()?, community_id, channel_id).await
+        match &self.backend {
+            DbBackend::SQLite(pool) => {
+                sqlite::unarchive_channel(pool, community_id, channel_id).await
+            }
+            DbBackend::Postgres => {
+                channel::unarchive_channel(self.pg_pool()?, community_id, channel_id).await
+            }
+        }
     }
 
     /// Soft-delete a channel.
@@ -2634,7 +2747,14 @@ impl Db {
         community_id: CommunityId,
         channel_id: Uuid,
     ) -> Result<bool> {
-        channel::soft_delete_channel(self.pg_pool()?, community_id, channel_id).await
+        match &self.backend {
+            DbBackend::SQLite(pool) => {
+                sqlite::soft_delete_channel(pool, community_id, channel_id).await
+            }
+            DbBackend::Postgres => {
+                channel::soft_delete_channel(self.pg_pool()?, community_id, channel_id).await
+            }
+        }
     }
 
     /// Returns the count of active members in a channel.
@@ -2643,7 +2763,14 @@ impl Db {
         community_id: CommunityId,
         channel_id: Uuid,
     ) -> Result<i64> {
-        channel::get_member_count(self.pg_pool()?, community_id, channel_id).await
+        match &self.backend {
+            DbBackend::SQLite(pool) => {
+                sqlite::get_member_count(pool, community_id, channel_id).await
+            }
+            DbBackend::Postgres => {
+                channel::get_member_count(self.pg_pool()?, community_id, channel_id).await
+            }
+        }
     }
 
     /// Bulk-fetch member counts for a set of channel IDs.
@@ -2652,7 +2779,14 @@ impl Db {
         community_id: CommunityId,
         channel_ids: &[Uuid],
     ) -> Result<std::collections::HashMap<Uuid, i64>> {
-        channel::get_member_counts_bulk(self.pg_pool()?, community_id, channel_ids).await
+        match &self.backend {
+            DbBackend::SQLite(pool) => {
+                sqlite::get_member_counts_bulk(pool, community_id, channel_ids).await
+            }
+            DbBackend::Postgres => {
+                channel::get_member_counts_bulk(self.pg_pool()?, community_id, channel_ids).await
+            }
+        }
     }
 
     /// Get the active role of a pubkey in a channel.
@@ -2676,7 +2810,10 @@ impl Db {
     pub async fn reap_expired_ephemeral_channels(
         &self,
     ) -> Result<Vec<channel::ReapedEphemeralChannel>> {
-        channel::reap_expired_ephemeral_channels(self.pg_pool()?).await
+        match &self.backend {
+            DbBackend::SQLite(pool) => sqlite::reap_expired_ephemeral_channels(pool).await,
+            DbBackend::Postgres => channel::reap_expired_ephemeral_channels(self.pg_pool()?).await,
+        }
     }
 
     /// Query due reminders ready for delivery.
@@ -5040,14 +5177,21 @@ impl Db {
         role: &str,
         policy_version: Option<&str>,
     ) -> Result<bool> {
-        relay_members::claim_relay_membership(
-            self.pg_pool()?,
-            community,
-            pubkey,
-            role,
-            policy_version,
-        )
-        .await
+        match &self.backend {
+            DbBackend::SQLite(pool) => {
+                sqlite::claim_relay_membership(pool, community, pubkey, role, policy_version).await
+            }
+            DbBackend::Postgres => {
+                relay_members::claim_relay_membership(
+                    self.pg_pool()?,
+                    community,
+                    pubkey,
+                    role,
+                    policy_version,
+                )
+                .await
+            }
+        }
     }
 
     /// Returns whether a member has persisted acceptance evidence for a policy version.
@@ -5057,13 +5201,20 @@ impl Db {
         pubkey: &str,
         policy_version: &str,
     ) -> Result<bool> {
-        relay_members::has_join_policy_acceptance(
-            self.pg_pool()?,
-            community,
-            pubkey,
-            policy_version,
-        )
-        .await
+        match &self.backend {
+            DbBackend::SQLite(pool) => {
+                sqlite::has_join_policy_acceptance(pool, community, pubkey, policy_version).await
+            }
+            DbBackend::Postgres => {
+                relay_members::has_join_policy_acceptance(
+                    self.pg_pool()?,
+                    community,
+                    pubkey,
+                    policy_version,
+                )
+                .await
+            }
+        }
     }
 
     /// Removes a relay member from `community` atomically, refusing to delete the owner.
@@ -5072,7 +5223,14 @@ impl Db {
         community: CommunityId,
         pubkey: &str,
     ) -> Result<relay_members::RemoveResult> {
-        relay_members::remove_relay_member(self.pg_pool()?, community, pubkey).await
+        match &self.backend {
+            DbBackend::SQLite(pool) => {
+                sqlite::remove_relay_member(pool, community, pubkey, None).await
+            }
+            DbBackend::Postgres => {
+                relay_members::remove_relay_member(self.pg_pool()?, community, pubkey).await
+            }
+        }
     }
 
     /// Removes a relay member from `community` only if their current role matches `expected_role`.
@@ -5085,13 +5243,20 @@ impl Db {
         pubkey: &str,
         expected_role: &str,
     ) -> Result<relay_members::RemoveResult> {
-        relay_members::remove_relay_member_if_role(
-            self.pg_pool()?,
-            community,
-            pubkey,
-            expected_role,
-        )
-        .await
+        match &self.backend {
+            DbBackend::SQLite(pool) => {
+                sqlite::remove_relay_member(pool, community, pubkey, Some(expected_role)).await
+            }
+            DbBackend::Postgres => {
+                relay_members::remove_relay_member_if_role(
+                    self.pg_pool()?,
+                    community,
+                    pubkey,
+                    expected_role,
+                )
+                .await
+            }
+        }
     }
 
     /// Updates the role of an existing relay member in `community`. Returns `true` if updated.
@@ -5101,7 +5266,20 @@ impl Db {
         pubkey: &str,
         new_role: &str,
     ) -> Result<bool> {
-        relay_members::update_relay_member_role(self.pg_pool()?, community, pubkey, new_role).await
+        match &self.backend {
+            DbBackend::SQLite(pool) => {
+                sqlite::update_relay_member_role(pool, community, pubkey, new_role).await
+            }
+            DbBackend::Postgres => {
+                relay_members::update_relay_member_role(
+                    self.pg_pool()?,
+                    community,
+                    pubkey,
+                    new_role,
+                )
+                .await
+            }
+        }
     }
 
     /// Ensures the owner pubkey exists with role `"owner"` in `community`. Called at startup.
