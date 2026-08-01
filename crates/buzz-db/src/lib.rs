@@ -5976,6 +5976,15 @@ impl Db {
         channel_id: Uuid,
         relay_pubkey: &[u8],
     ) -> Result<u64> {
+        if let DbBackend::SQLite(pool) = &self.backend {
+            return sqlite::soft_delete_discovery_events(
+                pool,
+                community_id,
+                channel_id,
+                relay_pubkey,
+            )
+            .await;
+        }
         let result = sqlx::query(
             "UPDATE events SET deleted_at = NOW() \
              WHERE community_id = $1 AND channel_id = $2 AND pubkey = $3 AND deleted_at IS NULL AND kind IN (39000, 39001, 39002)",

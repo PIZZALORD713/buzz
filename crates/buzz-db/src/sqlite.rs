@@ -551,6 +551,21 @@ pub(crate) async fn ensure_configured_community(
     })
 }
 
+pub(crate) async fn soft_delete_discovery_events(
+    pool: &SqlitePool,
+    community: CommunityId,
+    channel_id: Uuid,
+    relay_pubkey: &[u8],
+) -> Result<u64> {
+    Ok(sqlx::query("DELETE FROM events WHERE community_id = ?1 AND channel_id = ?2 AND pubkey = ?3 AND kind IN (39000,39001,39002)")
+        .bind(community.as_uuid().to_string())
+        .bind(channel_id.to_string())
+        .bind(relay_pubkey)
+        .execute(pool)
+        .await?
+        .rows_affected())
+}
+
 pub(crate) async fn insert_event(
     pool: &SqlitePool,
     community: CommunityId,
@@ -4780,6 +4795,57 @@ mod tests {
                 .await
                 .unwrap()
         );
+    }
+
+    #[tokio::test]
+    async fn discovery_delete_is_channel_relay_kind_and_tenant_scoped() {
+        let pool = connect("sqlite::memory:").await.unwrap();
+        let a = ensure_configured_community(&pool, "discovery-a.example")
+            .await
+            .unwrap()
+            .id;
+        let b = ensure_configured_community(&pool, "discovery-b.example")
+            .await
+            .unwrap()
+            .id;
+        let relay = Keys::generate();
+        let other = Keys::generate();
+        let channel = Uuid::new_v4();
+        let other_channel = Uuid::new_v4();
+        let mut events = Vec::new();
+        for (index, kind, keys, channel_id, community) in [
+            (0, 39000, &relay, channel, a),
+            (1, 39001, &relay, channel, a),
+            (2, 39002, &relay, channel, a),
+            (3, 9, &relay, channel, a),
+            (4, 39000, &relay, other_channel, a),
+            (5, 39000, &other, channel, a),
+            (6, 39000, &relay, channel, b),
+        ] {
+            let event = EventBuilder::new(Kind::Custom(kind), format!("discovery-{index}"))
+                .custom_created_at(Timestamp::from(100 + index as u64))
+                .sign_with_keys(keys)
+                .unwrap();
+            insert_event(&pool, community, &event, Some(channel_id))
+                .await
+                .unwrap();
+            events.push((community, event));
+        }
+        assert_eq!(
+            soft_delete_discovery_events(&pool, a, channel, &relay.public_key().to_bytes())
+                .await
+                .unwrap(),
+            3
+        );
+        for (index, (community, event)) in events.iter().enumerate() {
+            assert_eq!(
+                get_event_by_id(&pool, *community, event.id.as_bytes())
+                    .await
+                    .unwrap()
+                    .is_some(),
+                index >= 3
+            );
+        }
     }
 
     #[tokio::test]
