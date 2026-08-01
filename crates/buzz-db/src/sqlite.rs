@@ -230,7 +230,32 @@ pub(crate) async fn migrate(pool: &SqlitePool) -> Result<()> {
         tx.commit().await?;
         version = 4;
     }
-    if version != 4 {
+    if version < 5 {
+        let mut tx = pool.begin().await?;
+        for statement in [
+            "DROP TRIGGER IF EXISTS events_fts_insert",
+            "DROP TRIGGER IF EXISTS events_fts_delete",
+            "DROP TRIGGER IF EXISTS events_fts_update",
+            "DROP TABLE IF EXISTS events_fts",
+            "DROP VIEW IF EXISTS searchable_events",
+            "CREATE VIEW searchable_events AS SELECT rowid, content FROM events WHERE kind IN (0, 9, 40002, 45001, 45003)",
+            "CREATE VIRTUAL TABLE events_fts USING fts5(content, content='searchable_events', content_rowid='rowid', tokenize='unicode61')",
+            "INSERT INTO events_fts(events_fts) VALUES ('rebuild')",
+            "CREATE TRIGGER events_fts_insert AFTER INSERT ON events WHEN new.kind IN (0, 9, 40002, 45001, 45003) BEGIN INSERT INTO events_fts(rowid, content) VALUES (new.rowid, new.content); END",
+            "CREATE TRIGGER events_fts_delete AFTER DELETE ON events WHEN old.kind IN (0, 9, 40002, 45001, 45003) BEGIN INSERT INTO events_fts(events_fts, rowid, content) VALUES ('delete', old.rowid, old.content); END",
+            "CREATE TRIGGER events_fts_update AFTER UPDATE OF content, kind ON events BEGIN INSERT INTO events_fts(events_fts, rowid, content) SELECT 'delete', old.rowid, old.content WHERE old.kind IN (0, 9, 40002, 45001, 45003); INSERT INTO events_fts(rowid, content) SELECT new.rowid, new.content WHERE new.kind IN (0, 9, 40002, 45001, 45003); END",
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_channels_dm_hash ON channels (community_id, participant_hash) WHERE channel_type = 'dm' AND deleted_at IS NULL",
+            "CREATE TABLE IF NOT EXISTS git_repo_names (community_id TEXT NOT NULL, repo_id TEXT NOT NULL, owner_pubkey TEXT NOT NULL, created_at INTEGER NOT NULL DEFAULT (unixepoch()), PRIMARY KEY (community_id, repo_id), FOREIGN KEY (community_id) REFERENCES communities(id) ON DELETE CASCADE)",
+        ] {
+            sqlx::query(statement).execute(&mut *tx).await?;
+        }
+        sqlx::query("UPDATE schema_version SET version = 5 WHERE singleton = 1")
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        version = 5;
+    }
+    if version != 5 {
         return Err(crate::DbError::InvalidData(format!(
             "unsupported SQLite schema version {version}"
         )));
@@ -1017,6 +1042,68 @@ pub(crate) async fn list_hidden_dms(
         .collect()
 }
 
+pub(crate) async fn repo_name_owner(
+    pool: &SqlitePool,
+    community: CommunityId,
+    repo_id: &str,
+) -> Result<Option<String>> {
+    Ok(sqlx::query_scalar(
+        "SELECT owner_pubkey FROM git_repo_names WHERE community_id = ?1 AND repo_id = ?2",
+    )
+    .bind(community.as_uuid().to_string())
+    .bind(repo_id)
+    .fetch_optional(pool)
+    .await?)
+}
+
+pub(crate) async fn reserve_repo_name(
+    pool: &SqlitePool,
+    community: CommunityId,
+    repo_id: &str,
+    owner_pubkey: &str,
+) -> Result<crate::git_repo::ReserveOutcome> {
+    let inserted = sqlx::query("INSERT INTO git_repo_names (community_id,repo_id,owner_pubkey) VALUES (?1,?2,?3) ON CONFLICT (community_id,repo_id) DO NOTHING")
+        .bind(community.as_uuid().to_string()).bind(repo_id).bind(owner_pubkey).execute(pool).await?.rows_affected();
+    if inserted != 0 {
+        return Ok(crate::git_repo::ReserveOutcome::Reserved);
+    }
+    match repo_name_owner(pool, community, repo_id).await? {
+        Some(holder) if holder == owner_pubkey => Ok(crate::git_repo::ReserveOutcome::AlreadyOwned),
+        _ => Ok(crate::git_repo::ReserveOutcome::TakenByOther),
+    }
+}
+
+pub(crate) async fn count_repos_for_owner(
+    pool: &SqlitePool,
+    community: CommunityId,
+    owner_pubkey: &str,
+) -> Result<i64> {
+    Ok(sqlx::query_scalar(
+        "SELECT COUNT(*) FROM git_repo_names WHERE community_id = ?1 AND owner_pubkey = ?2",
+    )
+    .bind(community.as_uuid().to_string())
+    .bind(owner_pubkey)
+    .fetch_one(pool)
+    .await?)
+}
+
+pub(crate) async fn release_repo_name(
+    pool: &SqlitePool,
+    community: CommunityId,
+    repo_id: &str,
+    owner_pubkey: &str,
+) -> Result<u64> {
+    Ok(sqlx::query(
+        "DELETE FROM git_repo_names WHERE community_id = ?1 AND repo_id = ?2 AND owner_pubkey = ?3",
+    )
+    .bind(community.as_uuid().to_string())
+    .bind(repo_id)
+    .bind(owner_pubkey)
+    .execute(pool)
+    .await?
+    .rows_affected())
+}
+
 pub(crate) async fn is_archived(
     pool: &SqlitePool,
     community: CommunityId,
@@ -1642,7 +1729,7 @@ mod tests {
                 .fetch_one(&upgraded)
                 .await
                 .unwrap(),
-            4
+            5
         );
         for (table, column) in [
             ("channels", "participant_hash"),
@@ -1730,6 +1817,68 @@ mod tests {
         assert!(create_dm(&pool, a, &[owner.as_slice()], &owner)
             .await
             .is_err());
+    }
+
+    #[tokio::test]
+    async fn git_repo_names_are_scoped_idempotent_and_owner_released() {
+        let pool = connect("sqlite::memory:").await.unwrap();
+        let a = ensure_configured_community(&pool, "git-a.example")
+            .await
+            .unwrap()
+            .id;
+        let b = ensure_configured_community(&pool, "git-b.example")
+            .await
+            .unwrap()
+            .id;
+        assert_eq!(
+            reserve_repo_name(&pool, a, "project", "alice")
+                .await
+                .unwrap(),
+            crate::git_repo::ReserveOutcome::Reserved
+        );
+        assert_eq!(
+            reserve_repo_name(&pool, a, "project", "alice")
+                .await
+                .unwrap(),
+            crate::git_repo::ReserveOutcome::AlreadyOwned
+        );
+        assert_eq!(
+            reserve_repo_name(&pool, a, "project", "bob").await.unwrap(),
+            crate::git_repo::ReserveOutcome::TakenByOther
+        );
+        assert_eq!(
+            reserve_repo_name(&pool, b, "project", "bob").await.unwrap(),
+            crate::git_repo::ReserveOutcome::Reserved
+        );
+        assert_eq!(
+            repo_name_owner(&pool, a, "project")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("alice")
+        );
+        assert_eq!(count_repos_for_owner(&pool, a, "alice").await.unwrap(), 1);
+        assert_eq!(
+            release_repo_name(&pool, a, "project", "bob").await.unwrap(),
+            0
+        );
+        assert_eq!(
+            release_repo_name(&pool, a, "project", "alice")
+                .await
+                .unwrap(),
+            1
+        );
+        assert!(repo_name_owner(&pool, a, "project")
+            .await
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            repo_name_owner(&pool, b, "project")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("bob")
+        );
     }
 
     #[tokio::test]

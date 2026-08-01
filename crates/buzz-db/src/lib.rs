@@ -4928,7 +4928,12 @@ impl Db {
         community: CommunityId,
         repo_id: &str,
     ) -> Result<Option<String>> {
-        git_repo::repo_name_owner(self.pg_pool()?, community, repo_id).await
+        match &self.backend {
+            DbBackend::SQLite(pool) => sqlite::repo_name_owner(pool, community, repo_id).await,
+            DbBackend::Postgres => {
+                git_repo::repo_name_owner(self.pg_pool()?, community, repo_id).await
+            }
+        }
     }
 
     /// Reserve a git repo name for `owner_pubkey` in `community` (NIP-34).
@@ -4941,7 +4946,14 @@ impl Db {
         repo_id: &str,
         owner_pubkey: &str,
     ) -> Result<git_repo::ReserveOutcome> {
-        git_repo::reserve_repo_name(self.pg_pool()?, community, repo_id, owner_pubkey).await
+        match &self.backend {
+            DbBackend::SQLite(pool) => {
+                sqlite::reserve_repo_name(pool, community, repo_id, owner_pubkey).await
+            }
+            DbBackend::Postgres => {
+                git_repo::reserve_repo_name(self.pg_pool()?, community, repo_id, owner_pubkey).await
+            }
+        }
     }
 
     /// Count git repos reserved by `owner_pubkey` in `community` (quota check).
@@ -4950,7 +4962,14 @@ impl Db {
         community: CommunityId,
         owner_pubkey: &str,
     ) -> Result<i64> {
-        git_repo::count_repos_for_owner(self.pg_pool()?, community, owner_pubkey).await
+        match &self.backend {
+            DbBackend::SQLite(pool) => {
+                sqlite::count_repos_for_owner(pool, community, owner_pubkey).await
+            }
+            DbBackend::Postgres => {
+                git_repo::count_repos_for_owner(self.pg_pool()?, community, owner_pubkey).await
+            }
+        }
     }
 
     /// Release a git repo name reservation held by `owner_pubkey` (rollback).
@@ -4962,7 +4981,14 @@ impl Db {
         repo_id: &str,
         owner_pubkey: &str,
     ) -> Result<u64> {
-        git_repo::release_repo_name(self.pg_pool()?, community, repo_id, owner_pubkey).await
+        match &self.backend {
+            DbBackend::SQLite(pool) => {
+                sqlite::release_repo_name(pool, community, repo_id, owner_pubkey).await
+            }
+            DbBackend::Postgres => {
+                git_repo::release_repo_name(self.pg_pool()?, community, repo_id, owner_pubkey).await
+            }
+        }
     }
 
     /// Returns `true` if `pubkey` (64-char hex) is archived in `community_id`.
