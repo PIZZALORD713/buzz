@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::net::{IpAddr, Ipv4Addr};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
@@ -18,7 +19,7 @@ use buzz_db::{Db, DbConfig};
 use buzz_pubsub::{rate_limiter::AdmissionRateLimiter, InProcessNip98ReplayGuard, PubSubManager};
 use buzz_search::SearchService;
 
-use buzz_relay::config::Config;
+use buzz_relay::config::{Config, RelayProfile};
 use buzz_relay::metrics as relay_metrics;
 use buzz_relay::router::{build_health_router, build_router};
 use buzz_relay::state::{AppBackends, AppState};
@@ -1217,7 +1218,7 @@ async fn run_single_node(config: Config, tracer_init: telemetry::TracerInit) -> 
         ));
     }
 
-    relay_metrics::install(config.metrics_port, usage_metrics_idle_timeout_secs(60));
+    relay_metrics::install_loopback(config.metrics_port, usage_metrics_idle_timeout_secs(60));
     let db_path =
         std::env::var("BUZZ_LOCAL_DB").unwrap_or_else(|_| "buzz-local.sqlite".to_string());
     let media_root =
@@ -1302,6 +1303,13 @@ async fn run_single_node(config: Config, tracer_init: telemetry::TracerInit) -> 
     Ok(())
 }
 
+fn health_listener_ip(profile: RelayProfile) -> IpAddr {
+    match profile {
+        RelayProfile::SingleNode => IpAddr::V4(Ipv4Addr::LOCALHOST),
+        RelayProfile::Production => IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+    }
+}
+
 /// ```
 async fn serve(
     router: axum::Router,
@@ -1310,10 +1318,11 @@ async fn serve(
 ) -> anyhow::Result<()> {
     let config = &state.config;
 
-    let health_listener = tokio::net::TcpListener::bind(("0.0.0.0", config.health_port))
+    let health_host = health_listener_ip(config.profile);
+    let health_listener = tokio::net::TcpListener::bind((health_host, config.health_port))
         .await
         .map_err(|e| anyhow::anyhow!("Failed to bind health port {}: {e}", config.health_port))?;
-    info!(port = config.health_port, "Health probe listener started");
+    info!(host = %health_host, port = config.health_port, "Health probe listener started");
     tokio::spawn(async move {
         axum::serve(health_listener, health_router).await.ok();
     });
@@ -2015,6 +2024,7 @@ async fn emit_db_usage_metrics(
 #[cfg(test)]
 mod tests {
     use std::collections::HashSet;
+    use std::net::{IpAddr, Ipv4Addr};
     use std::sync::Arc;
     use std::time::Duration;
 
@@ -2022,9 +2032,9 @@ mod tests {
     use uuid::Uuid;
 
     use super::{
-        buzz_auto_migrate_enabled, dropped_in_memory_keys, idle_timeout_secs,
+        buzz_auto_migrate_enabled, dropped_in_memory_keys, health_listener_ip, idle_timeout_secs,
         refresh_legacy_active_gauge_recency, run_periodic_until_cancelled, EmissionScope,
-        InMemoryMetricKey,
+        InMemoryMetricKey, RelayProfile,
     };
     use metrics::GaugeFn;
     use metrics_util::{
@@ -2055,6 +2065,18 @@ mod tests {
             .expect("loop must not wait for the next interval")
             .expect("loop task");
         assert!(tick_count.load(std::sync::atomic::Ordering::Relaxed) <= 1);
+    }
+
+    #[test]
+    fn health_listener_is_loopback_only_for_single_node() {
+        assert_eq!(
+            health_listener_ip(RelayProfile::SingleNode),
+            IpAddr::V4(Ipv4Addr::LOCALHOST)
+        );
+        assert_eq!(
+            health_listener_ip(RelayProfile::Production),
+            IpAddr::V4(Ipv4Addr::UNSPECIFIED)
+        );
     }
 
     #[test]
