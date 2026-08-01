@@ -3348,16 +3348,32 @@ impl Db {
         emoji: &str,
         reaction_event_id: Option<&[u8]>,
     ) -> Result<bool> {
-        reaction::add_reaction(
-            self.pg_pool()?,
-            community,
-            event_id,
-            event_created_at,
-            pubkey,
-            emoji,
-            reaction_event_id,
-        )
-        .await
+        match &self.backend {
+            DbBackend::SQLite(pool) => {
+                sqlite::add_reaction(
+                    pool,
+                    community,
+                    event_id,
+                    event_created_at,
+                    pubkey,
+                    emoji,
+                    reaction_event_id,
+                )
+                .await
+            }
+            DbBackend::Postgres => {
+                reaction::add_reaction(
+                    self.pg_pool()?,
+                    community,
+                    event_id,
+                    event_created_at,
+                    pubkey,
+                    emoji,
+                    reaction_event_id,
+                )
+                .await
+            }
+        }
     }
 
     /// Soft-delete a reaction.
@@ -3414,15 +3430,30 @@ impl Db {
         pubkey: &[u8],
         emoji: &str,
     ) -> Result<Option<reaction::ActiveReactionRecord>> {
-        reaction::get_active_reaction_record(
-            self.pg_pool()?,
-            community,
-            event_id,
-            event_created_at,
-            pubkey,
-            emoji,
-        )
-        .await
+        match &self.backend {
+            DbBackend::SQLite(pool) => {
+                sqlite::get_active_reaction_record(
+                    pool,
+                    community,
+                    event_id,
+                    event_created_at,
+                    pubkey,
+                    emoji,
+                )
+                .await
+            }
+            DbBackend::Postgres => {
+                reaction::get_active_reaction_record(
+                    self.pg_pool()?,
+                    community,
+                    event_id,
+                    event_created_at,
+                    pubkey,
+                    emoji,
+                )
+                .await
+            }
+        }
     }
 
     /// Backfill the source event ID on an active reaction row.
@@ -3435,16 +3466,32 @@ impl Db {
         emoji: &str,
         reaction_event_id: &[u8],
     ) -> Result<bool> {
-        reaction::set_reaction_event_id(
-            self.pg_pool()?,
-            community,
-            event_id,
-            event_created_at,
-            pubkey,
-            emoji,
-            reaction_event_id,
-        )
-        .await
+        match &self.backend {
+            DbBackend::SQLite(pool) => {
+                sqlite::set_reaction_event_id(
+                    pool,
+                    community,
+                    event_id,
+                    event_created_at,
+                    pubkey,
+                    emoji,
+                    reaction_event_id,
+                )
+                .await
+            }
+            DbBackend::Postgres => {
+                reaction::set_reaction_event_id(
+                    self.pg_pool()?,
+                    community,
+                    event_id,
+                    event_created_at,
+                    pubkey,
+                    emoji,
+                    reaction_event_id,
+                )
+                .await
+            }
+        }
     }
 
     /// Get all active reactions for an event, grouped by emoji.
@@ -3456,15 +3503,23 @@ impl Db {
         limit: u32,
         cursor: Option<&str>,
     ) -> Result<Vec<reaction::ReactionGroup>> {
-        reaction::get_reactions(
-            self.pg_pool()?,
-            community,
-            event_id,
-            event_created_at,
-            limit,
-            cursor,
-        )
-        .await
+        match &self.backend {
+            DbBackend::SQLite(pool) => {
+                sqlite::get_reactions(pool, community, event_id, event_created_at, limit, cursor)
+                    .await
+            }
+            DbBackend::Postgres => {
+                reaction::get_reactions(
+                    self.pg_pool()?,
+                    community,
+                    event_id,
+                    event_created_at,
+                    limit,
+                    cursor,
+                )
+                .await
+            }
+        }
     }
 
     /// Batch-fetch emoji counts for a set of (event_id, event_created_at) pairs.
@@ -3473,7 +3528,12 @@ impl Db {
         community: CommunityId,
         event_ids: &[(&[u8], DateTime<Utc>)],
     ) -> Result<Vec<reaction::BulkReactionEntry>> {
-        reaction::get_reactions_bulk(self.pg_pool()?, community, event_ids).await
+        match &self.backend {
+            DbBackend::SQLite(pool) => sqlite::get_reactions_bulk(pool, community, event_ids).await,
+            DbBackend::Postgres => {
+                reaction::get_reactions_bulk(self.pg_pool()?, community, event_ids).await
+            }
+        }
     }
 
     /// Find events that @mention the given pubkey.
@@ -3485,15 +3545,30 @@ impl Db {
         since: Option<DateTime<Utc>>,
         limit: i64,
     ) -> Result<Vec<StoredEvent>> {
-        feed::query_mentions(
-            self.pg_pool()?,
-            community,
-            pubkey_bytes,
-            accessible_channel_ids,
-            since,
-            limit,
-        )
-        .await
+        match &self.backend {
+            DbBackend::SQLite(pool) => {
+                sqlite::query_feed_mentions(
+                    pool,
+                    community,
+                    pubkey_bytes,
+                    accessible_channel_ids,
+                    since,
+                    limit,
+                )
+                .await
+            }
+            DbBackend::Postgres => {
+                feed::query_mentions(
+                    self.pg_pool()?,
+                    community,
+                    pubkey_bytes,
+                    accessible_channel_ids,
+                    since,
+                    limit,
+                )
+                .await
+            }
+        }
     }
 
     /// [`Db::query_feed_mentions`] with replica routing — same contract and
@@ -3577,15 +3652,30 @@ impl Db {
         since: Option<DateTime<Utc>>,
         limit: i64,
     ) -> Result<Vec<StoredEvent>> {
-        feed::query_needs_action(
-            self.pg_pool()?,
-            community,
-            pubkey_bytes,
-            accessible_channel_ids,
-            since,
-            limit,
-        )
-        .await
+        match &self.backend {
+            DbBackend::SQLite(pool) => {
+                sqlite::query_feed_needs_action(
+                    pool,
+                    community,
+                    pubkey_bytes,
+                    accessible_channel_ids,
+                    since,
+                    limit,
+                )
+                .await
+            }
+            DbBackend::Postgres => {
+                feed::query_needs_action(
+                    self.pg_pool()?,
+                    community,
+                    pubkey_bytes,
+                    accessible_channel_ids,
+                    since,
+                    limit,
+                )
+                .await
+            }
+        }
     }
 
     /// [`Db::query_feed_needs_action`] with replica routing — BOUNDED arm
@@ -3664,14 +3754,22 @@ impl Db {
         since: Option<DateTime<Utc>>,
         limit: i64,
     ) -> Result<Vec<StoredEvent>> {
-        feed::query_activity(
-            self.pg_pool()?,
-            community,
-            accessible_channel_ids,
-            since,
-            limit,
-        )
-        .await
+        match &self.backend {
+            DbBackend::SQLite(pool) => {
+                sqlite::query_feed_activity(pool, community, accessible_channel_ids, since, limit)
+                    .await
+            }
+            DbBackend::Postgres => {
+                feed::query_activity(
+                    self.pg_pool()?,
+                    community,
+                    accessible_channel_ids,
+                    since,
+                    limit,
+                )
+                .await
+            }
+        }
     }
 
     /// [`Db::query_feed_activity`] with replica routing — BOUNDED arm only;

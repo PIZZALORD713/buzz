@@ -205,10 +205,10 @@ pub(crate) async fn migrate(pool: &SqlitePool) -> Result<()> {
         let mut tx = pool.begin().await?;
         for statement in [
             "CREATE VIRTUAL TABLE IF NOT EXISTS events_fts USING fts5(content, content='events', content_rowid='rowid', tokenize='unicode61')",
-            "CREATE TRIGGER IF NOT EXISTS events_fts_insert AFTER INSERT ON events WHEN new.kind NOT IN (1059, 30300, 30350, 30622, 44100, 44101, 44200) BEGIN INSERT INTO events_fts(rowid, content) VALUES (new.rowid, new.content); END",
-            "CREATE TRIGGER IF NOT EXISTS events_fts_delete AFTER DELETE ON events WHEN old.kind NOT IN (1059, 30300, 30350, 30622, 44100, 44101, 44200) BEGIN INSERT INTO events_fts(events_fts, rowid, content) VALUES ('delete', old.rowid, old.content); END",
-            "CREATE TRIGGER IF NOT EXISTS events_fts_update AFTER UPDATE OF content, kind ON events BEGIN INSERT INTO events_fts(events_fts, rowid, content) SELECT 'delete', old.rowid, old.content WHERE old.kind NOT IN (1059, 30300, 30350, 30622, 44100, 44101, 44200); INSERT INTO events_fts(rowid, content) SELECT new.rowid, new.content WHERE new.kind NOT IN (1059, 30300, 30350, 30622, 44100, 44101, 44200); END",
-            "INSERT INTO events_fts(rowid, content) SELECT rowid, content FROM events WHERE kind NOT IN (1059, 30300, 30350, 30622, 44100, 44101, 44200)",
+            "CREATE TRIGGER IF NOT EXISTS events_fts_insert AFTER INSERT ON events WHEN new.kind IN (0, 9, 40002, 45001, 45003) BEGIN INSERT INTO events_fts(rowid, content) VALUES (new.rowid, new.content); END",
+            "CREATE TRIGGER IF NOT EXISTS events_fts_delete AFTER DELETE ON events WHEN old.kind IN (0, 9, 40002, 45001, 45003) BEGIN INSERT INTO events_fts(events_fts, rowid, content) VALUES ('delete', old.rowid, old.content); END",
+            "CREATE TRIGGER IF NOT EXISTS events_fts_update AFTER UPDATE OF content, kind ON events BEGIN INSERT INTO events_fts(events_fts, rowid, content) SELECT 'delete', old.rowid, old.content WHERE old.kind IN (0, 9, 40002, 45001, 45003); INSERT INTO events_fts(rowid, content) SELECT new.rowid, new.content WHERE new.kind IN (0, 9, 40002, 45001, 45003); END",
+            "INSERT INTO events_fts(rowid, content) SELECT rowid, content FROM events WHERE kind IN (0, 9, 40002, 45001, 45003)",
         ] {
             sqlx::query(statement).execute(&mut *tx).await?;
         }
@@ -659,6 +659,121 @@ pub(crate) async fn insert_reaction_event(
         )),
         was_inserted: inserted,
     })
+}
+
+pub(crate) async fn add_reaction(
+    pool: &SqlitePool,
+    community: CommunityId,
+    event_id: &[u8],
+    event_created_at: chrono::DateTime<chrono::Utc>,
+    pubkey: &[u8],
+    emoji: &str,
+    reaction_event_id: Option<&[u8]>,
+) -> Result<bool> {
+    let result = sqlx::query("INSERT INTO reactions (community_id,event_created_at,event_id,pubkey,emoji,reaction_event_id) VALUES (?1,?2,?3,?4,?5,?6) ON CONFLICT (community_id,event_created_at,event_id,pubkey,emoji) DO UPDATE SET removed_at=NULL, reaction_event_id=COALESCE(excluded.reaction_event_id,reactions.reaction_event_id) WHERE reactions.removed_at IS NOT NULL")
+        .bind(community.as_uuid().to_string()).bind(event_created_at.timestamp()).bind(event_id).bind(pubkey).bind(emoji).bind(reaction_event_id).execute(pool).await?;
+    Ok(result.rows_affected() != 0)
+}
+
+pub(crate) async fn get_active_reaction_record(
+    pool: &SqlitePool,
+    community: CommunityId,
+    event_id: &[u8],
+    event_created_at: chrono::DateTime<chrono::Utc>,
+    pubkey: &[u8],
+    emoji: &str,
+) -> Result<Option<crate::reaction::ActiveReactionRecord>> {
+    let row = sqlx::query("SELECT reaction_event_id FROM reactions WHERE community_id=?1 AND event_id=?2 AND event_created_at=?3 AND pubkey=?4 AND emoji=?5 AND removed_at IS NULL LIMIT 1")
+        .bind(community.as_uuid().to_string()).bind(event_id).bind(event_created_at.timestamp()).bind(pubkey).bind(emoji).fetch_optional(pool).await?;
+    row.map(|r| {
+        Ok(crate::reaction::ActiveReactionRecord {
+            reaction_event_id: r.try_get("reaction_event_id")?,
+        })
+    })
+    .transpose()
+}
+
+pub(crate) async fn set_reaction_event_id(
+    pool: &SqlitePool,
+    community: CommunityId,
+    event_id: &[u8],
+    event_created_at: chrono::DateTime<chrono::Utc>,
+    pubkey: &[u8],
+    emoji: &str,
+    reaction_event_id: &[u8],
+) -> Result<bool> {
+    Ok(sqlx::query("UPDATE reactions SET reaction_event_id=?1 WHERE community_id=?2 AND event_created_at=?3 AND event_id=?4 AND pubkey=?5 AND emoji=?6 AND removed_at IS NULL")
+        .bind(reaction_event_id).bind(community.as_uuid().to_string()).bind(event_created_at.timestamp()).bind(event_id).bind(pubkey).bind(emoji).execute(pool).await?.rows_affected() > 0)
+}
+
+pub(crate) async fn get_reactions(
+    pool: &SqlitePool,
+    community: CommunityId,
+    event_id: &[u8],
+    event_created_at: chrono::DateTime<chrono::Utc>,
+    limit: u32,
+    _cursor: Option<&str>,
+) -> Result<Vec<crate::reaction::ReactionGroup>> {
+    let rows = sqlx::query("SELECT r.emoji,r.pubkey,r.reaction_event_id FROM reactions r WHERE r.community_id=?1 AND r.event_id=?2 AND r.event_created_at=?3 AND r.removed_at IS NULL AND r.emoji IN (SELECT emoji FROM reactions WHERE community_id=?1 AND event_id=?2 AND event_created_at=?3 AND removed_at IS NULL GROUP BY emoji ORDER BY emoji LIMIT ?4) ORDER BY r.emoji,r.rowid")
+        .bind(community.as_uuid().to_string()).bind(event_id).bind(event_created_at.timestamp()).bind(limit as i64).fetch_all(pool).await?;
+    let mut groups = Vec::new();
+    let mut current: Option<String> = None;
+    let mut users = Vec::new();
+    for row in rows {
+        let emoji: String = row.try_get("emoji")?;
+        if current.as_ref() != Some(&emoji) {
+            if let Some(e) = current.take() {
+                groups.push(crate::reaction::ReactionGroup {
+                    emoji: e,
+                    count: users.len() as i64,
+                    users: std::mem::take(&mut users),
+                });
+            }
+            current = Some(emoji);
+        }
+        users.push(crate::reaction::ReactionUser {
+            pubkey: row.try_get("pubkey")?,
+            display_name: None,
+            reaction_event_id: row.try_get("reaction_event_id")?,
+        });
+    }
+    if let Some(e) = current {
+        groups.push(crate::reaction::ReactionGroup {
+            emoji: e,
+            count: users.len() as i64,
+            users,
+        });
+    }
+    Ok(groups)
+}
+
+pub(crate) async fn get_reactions_bulk(
+    pool: &SqlitePool,
+    community: CommunityId,
+    event_ids: &[(&[u8], chrono::DateTime<chrono::Utc>)],
+) -> Result<Vec<crate::reaction::BulkReactionEntry>> {
+    let mut out = Vec::new();
+    for (event_id, ts) in event_ids {
+        let rows=sqlx::query("SELECT emoji,COUNT(*) AS count FROM reactions WHERE community_id=?1 AND event_id=?2 AND event_created_at=?3 AND removed_at IS NULL GROUP BY emoji ORDER BY emoji").bind(community.as_uuid().to_string()).bind(*event_id).bind(ts.timestamp()).fetch_all(pool).await?;
+        if rows.is_empty() {
+            continue;
+        }
+        let reactions = rows
+            .into_iter()
+            .map(|r| {
+                Ok(crate::reaction::ReactionSummary {
+                    emoji: r.try_get("emoji")?,
+                    count: r.try_get("count")?,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        out.push(crate::reaction::BulkReactionEntry {
+            event_id: event_id.to_vec(),
+            event_created_at: *ts,
+            reactions,
+        });
+    }
+    Ok(out)
 }
 
 pub(crate) async fn remove_reaction(
