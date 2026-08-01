@@ -244,6 +244,8 @@ pub(crate) async fn migrate(pool: &SqlitePool) -> Result<()> {
             "CREATE TRIGGER events_fts_insert AFTER INSERT ON events WHEN new.kind IN (0, 9, 40002, 45001, 45003) BEGIN INSERT INTO events_fts(rowid, content) VALUES (new.rowid, new.content); END",
             "CREATE TRIGGER events_fts_delete AFTER DELETE ON events WHEN old.kind IN (0, 9, 40002, 45001, 45003) BEGIN INSERT INTO events_fts(events_fts, rowid, content) VALUES ('delete', old.rowid, old.content); END",
             "CREATE TRIGGER events_fts_update AFTER UPDATE OF content, kind ON events BEGIN INSERT INTO events_fts(events_fts, rowid, content) SELECT 'delete', old.rowid, old.content WHERE old.kind IN (0, 9, 40002, 45001, 45003); INSERT INTO events_fts(rowid, content) SELECT new.rowid, new.content WHERE new.kind IN (0, 9, 40002, 45001, 45003); END",
+            "INSERT OR IGNORE INTO channel_members (channel_id, pubkey, role, joined_at, invited_by, hidden_at, removed_at) SELECT winner.id, cm.pubkey, cm.role, cm.joined_at, cm.invited_by, cm.hidden_at, cm.removed_at FROM channels duplicate JOIN channels winner ON winner.id = (SELECT MIN(candidate.id) FROM channels candidate WHERE candidate.community_id = duplicate.community_id AND candidate.participant_hash = duplicate.participant_hash AND candidate.channel_type = 'dm' AND candidate.deleted_at IS NULL) JOIN channel_members cm ON cm.channel_id = duplicate.id WHERE duplicate.channel_type = 'dm' AND duplicate.deleted_at IS NULL AND duplicate.participant_hash IS NOT NULL AND duplicate.id <> winner.id",
+            "UPDATE channels SET deleted_at = unixepoch() WHERE channel_type = 'dm' AND deleted_at IS NULL AND participant_hash IS NOT NULL AND id <> (SELECT MIN(candidate.id) FROM channels candidate WHERE candidate.community_id = channels.community_id AND candidate.participant_hash = channels.participant_hash AND candidate.channel_type = 'dm' AND candidate.deleted_at IS NULL)",
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_channels_dm_hash ON channels (community_id, participant_hash) WHERE channel_type = 'dm' AND deleted_at IS NULL",
             "CREATE TABLE IF NOT EXISTS git_repo_names (community_id TEXT NOT NULL, repo_id TEXT NOT NULL, owner_pubkey TEXT NOT NULL, created_at INTEGER NOT NULL DEFAULT (unixepoch()), PRIMARY KEY (community_id, repo_id), FOREIGN KEY (community_id) REFERENCES communities(id) ON DELETE CASCADE)",
         ] {
@@ -1985,7 +1987,7 @@ mod tests {
                 .fetch_one(&upgraded)
                 .await
                 .unwrap(),
-            5
+            6
         );
         assert_eq!(
             sqlx::query_scalar::<_, i64>(
