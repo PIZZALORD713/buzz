@@ -32,10 +32,10 @@ pub(crate) struct Config {
 
 impl Config {
     pub(crate) fn from_env() -> anyhow::Result<Option<Self>> {
-        let enabled = std::env::var("BUZZ_LOCAL_MODE")
+        let legacy_spike_enabled = std::env::var("BUZZ_LOCAL_MODE")
             .ok()
             .is_some_and(|value| matches!(value.trim(), "1" | "true" | "on"));
-        if !enabled {
+        if !legacy_spike_enabled {
             return Ok(None);
         }
         let bind_addr = std::env::var("BUZZ_BIND_ADDR")

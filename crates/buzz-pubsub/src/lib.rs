@@ -96,8 +96,190 @@ impl PubSubConfig {
     }
 }
 
-/// Central pub/sub manager for a Buzz relay instance.
+/// Backend-neutral pub/sub handle selected once at relay startup.
+///
+/// Request handlers use this stable surface; backend selection never occurs in
+/// the event, presence, or subscription paths.
 pub struct PubSubManager {
+    backend: PubSubBackend,
+}
+
+enum PubSubBackend {
+    Redis(Arc<RedisPubSubManager>),
+}
+
+impl PubSubManager {
+    /// Creates the production Redis pub/sub backend.
+    pub async fn new(redis_url: &str, pool: deadpool_redis::Pool) -> Result<Self, PubSubError> {
+        Self::with_config(PubSubConfig::new(redis_url), pool).await
+    }
+
+    /// Creates the production Redis backend with explicit configuration.
+    pub async fn with_config(
+        config: PubSubConfig,
+        pool: deadpool_redis::Pool,
+    ) -> Result<Self, PubSubError> {
+        Ok(Self {
+            backend: PubSubBackend::Redis(Arc::new(
+                RedisPubSubManager::with_config(config, pool).await?,
+            )),
+        })
+    }
+
+    /// Runs the backend event subscriber. Process-local backends may implement
+    /// this as a pending task because publication already reaches local receivers.
+    pub async fn run_subscriber(self: Arc<Self>) {
+        match &self.backend {
+            PubSubBackend::Redis(backend) => Arc::clone(backend).run_subscriber().await,
+        }
+    }
+
+    /// Runs the backend cache-invalidation subscriber.
+    pub async fn run_cache_invalidation_subscriber(self: Arc<Self>) {
+        match &self.backend {
+            PubSubBackend::Redis(backend) => {
+                Arc::clone(backend)
+                    .run_cache_invalidation_subscriber()
+                    .await
+            }
+        }
+    }
+
+    /// Runs the backend connection-control subscriber.
+    pub async fn run_conn_control_subscriber(self: Arc<Self>) {
+        match &self.backend {
+            PubSubBackend::Redis(backend) => {
+                Arc::clone(backend).run_conn_control_subscriber().await
+            }
+        }
+    }
+
+    /// Returns a receiver for locally visible channel events.
+    pub fn subscribe_local(&self) -> broadcast::Receiver<ChannelEvent> {
+        match &self.backend {
+            PubSubBackend::Redis(backend) => backend.subscribe_local(),
+        }
+    }
+
+    /// Retains interest in a scoped event topic.
+    pub async fn retain_topic(&self, ctx: &TenantContext, topic: EventTopic) {
+        match &self.backend {
+            PubSubBackend::Redis(backend) => backend.retain_topic(ctx, topic).await,
+        }
+    }
+
+    /// Releases interest in a scoped event topic.
+    pub async fn release_topic(&self, ctx: &TenantContext, topic: EventTopic) {
+        match &self.backend {
+            PubSubBackend::Redis(backend) => backend.release_topic(ctx, topic).await,
+        }
+    }
+
+    /// Returns the current topic retain count.
+    pub async fn topic_refcount(&self, ctx: &TenantContext, topic: EventTopic) -> usize {
+        match &self.backend {
+            PubSubBackend::Redis(backend) => backend.topic_refcount(ctx, topic).await,
+        }
+    }
+
+    /// Returns a receiver for cache invalidations.
+    pub fn subscribe_cache_invalidations(&self) -> broadcast::Receiver<ScopedCacheInvalidation> {
+        match &self.backend {
+            PubSubBackend::Redis(backend) => backend.subscribe_cache_invalidations(),
+        }
+    }
+
+    /// Returns a receiver for connection-control commands.
+    pub fn subscribe_conn_control(&self) -> broadcast::Receiver<ScopedConnControl> {
+        match &self.backend {
+            PubSubBackend::Redis(backend) => backend.subscribe_conn_control(),
+        }
+    }
+
+    /// Publishes a cache invalidation.
+    pub async fn publish_cache_invalidation(
+        &self,
+        ctx: &TenantContext,
+        invalidation: &CacheInvalidation,
+    ) -> Result<i64, PubSubError> {
+        match &self.backend {
+            PubSubBackend::Redis(backend) => {
+                backend.publish_cache_invalidation(ctx, invalidation).await
+            }
+        }
+    }
+
+    /// Publishes a connection-control command.
+    pub async fn publish_conn_control(
+        &self,
+        ctx: &TenantContext,
+        command: &ConnControl,
+    ) -> Result<i64, PubSubError> {
+        match &self.backend {
+            PubSubBackend::Redis(backend) => backend.publish_conn_control(ctx, command).await,
+        }
+    }
+
+    /// Publishes an event to the selected backend.
+    pub async fn publish_event(
+        &self,
+        ctx: &TenantContext,
+        topic: EventTopic,
+        event: &nostr::Event,
+    ) -> Result<i64, PubSubError> {
+        match &self.backend {
+            PubSubBackend::Redis(backend) => backend.publish_event(ctx, topic, event).await,
+        }
+    }
+
+    /// Sets presence for a principal.
+    pub async fn set_presence(
+        &self,
+        ctx: &TenantContext,
+        pubkey: &PublicKey,
+        status: &str,
+    ) -> Result<(), PubSubError> {
+        match &self.backend {
+            PubSubBackend::Redis(backend) => backend.set_presence(ctx, pubkey, status).await,
+        }
+    }
+
+    /// Clears presence for a principal.
+    pub async fn clear_presence(
+        &self,
+        ctx: &TenantContext,
+        pubkey: &PublicKey,
+    ) -> Result<(), PubSubError> {
+        match &self.backend {
+            PubSubBackend::Redis(backend) => backend.clear_presence(ctx, pubkey).await,
+        }
+    }
+
+    /// Gets presence for one principal.
+    pub async fn get_presence(
+        &self,
+        ctx: &TenantContext,
+        pubkey: &PublicKey,
+    ) -> Result<Option<String>, PubSubError> {
+        match &self.backend {
+            PubSubBackend::Redis(backend) => backend.get_presence(ctx, pubkey).await,
+        }
+    }
+
+    /// Gets presence for multiple principals.
+    pub async fn get_presence_bulk(
+        &self,
+        ctx: &TenantContext,
+        pubkeys: &[PublicKey],
+    ) -> Result<HashMap<String, String>, PubSubError> {
+        match &self.backend {
+            PubSubBackend::Redis(backend) => backend.get_presence_bulk(ctx, pubkeys).await,
+        }
+    }
+}
+
+/// Redis implementation behind [`PubSubManager`].
+struct RedisPubSubManager {
     pool: deadpool_redis::Pool,
     /// Redis URL used by the reconnect loop to re-establish pub/sub connections.
     redis_url: String,
@@ -112,12 +294,7 @@ pub struct PubSubManager {
     conn_control_tx: broadcast::Sender<ScopedConnControl>,
 }
 
-impl PubSubManager {
-    /// Creates a new `PubSubManager` connected to the given Redis URL.
-    pub async fn new(redis_url: &str, pool: deadpool_redis::Pool) -> Result<Self, PubSubError> {
-        Self::with_config(PubSubConfig::new(redis_url), pool).await
-    }
-
+impl RedisPubSubManager {
     /// Creates a new `PubSubManager` using explicit pub/sub configuration.
     pub async fn with_config(
         config: PubSubConfig,
