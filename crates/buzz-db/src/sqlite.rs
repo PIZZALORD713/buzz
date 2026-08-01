@@ -204,11 +204,13 @@ pub(crate) async fn migrate(pool: &SqlitePool) -> Result<()> {
     if version < 3 {
         let mut tx = pool.begin().await?;
         for statement in [
-            "CREATE VIRTUAL TABLE IF NOT EXISTS events_fts USING fts5(content, content='events', content_rowid='rowid', tokenize='unicode61')",
+            "CREATE VIEW IF NOT EXISTS searchable_events AS SELECT rowid, content FROM events WHERE kind IN (0, 9, 40002, 45001, 45003)",
+            "CREATE VIRTUAL TABLE IF NOT EXISTS events_fts USING fts5(content, content='searchable_events', content_rowid='rowid', tokenize='unicode61')",
+            "INSERT INTO events_fts(events_fts) VALUES ('rebuild')",
             "CREATE TRIGGER IF NOT EXISTS events_fts_insert AFTER INSERT ON events WHEN new.kind IN (0, 9, 40002, 45001, 45003) BEGIN INSERT INTO events_fts(rowid, content) VALUES (new.rowid, new.content); END",
             "CREATE TRIGGER IF NOT EXISTS events_fts_delete AFTER DELETE ON events WHEN old.kind IN (0, 9, 40002, 45001, 45003) BEGIN INSERT INTO events_fts(events_fts, rowid, content) VALUES ('delete', old.rowid, old.content); END",
             "CREATE TRIGGER IF NOT EXISTS events_fts_update AFTER UPDATE OF content, kind ON events BEGIN INSERT INTO events_fts(events_fts, rowid, content) SELECT 'delete', old.rowid, old.content WHERE old.kind IN (0, 9, 40002, 45001, 45003); INSERT INTO events_fts(rowid, content) SELECT new.rowid, new.content WHERE new.kind IN (0, 9, 40002, 45001, 45003); END",
-            "INSERT INTO events_fts(rowid, content) SELECT rowid, content FROM events WHERE kind IN (0, 9, 40002, 45001, 45003)",
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_channels_dm_hash ON channels (community_id, participant_hash) WHERE channel_type = 'dm' AND deleted_at IS NULL",
         ] {
             sqlx::query(statement).execute(&mut *tx).await?;
         }
@@ -218,7 +220,17 @@ pub(crate) async fn migrate(pool: &SqlitePool) -> Result<()> {
         tx.commit().await?;
         version = 3;
     }
-    if version != 3 {
+    if version < 4 {
+        let mut tx = pool.begin().await?;
+        sqlx::query("CREATE TABLE IF NOT EXISTS archived_identities (community_id TEXT NOT NULL, pubkey TEXT NOT NULL, consent_path TEXT NOT NULL, actor TEXT NOT NULL, reason TEXT, replaced_by TEXT, request_event_id TEXT NOT NULL, archived_at INTEGER NOT NULL DEFAULT (unixepoch()), PRIMARY KEY (community_id, pubkey), FOREIGN KEY (community_id) REFERENCES communities(id) ON DELETE CASCADE)")
+            .execute(&mut *tx).await?;
+        sqlx::query("UPDATE schema_version SET version = 4 WHERE singleton = 1")
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        version = 4;
+    }
+    if version != 4 {
         return Err(crate::DbError::InvalidData(format!(
             "unsupported SQLite schema version {version}"
         )));
@@ -995,6 +1007,75 @@ pub(crate) async fn list_hidden_dms(
         .collect()
 }
 
+pub(crate) async fn is_archived(
+    pool: &SqlitePool,
+    community: CommunityId,
+    pubkey: &str,
+) -> Result<bool> {
+    Ok(sqlx::query_scalar::<_, i64>(
+        "SELECT EXISTS(SELECT 1 FROM archived_identities WHERE community_id = ?1 AND pubkey = ?2)",
+    )
+    .bind(community.as_uuid().to_string())
+    .bind(pubkey)
+    .fetch_one(pool)
+    .await?
+        != 0)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn archive(
+    pool: &SqlitePool,
+    community: CommunityId,
+    pubkey: &str,
+    consent_path: &str,
+    actor: &str,
+    reason: Option<&str>,
+    replaced_by: Option<&str>,
+    request_event_id: &str,
+) -> Result<bool> {
+    Ok(sqlx::query("INSERT INTO archived_identities (community_id,pubkey,consent_path,actor,reason,replaced_by,request_event_id) VALUES (?1,?2,?3,?4,?5,?6,?7) ON CONFLICT (community_id,pubkey) DO NOTHING")
+        .bind(community.as_uuid().to_string()).bind(pubkey).bind(consent_path).bind(actor).bind(reason).bind(replaced_by).bind(request_event_id)
+        .execute(pool).await?.rows_affected() > 0)
+}
+
+pub(crate) async fn unarchive(
+    pool: &SqlitePool,
+    community: CommunityId,
+    pubkey: &str,
+) -> Result<bool> {
+    Ok(
+        sqlx::query("DELETE FROM archived_identities WHERE community_id = ?1 AND pubkey = ?2")
+            .bind(community.as_uuid().to_string())
+            .bind(pubkey)
+            .execute(pool)
+            .await?
+            .rows_affected()
+            > 0,
+    )
+}
+
+pub(crate) async fn list_archived(
+    pool: &SqlitePool,
+    community: CommunityId,
+) -> Result<Vec<crate::archived_identities::ArchivedIdentity>> {
+    let rows = sqlx::query("SELECT pubkey,consent_path,actor,reason,replaced_by,request_event_id,archived_at FROM archived_identities WHERE community_id = ?1 ORDER BY archived_at ASC")
+        .bind(community.as_uuid().to_string()).fetch_all(pool).await?;
+    rows.into_iter()
+        .map(|row| {
+            let archived_at: i64 = row.try_get("archived_at")?;
+            Ok(crate::archived_identities::ArchivedIdentity {
+                pubkey: row.try_get("pubkey")?,
+                consent_path: row.try_get("consent_path")?,
+                actor: row.try_get("actor")?,
+                reason: row.try_get("reason")?,
+                replaced_by: row.try_get("replaced_by")?,
+                request_event_id: row.try_get("request_event_id")?,
+                archived_at: timestamp(archived_at)?,
+            })
+        })
+        .collect()
+}
+
 pub(crate) async fn open_dm(
     pool: &SqlitePool,
     community: CommunityId,
@@ -1541,7 +1622,7 @@ mod tests {
                 .fetch_one(&upgraded)
                 .await
                 .unwrap(),
-            3
+            4
         );
         for (table, column) in [
             ("channels", "participant_hash"),
@@ -1557,6 +1638,46 @@ mod tests {
         }
         upgraded.close().await;
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn archived_identities_are_idempotent_and_community_scoped() {
+        let pool = connect("sqlite::memory:").await.unwrap();
+        let a = ensure_configured_community(&pool, "archive-a.example")
+            .await
+            .unwrap()
+            .id;
+        let b = ensure_configured_community(&pool, "archive-b.example")
+            .await
+            .unwrap()
+            .id;
+        let pubkey = "aa".repeat(32);
+        let actor = "bb".repeat(32);
+        let event = "cc".repeat(32);
+        assert!(archive(
+            &pool,
+            a,
+            &pubkey,
+            "self",
+            &actor,
+            Some("reason"),
+            None,
+            &event
+        )
+        .await
+        .unwrap());
+        assert!(
+            !archive(&pool, a, &pubkey, "self", &actor, None, None, &event)
+                .await
+                .unwrap()
+        );
+        assert!(is_archived(&pool, a, &pubkey).await.unwrap());
+        assert!(!is_archived(&pool, b, &pubkey).await.unwrap());
+        assert_eq!(list_archived(&pool, a).await.unwrap().len(), 1);
+        assert!(list_archived(&pool, b).await.unwrap().is_empty());
+        assert!(!unarchive(&pool, b, &pubkey).await.unwrap());
+        assert!(unarchive(&pool, a, &pubkey).await.unwrap());
+        assert!(!unarchive(&pool, a, &pubkey).await.unwrap());
     }
 
     #[tokio::test]
@@ -1625,6 +1746,50 @@ mod tests {
                 .await
                 .unwrap()
         );
+    }
+
+    #[tokio::test]
+    async fn archived_identities_are_scoped_and_idempotent() {
+        let pool = connect("sqlite::memory:").await.unwrap();
+        let community = ensure_configured_community(&pool, "archive.example")
+            .await
+            .unwrap()
+            .id;
+        let foreign = ensure_configured_community(&pool, "archive-foreign.example")
+            .await
+            .unwrap()
+            .id;
+        let pubkey = "11".repeat(32);
+        let actor = "22".repeat(32);
+        let request = "33".repeat(32);
+
+        assert!(archive(
+            &pool,
+            community,
+            &pubkey,
+            "self",
+            &actor,
+            Some("rotated"),
+            None,
+            &request,
+        )
+        .await
+        .unwrap());
+        assert!(
+            !archive(&pool, community, &pubkey, "admin", &actor, None, None, &request,)
+                .await
+                .unwrap()
+        );
+        assert!(is_archived(&pool, community, &pubkey).await.unwrap());
+        assert!(!is_archived(&pool, foreign, &pubkey).await.unwrap());
+        let records = list_archived(&pool, community).await.unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].consent_path, "self");
+        assert_eq!(records[0].reason.as_deref(), Some("rotated"));
+        assert!(list_archived(&pool, foreign).await.unwrap().is_empty());
+        assert!(unarchive(&pool, community, &pubkey).await.unwrap());
+        assert!(!unarchive(&pool, community, &pubkey).await.unwrap());
+        assert!(!is_archived(&pool, community, &pubkey).await.unwrap());
     }
 
     #[tokio::test]

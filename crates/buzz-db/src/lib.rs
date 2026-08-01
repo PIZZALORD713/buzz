@@ -4967,7 +4967,12 @@ impl Db {
 
     /// Returns `true` if `pubkey` (64-char hex) is archived in `community_id`.
     pub async fn is_archived(&self, community_id: CommunityId, pubkey: &str) -> Result<bool> {
-        archived_identities::is_archived(self.pg_pool()?, community_id, pubkey).await
+        match &self.backend {
+            DbBackend::SQLite(pool) => sqlite::is_archived(pool, community_id, pubkey).await,
+            DbBackend::Postgres => {
+                archived_identities::is_archived(self.pg_pool()?, community_id, pubkey).await
+            }
+        }
     }
 
     /// Archives an identity in `community_id`. Returns `true` if inserted, `false` if already archived.
@@ -4982,22 +4987,44 @@ impl Db {
         replaced_by: Option<&str>,
         request_event_id: &str,
     ) -> Result<bool> {
-        archived_identities::archive(
-            self.pg_pool()?,
-            community_id,
-            pubkey,
-            consent_path,
-            actor,
-            reason,
-            replaced_by,
-            request_event_id,
-        )
-        .await
+        match &self.backend {
+            DbBackend::SQLite(pool) => {
+                sqlite::archive(
+                    pool,
+                    community_id,
+                    pubkey,
+                    consent_path,
+                    actor,
+                    reason,
+                    replaced_by,
+                    request_event_id,
+                )
+                .await
+            }
+            DbBackend::Postgres => {
+                archived_identities::archive(
+                    self.pg_pool()?,
+                    community_id,
+                    pubkey,
+                    consent_path,
+                    actor,
+                    reason,
+                    replaced_by,
+                    request_event_id,
+                )
+                .await
+            }
+        }
     }
 
     /// Unarchives an identity from `community_id`. Returns `true` if deleted, `false` if absent.
     pub async fn unarchive(&self, community_id: CommunityId, pubkey: &str) -> Result<bool> {
-        archived_identities::unarchive(self.pg_pool()?, community_id, pubkey).await
+        match &self.backend {
+            DbBackend::SQLite(pool) => sqlite::unarchive(pool, community_id, pubkey).await,
+            DbBackend::Postgres => {
+                archived_identities::unarchive(self.pg_pool()?, community_id, pubkey).await
+            }
+        }
     }
 
     /// Returns all identities archived in `community_id`, ordered by archive time ascending.
@@ -5005,7 +5032,12 @@ impl Db {
         &self,
         community_id: CommunityId,
     ) -> Result<Vec<archived_identities::ArchivedIdentity>> {
-        archived_identities::list_archived(self.pg_pool()?, community_id).await
+        match &self.backend {
+            DbBackend::SQLite(pool) => sqlite::list_archived(pool, community_id).await,
+            DbBackend::Postgres => {
+                archived_identities::list_archived(self.pg_pool()?, community_id).await
+            }
+        }
     }
 
     /// Soft-delete NIP-29 discovery events for a channel created by a specific relay pubkey.
