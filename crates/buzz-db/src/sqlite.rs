@@ -3492,28 +3492,136 @@ pub(crate) async fn update_user_profile(
     Ok(())
 }
 
+fn user_profile(row: sqlx::sqlite::SqliteRow) -> Result<crate::user::UserProfile> {
+    Ok(crate::user::UserProfile {
+        pubkey: row.try_get("pubkey")?,
+        display_name: row.try_get("display_name")?,
+        avatar_url: row.try_get("avatar_url")?,
+        about: row.try_get("about")?,
+        nip05_handle: row.try_get("nip05_handle")?,
+    })
+}
+
 pub(crate) async fn get_user(
     pool: &SqlitePool,
     community: CommunityId,
     pubkey: &[u8],
 ) -> Result<Option<crate::user::UserProfile>> {
-    let row = sqlx::query(
+    sqlx::query(
         "SELECT pubkey, display_name, avatar_url, about, nip05_handle FROM users WHERE community_id = ?1 AND pubkey = ?2",
     )
     .bind(community.as_uuid().to_string())
     .bind(pubkey)
     .fetch_optional(pool)
-    .await?;
-    row.map(|row| {
-        Ok(crate::user::UserProfile {
-            pubkey: row.try_get("pubkey")?,
-            display_name: row.try_get("display_name")?,
-            avatar_url: row.try_get("avatar_url")?,
-            about: row.try_get("about")?,
-            nip05_handle: row.try_get("nip05_handle")?,
-        })
-    })
+    .await?
+    .map(user_profile)
     .transpose()
+}
+
+pub(crate) async fn get_user_by_nip05(
+    pool: &SqlitePool,
+    community: CommunityId,
+    local_part: &str,
+    domain: &str,
+) -> Result<Option<crate::user::UserProfile>> {
+    let handle = format!("{local_part}@{domain}").to_lowercase();
+    let rows = sqlx::query(
+        "SELECT pubkey, display_name, avatar_url, about, nip05_handle FROM users WHERE community_id = ?1 AND nip05_handle IS NOT NULL",
+    )
+    .bind(community.as_uuid().to_string())
+    .fetch_all(pool)
+    .await?;
+    rows.into_iter()
+        .find(|row| {
+            row.try_get::<String, _>("nip05_handle")
+                .is_ok_and(|stored| stored.to_lowercase() == handle)
+        })
+        .map(user_profile)
+        .transpose()
+}
+
+pub(crate) async fn search_users(
+    pool: &SqlitePool,
+    community: CommunityId,
+    query: &str,
+    limit: u32,
+) -> Result<Vec<crate::user::UserSearchProfile>> {
+    let normalized = query.trim().to_lowercase();
+    if normalized.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let rows = sqlx::query(
+        "SELECT pubkey, display_name, avatar_url, nip05_handle FROM users WHERE community_id = ?1",
+    )
+    .bind(community.as_uuid().to_string())
+    .fetch_all(pool)
+    .await?;
+
+    let mut matches = rows
+        .into_iter()
+        .map(|row| {
+            let profile = crate::user::UserSearchProfile {
+                pubkey: row.try_get("pubkey")?,
+                display_name: row.try_get("display_name")?,
+                avatar_url: row.try_get("avatar_url")?,
+                nip05_handle: row.try_get("nip05_handle")?,
+            };
+            let display_name = profile
+                .display_name
+                .as_deref()
+                .unwrap_or_default()
+                .to_lowercase();
+            let nip05_handle = profile
+                .nip05_handle
+                .as_deref()
+                .unwrap_or_default()
+                .to_lowercase();
+            let pubkey = hex::encode(&profile.pubkey);
+            let rank = if display_name == normalized {
+                0
+            } else if nip05_handle == normalized {
+                1
+            } else if pubkey == normalized {
+                2
+            } else if display_name.starts_with(&normalized) {
+                3
+            } else if nip05_handle.starts_with(&normalized) {
+                4
+            } else if pubkey.starts_with(&normalized) {
+                5
+            } else {
+                6
+            };
+            let sort_name = profile
+                .display_name
+                .as_deref()
+                .filter(|value| !value.is_empty())
+                .or_else(|| {
+                    profile
+                        .nip05_handle
+                        .as_deref()
+                        .filter(|value| !value.is_empty())
+                })
+                .map(str::to_owned)
+                .unwrap_or_else(|| pubkey.clone());
+            Ok((
+                display_name.contains(&normalized)
+                    || nip05_handle.contains(&normalized)
+                    || pubkey.contains(&normalized),
+                rank,
+                sort_name,
+                profile,
+            ))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    matches.retain(|(is_match, _, _, _)| *is_match);
+    matches.sort_by(|left, right| left.1.cmp(&right.1).then_with(|| left.2.cmp(&right.2)));
+    Ok(matches
+        .into_iter()
+        .take(limit.clamp(1, 500) as usize)
+        .map(|(_, _, _, profile)| profile)
+        .collect())
 }
 
 pub(crate) async fn set_agent_owner(
@@ -4049,6 +4157,193 @@ mod tests {
         );
         upgraded.close().await;
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn user_nip05_and_search_match_scope_ranking_and_literal_like_contracts() {
+        let pool = connect("sqlite::memory:").await.unwrap();
+        let a = ensure_configured_community(&pool, "users-a.example")
+            .await
+            .unwrap()
+            .id;
+        let b = ensure_configured_community(&pool, "users-b.example")
+            .await
+            .unwrap()
+            .id;
+        let exact_name = vec![0x10_u8; 32];
+        let exact_nip05 = vec![0x20_u8; 32];
+        let prefix_name = vec![0x30_u8; 32];
+        let wildcard_name = vec![0x40_u8; 32];
+        let other_tenant = vec![0x50_u8; 32];
+        let unicode_name = vec![0x60_u8; 32];
+        let backslash_name = vec![0x70_u8; 32];
+
+        for pubkey in [
+            &exact_name,
+            &exact_nip05,
+            &prefix_name,
+            &wildcard_name,
+            &unicode_name,
+            &backslash_name,
+        ] {
+            ensure_user(&pool, a, pubkey).await.unwrap();
+        }
+        ensure_user(&pool, b, &other_tenant).await.unwrap();
+        update_user_profile(
+            &pool,
+            a,
+            &exact_name,
+            Some("Alice"),
+            Some("alice.png"),
+            Some("first"),
+            Some("name@example.com"),
+        )
+        .await
+        .unwrap();
+        update_user_profile(
+            &pool,
+            a,
+            &exact_nip05,
+            Some("Elsewhere"),
+            None,
+            None,
+            Some("alice"),
+        )
+        .await
+        .unwrap();
+        update_user_profile(
+            &pool,
+            a,
+            &prefix_name,
+            Some("Alice Cooper"),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        update_user_profile(
+            &pool,
+            a,
+            &wildcard_name,
+            Some("100%_literal"),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        update_user_profile(
+            &pool,
+            a,
+            &unicode_name,
+            Some("Älice"),
+            None,
+            None,
+            Some("Üser@example.com"),
+        )
+        .await
+        .unwrap();
+        update_user_profile(
+            &pool,
+            a,
+            &backslash_name,
+            Some(r"path\user"),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        update_user_profile(
+            &pool,
+            b,
+            &other_tenant,
+            Some("Other Tenant"),
+            None,
+            None,
+            Some("only-other@example.com"),
+        )
+        .await
+        .unwrap();
+
+        let nip05 = get_user_by_nip05(&pool, a, "NAME", "EXAMPLE.COM")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(nip05.pubkey, exact_name);
+        assert_eq!(nip05.about.as_deref(), Some("first"));
+        assert_eq!(
+            get_user_by_nip05(&pool, a, "ÜSER", "EXAMPLE.COM")
+                .await
+                .unwrap()
+                .unwrap()
+                .pubkey,
+            unicode_name
+        );
+        assert!(get_user_by_nip05(&pool, a, "only-other", "example.com")
+            .await
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            get_user_by_nip05(&pool, b, "only-other", "example.com")
+                .await
+                .unwrap()
+                .unwrap()
+                .pubkey,
+            other_tenant
+        );
+
+        let ranked = search_users(&pool, a, "  ALICE  ", 20).await.unwrap();
+        assert_eq!(
+            ranked
+                .iter()
+                .map(|profile| profile.pubkey.clone())
+                .collect::<Vec<_>>(),
+            vec![exact_name.clone(), exact_nip05.clone(), prefix_name]
+        );
+        assert!(search_users(&pool, a, " ", 20).await.unwrap().is_empty());
+        assert_eq!(
+            search_users(&pool, a, "%_", 20)
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|profile| profile.pubkey)
+                .collect::<Vec<_>>(),
+            vec![wildcard_name]
+        );
+        assert_eq!(
+            search_users(&pool, a, "ÄLICE", 20)
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|profile| profile.pubkey)
+                .collect::<Vec<_>>(),
+            vec![unicode_name]
+        );
+        assert_eq!(
+            search_users(&pool, a, r"path\user", 20)
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|profile| profile.pubkey)
+                .collect::<Vec<_>>(),
+            vec![backslash_name]
+        );
+        assert!(search_users(&pool, a, "other tenant", 20)
+            .await
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            search_users(&pool, a, "1010", 20)
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|profile| profile.pubkey)
+                .collect::<Vec<_>>(),
+            vec![exact_name]
+        );
+        assert_eq!(search_users(&pool, a, "alice", 0).await.unwrap().len(), 1);
     }
 
     #[tokio::test]

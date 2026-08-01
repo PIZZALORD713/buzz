@@ -2940,7 +2940,14 @@ impl Db {
         local_part: &str,
         domain: &str,
     ) -> Result<Option<user::UserProfile>> {
-        user::get_user_by_nip05(self.pg_pool()?, community_id, local_part, domain).await
+        match &self.backend {
+            DbBackend::SQLite(pool) => {
+                sqlite::get_user_by_nip05(pool, community_id, local_part, domain).await
+            }
+            DbBackend::Postgres => {
+                user::get_user_by_nip05(self.pg_pool()?, community_id, local_part, domain).await
+            }
+        }
     }
 
     /// Search users by display name, NIP-05 handle, or pubkey prefix.
@@ -2950,7 +2957,12 @@ impl Db {
         query: &str,
         limit: u32,
     ) -> Result<Vec<user::UserSearchProfile>> {
-        user::search_users(self.pg_pool()?, community_id, query, limit).await
+        match &self.backend {
+            DbBackend::SQLite(pool) => sqlite::search_users(pool, community_id, query, limit).await,
+            DbBackend::Postgres => {
+                user::search_users(self.pg_pool()?, community_id, query, limit).await
+            }
+        }
     }
 
     /// Atomically set agent owner — only if no owner is currently assigned.
