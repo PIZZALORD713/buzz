@@ -1030,6 +1030,135 @@ pub(crate) async fn query_events(
     Ok(events.into_iter().skip(offset).take(limit).collect())
 }
 
+pub(crate) async fn count_events(pool: &SqlitePool, q: &crate::EventQuery) -> Result<i64> {
+    let mut unpaged = q.clone();
+    unpaged.offset = None;
+    unpaged.limit = Some(i64::MAX);
+    unpaged.max_limit = Some(i64::MAX);
+    Ok(query_events(pool, &unpaged).await?.len() as i64)
+}
+
+pub(crate) async fn huddle_started_link_exists(
+    pool: &SqlitePool,
+    community: CommunityId,
+    parent_channel_id: Uuid,
+    ephemeral_channel_id: Uuid,
+    creator_pubkey: &[u8],
+) -> Result<bool> {
+    let rows = sqlx::query(
+        "SELECT content FROM events WHERE community_id = ?1 AND channel_id = ?2 AND kind = ?3 AND pubkey = ?4 AND length(CAST(content AS BLOB)) <= 512 AND instr(LOWER(content), LOWER(?5)) > 0 ORDER BY created_at DESC, id ASC LIMIT 32",
+    )
+    .bind(community.as_uuid().to_string())
+    .bind(parent_channel_id.to_string())
+    .bind(buzz_core::kind::KIND_HUDDLE_STARTED as i32)
+    .bind(creator_pubkey)
+    .bind(ephemeral_channel_id.to_string())
+    .fetch_all(pool)
+    .await?;
+    Ok(rows.into_iter().any(|row| {
+        row.try_get::<String, _>("content")
+            .ok()
+            .and_then(|content| serde_json::from_str::<serde_json::Value>(&content).ok())
+            .and_then(|value| {
+                value
+                    .get("ephemeral_channel_id")
+                    .and_then(serde_json::Value::as_str)
+                    .and_then(|id| Uuid::parse_str(id).ok())
+            })
+            .is_some_and(|id| id == ephemeral_channel_id)
+    }))
+}
+
+pub(crate) async fn get_latest_global_replaceable(
+    pool: &SqlitePool,
+    community: CommunityId,
+    kind: i32,
+    pubkey: &[u8],
+) -> Result<Option<buzz_core::StoredEvent>> {
+    sqlx::query("SELECT event_json, received_at, channel_id FROM events WHERE community_id = ?1 AND kind = ?2 AND pubkey = ?3 AND channel_id IS NULL ORDER BY created_at DESC, id ASC LIMIT 1")
+        .bind(community.as_uuid().to_string()).bind(kind).bind(pubkey)
+        .fetch_optional(pool).await?.map(stored_event).transpose()
+}
+
+pub(crate) async fn soft_delete_by_coordinate(
+    pool: &SqlitePool,
+    community: CommunityId,
+    kind: i32,
+    pubkey: &[u8],
+    d_tag: &str,
+) -> Result<bool> {
+    let rows = sqlx::query(
+        "SELECT id, event_json FROM events WHERE community_id = ?1 AND kind = ?2 AND pubkey = ?3",
+    )
+    .bind(community.as_uuid().to_string())
+    .bind(kind)
+    .bind(pubkey)
+    .fetch_all(pool)
+    .await?;
+    let mut ids = Vec::new();
+    for row in rows {
+        let event: nostr::Event = serde_json::from_str(&row.try_get::<String, _>("event_json")?)?;
+        let matches = crate::event::extract_d_tag(&event).as_deref() == Some(d_tag);
+        if matches {
+            ids.push(row.try_get::<Vec<u8>, _>("id")?);
+        }
+    }
+    let mut deleted = false;
+    for id in ids {
+        deleted |= sqlx::query("DELETE FROM events WHERE community_id = ?1 AND id = ?2")
+            .bind(community.as_uuid().to_string())
+            .bind(id)
+            .execute(pool)
+            .await?
+            .rows_affected()
+            != 0;
+    }
+    Ok(deleted)
+}
+
+pub(crate) async fn get_last_message_at(
+    pool: &SqlitePool,
+    community: CommunityId,
+    channel_id: Uuid,
+) -> Result<Option<chrono::DateTime<chrono::Utc>>> {
+    sqlx::query_scalar::<_, Option<i64>>(
+        "SELECT MAX(created_at) FROM events WHERE community_id = ?1 AND channel_id = ?2",
+    )
+    .bind(community.as_uuid().to_string())
+    .bind(channel_id.to_string())
+    .fetch_one(pool)
+    .await?
+    .map(timestamp)
+    .transpose()
+}
+
+pub(crate) async fn get_last_message_at_bulk(
+    pool: &SqlitePool,
+    community: CommunityId,
+    channel_ids: &[Uuid],
+) -> Result<std::collections::HashMap<Uuid, chrono::DateTime<chrono::Utc>>> {
+    if channel_ids.is_empty() {
+        return Ok(std::collections::HashMap::new());
+    }
+    let mut qb = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
+        "SELECT channel_id, MAX(created_at) AS last_at FROM events WHERE community_id = ",
+    );
+    qb.push_bind(community.as_uuid().to_string())
+        .push(" AND channel_id IN (");
+    let mut separated = qb.separated(", ");
+    for id in channel_ids {
+        separated.push_bind(id.to_string());
+    }
+    separated.push_unseparated(") GROUP BY channel_id");
+    let mut result = std::collections::HashMap::new();
+    for row in qb.build().fetch_all(pool).await? {
+        let id = Uuid::parse_str(&row.try_get::<String, _>("channel_id")?)
+            .map_err(|e| crate::DbError::InvalidData(format!("invalid SQLite channel id: {e}")))?;
+        result.insert(id, timestamp(row.try_get("last_at")?)?);
+    }
+    Ok(result)
+}
+
 pub(crate) async fn query_feed_mentions(
     pool: &SqlitePool,
     community: CommunityId,
@@ -3887,7 +4016,7 @@ fn community_record(row: sqlx::sqlite::SqliteRow) -> Result<CommunityRecord> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nostr::{EventBuilder, Keys, Kind};
+    use nostr::{EventBuilder, Keys, Kind, Tag, Timestamp};
 
     #[tokio::test]
     async fn upgrades_phase_1_core_schema_before_dm_use() {
@@ -4157,6 +4286,170 @@ mod tests {
         );
         upgraded.close().await;
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn direct_event_helpers_match_count_order_scope_and_delete_contracts() {
+        let pool = connect("sqlite::memory:").await.unwrap();
+        let a = ensure_configured_community(&pool, "events-a.example")
+            .await
+            .unwrap()
+            .id;
+        let b = ensure_configured_community(&pool, "events-b.example")
+            .await
+            .unwrap()
+            .id;
+        let keys = Keys::generate();
+        let other = Keys::generate();
+        let channel = Uuid::new_v4();
+        let ephemeral = Uuid::new_v4();
+        let d_tag = "coordinate";
+        let global_old = EventBuilder::new(Kind::Custom(30023), "old")
+            .tags([Tag::parse(["d", d_tag]).unwrap()])
+            .custom_created_at(Timestamp::from(100_u64))
+            .sign_with_keys(&keys)
+            .unwrap();
+        let global_new = EventBuilder::new(Kind::Custom(30023), "new")
+            .tags([Tag::parse(["d", d_tag]).unwrap()])
+            .custom_created_at(Timestamp::from(101_u64))
+            .sign_with_keys(&keys)
+            .unwrap();
+        let channel_event = EventBuilder::new(Kind::Custom(9), "channel")
+            .custom_created_at(Timestamp::from(102_u64))
+            .sign_with_keys(&keys)
+            .unwrap();
+        let huddle = EventBuilder::new(
+            Kind::Custom(buzz_core::kind::KIND_HUDDLE_STARTED as u16),
+            serde_json::json!({"ephemeral_channel_id": ephemeral}).to_string(),
+        )
+        .custom_created_at(Timestamp::from(103_u64))
+        .sign_with_keys(&keys)
+        .unwrap();
+        let second_d_only = EventBuilder::new(Kind::Custom(30024), "second d")
+            .tags([
+                Tag::parse(["d", "first-coordinate"]).unwrap(),
+                Tag::parse(["d", d_tag]).unwrap(),
+            ])
+            .custom_created_at(Timestamp::from(104_u64))
+            .sign_with_keys(&keys)
+            .unwrap();
+        let non_parameterized_d = EventBuilder::new(Kind::Custom(9), "not nip33")
+            .tags([Tag::parse(["d", d_tag]).unwrap()])
+            .custom_created_at(Timestamp::from(105_u64))
+            .sign_with_keys(&keys)
+            .unwrap();
+        for (community, event, channel_id) in [
+            (a, &global_old, None),
+            (a, &global_new, None),
+            (a, &channel_event, Some(channel)),
+            (a, &huddle, Some(channel)),
+            (a, &second_d_only, None),
+            (a, &non_parameterized_d, None),
+            (b, &global_new, None),
+        ] {
+            insert_event(&pool, community, event, channel_id)
+                .await
+                .unwrap();
+        }
+
+        let mut query = crate::EventQuery::for_community(a);
+        query.limit = Some(1);
+        query.offset = Some(1);
+        assert_eq!(count_events(&pool, &query).await.unwrap(), 6);
+        query.global_only = true;
+        query.offset = None;
+        assert_eq!(count_events(&pool, &query).await.unwrap(), 4);
+        assert_eq!(
+            get_latest_global_replaceable(&pool, a, 30023, &keys.public_key().to_bytes())
+                .await
+                .unwrap()
+                .unwrap()
+                .event
+                .id,
+            global_new.id
+        );
+        assert!(
+            get_latest_global_replaceable(&pool, a, 30023, &other.public_key().to_bytes())
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(huddle_started_link_exists(
+            &pool,
+            a,
+            channel,
+            ephemeral,
+            &keys.public_key().to_bytes()
+        )
+        .await
+        .unwrap());
+        for created_at in 104_u64..137 {
+            let noise = EventBuilder::new(
+                Kind::Custom(buzz_core::kind::KIND_HUDDLE_STARTED as u16),
+                serde_json::json!({"ephemeral_channel_id": Uuid::new_v4()}).to_string(),
+            )
+            .custom_created_at(Timestamp::from(created_at))
+            .sign_with_keys(&keys)
+            .unwrap();
+            insert_event(&pool, a, &noise, Some(channel)).await.unwrap();
+        }
+        assert!(huddle_started_link_exists(
+            &pool,
+            a,
+            channel,
+            ephemeral,
+            &keys.public_key().to_bytes()
+        )
+        .await
+        .unwrap());
+        assert!(!huddle_started_link_exists(
+            &pool,
+            b,
+            channel,
+            ephemeral,
+            &keys.public_key().to_bytes()
+        )
+        .await
+        .unwrap());
+        assert_eq!(
+            get_last_message_at(&pool, a, channel)
+                .await
+                .unwrap()
+                .unwrap()
+                .timestamp(),
+            136
+        );
+        let bulk = get_last_message_at_bulk(&pool, a, &[channel, Uuid::new_v4()])
+            .await
+            .unwrap();
+        assert_eq!(bulk.len(), 1);
+        assert_eq!(bulk[&channel].timestamp(), 136);
+        assert!(
+            soft_delete_by_coordinate(&pool, a, 30023, &keys.public_key().to_bytes(), d_tag)
+                .await
+                .unwrap()
+        );
+        assert!(
+            !soft_delete_by_coordinate(&pool, a, 30023, &keys.public_key().to_bytes(), d_tag)
+                .await
+                .unwrap()
+        );
+        assert!(get_event_by_id(&pool, a, global_new.id.as_bytes())
+            .await
+            .unwrap()
+            .is_none());
+        assert!(get_event_by_id(&pool, a, second_d_only.id.as_bytes())
+            .await
+            .unwrap()
+            .is_some());
+        assert!(get_event_by_id(&pool, a, non_parameterized_d.id.as_bytes())
+            .await
+            .unwrap()
+            .is_some());
+        assert!(get_event_by_id(&pool, b, global_new.id.as_bytes())
+            .await
+            .unwrap()
+            .is_some());
     }
 
     #[tokio::test]
