@@ -895,8 +895,18 @@ pub(crate) async fn create_dm(
     } else {
         format!("Group DM ({})", participants.len())
     };
-    sqlx::query("INSERT INTO channels (id, community_id, name, channel_type, visibility, participant_hash, created_by) VALUES (?1, ?2, ?3, 'dm', 'private', ?4, ?5)")
-        .bind(id.to_string()).bind(community.as_uuid().to_string()).bind(name).bind(hash.as_slice()).bind(created_by).execute(&mut *tx).await?;
+    let inserted = sqlx::query("INSERT INTO channels (id, community_id, name, channel_type, visibility, participant_hash, created_by) VALUES (?1, ?2, ?3, 'dm', 'private', ?4, ?5) ON CONFLICT DO NOTHING")
+        .bind(id.to_string()).bind(community.as_uuid().to_string()).bind(name).bind(hash.as_slice()).bind(created_by).execute(&mut *tx).await?.rows_affected() == 1;
+    if !inserted {
+        let row = sqlx::query(query)
+            .bind(community.as_uuid().to_string())
+            .bind(hash.as_slice())
+            .fetch_one(&mut *tx)
+            .await?;
+        let record = channel_record(row)?;
+        tx.commit().await?;
+        return Ok(record);
+    }
     for participant in participants {
         sqlx::query("INSERT INTO channel_members (channel_id, pubkey, role, invited_by) VALUES (?1, ?2, 'member', ?3)")
             .bind(id.to_string()).bind(*participant).bind(created_by).execute(&mut *tx).await?;
@@ -1614,6 +1624,16 @@ mod tests {
             .execute(&pool).await.unwrap();
         sqlx::query("CREATE TABLE channel_members (channel_id TEXT NOT NULL, pubkey BLOB NOT NULL, role TEXT NOT NULL, joined_at INTEGER NOT NULL DEFAULT (unixepoch()), invited_by BLOB, removed_at INTEGER, PRIMARY KEY (channel_id, pubkey))")
             .execute(&pool).await.unwrap();
+        sqlx::query("CREATE TABLE events (community_id TEXT NOT NULL, id BLOB NOT NULL, pubkey BLOB NOT NULL, created_at INTEGER NOT NULL, kind INTEGER NOT NULL, tags_json TEXT NOT NULL, content TEXT NOT NULL, sig BLOB NOT NULL, channel_id TEXT, received_at INTEGER NOT NULL, event_json TEXT NOT NULL, PRIMARY KEY (community_id, id))")
+            .execute(&pool).await.unwrap();
+        let legacy_community = Uuid::new_v4();
+        sqlx::query("INSERT INTO communities (id, host) VALUES (?1, 'legacy.example')")
+            .bind(legacy_community.to_string())
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO events (community_id,id,pubkey,created_at,kind,tags_json,content,sig,received_at,event_json) VALUES (?1,?2,?3,100,9,'[]','legacy searchable orchard',?4,100,'{}')")
+            .bind(legacy_community.to_string()).bind(vec![1_u8; 32]).bind(vec![2_u8; 32]).bind(vec![3_u8; 64]).execute(&pool).await.unwrap();
         pool.close().await;
 
         let upgraded = connect(path.to_str().unwrap()).await.unwrap();
@@ -1636,8 +1656,80 @@ mod tests {
                 .iter()
                 .any(|row| row.get::<String, _>("name") == column));
         }
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT count(*) FROM events_fts WHERE events_fts MATCH 'orchard'"
+            )
+            .fetch_one(&upgraded)
+            .await
+            .unwrap(),
+            1
+        );
         upgraded.close().await;
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn dm_create_list_hide_and_scope_match_contract() {
+        let pool = connect("sqlite::memory:").await.unwrap();
+        let a = ensure_configured_community(&pool, "dm-a.example")
+            .await
+            .unwrap()
+            .id;
+        let b = ensure_configured_community(&pool, "dm-b.example")
+            .await
+            .unwrap()
+            .id;
+        let owner = vec![1_u8; 32];
+        let peer = vec![2_u8; 32];
+        let participants = [owner.as_slice(), peer.as_slice()];
+        ensure_user(&pool, a, &owner).await.unwrap();
+        ensure_user(&pool, a, &peer).await.unwrap();
+        update_user_profile(&pool, a, &peer, Some("Peer"), None, None, None)
+            .await
+            .unwrap();
+        let first = create_dm(&pool, a, &participants, &owner).await.unwrap();
+        let second = create_dm(&pool, a, &participants, &owner).await.unwrap();
+        assert_eq!(first.id, second.id);
+        let hash = crate::dm::compute_participant_hash(&participants);
+        assert_eq!(
+            find_dm_by_participants(&pool, a, &hash)
+                .await
+                .unwrap()
+                .unwrap()
+                .id,
+            first.id
+        );
+        assert!(find_dm_by_participants(&pool, b, &hash)
+            .await
+            .unwrap()
+            .is_none());
+        let listed = list_dms_for_user(&pool, a, &owner, 20, None).await.unwrap();
+        assert_eq!(listed.len(), 1);
+        assert!(listed[0]
+            .participants
+            .iter()
+            .any(|p| p.display_name.as_deref() == Some("Peer")));
+        hide_dm(&pool, a, first.id, &owner).await.unwrap();
+        assert!(list_dms_for_user(&pool, a, &owner, 20, None)
+            .await
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            list_hidden_dms(&pool, a, &owner).await.unwrap(),
+            vec![first.id]
+        );
+        unhide_dm(&pool, a, first.id, &owner).await.unwrap();
+        assert_eq!(
+            list_dms_for_user(&pool, a, &owner, 20, None)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(create_dm(&pool, a, &[owner.as_slice()], &owner)
+            .await
+            .is_err());
     }
 
     #[tokio::test]
@@ -1678,6 +1770,66 @@ mod tests {
         assert!(!unarchive(&pool, b, &pubkey).await.unwrap());
         assert!(unarchive(&pool, a, &pubkey).await.unwrap());
         assert!(!unarchive(&pool, a, &pubkey).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn dm_helpers_are_idempotent_hidden_and_community_scoped() {
+        let pool = connect("sqlite::memory:").await.unwrap();
+        let community = ensure_configured_community(&pool, "dm.example")
+            .await
+            .unwrap()
+            .id;
+        let foreign = ensure_configured_community(&pool, "dm-foreign.example")
+            .await
+            .unwrap()
+            .id;
+        let alice = vec![1_u8; 32];
+        let bob = vec![2_u8; 32];
+        let participants = [alice.as_slice(), bob.as_slice()];
+        let first = create_dm(&pool, community, &participants, &alice)
+            .await
+            .unwrap();
+        let second = create_dm(&pool, community, &participants, &alice)
+            .await
+            .unwrap();
+        assert_eq!(first.id, second.id);
+        let hash = crate::dm::compute_participant_hash(&participants);
+        assert_eq!(
+            find_dm_by_participants(&pool, community, &hash)
+                .await
+                .unwrap()
+                .unwrap()
+                .id,
+            first.id
+        );
+        assert!(find_dm_by_participants(&pool, foreign, &hash)
+            .await
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            list_dms_for_user(&pool, community, &alice, 10, None)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        hide_dm(&pool, community, first.id, &alice).await.unwrap();
+        assert!(list_dms_for_user(&pool, community, &alice, 10, None)
+            .await
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            list_hidden_dms(&pool, community, &alice).await.unwrap(),
+            vec![first.id]
+        );
+        unhide_dm(&pool, community, first.id, &alice).await.unwrap();
+        assert_eq!(
+            list_dms_for_user(&pool, community, &alice, 10, None)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     #[tokio::test]
@@ -1746,50 +1898,6 @@ mod tests {
                 .await
                 .unwrap()
         );
-    }
-
-    #[tokio::test]
-    async fn archived_identities_are_scoped_and_idempotent() {
-        let pool = connect("sqlite::memory:").await.unwrap();
-        let community = ensure_configured_community(&pool, "archive.example")
-            .await
-            .unwrap()
-            .id;
-        let foreign = ensure_configured_community(&pool, "archive-foreign.example")
-            .await
-            .unwrap()
-            .id;
-        let pubkey = "11".repeat(32);
-        let actor = "22".repeat(32);
-        let request = "33".repeat(32);
-
-        assert!(archive(
-            &pool,
-            community,
-            &pubkey,
-            "self",
-            &actor,
-            Some("rotated"),
-            None,
-            &request,
-        )
-        .await
-        .unwrap());
-        assert!(
-            !archive(&pool, community, &pubkey, "admin", &actor, None, None, &request,)
-                .await
-                .unwrap()
-        );
-        assert!(is_archived(&pool, community, &pubkey).await.unwrap());
-        assert!(!is_archived(&pool, foreign, &pubkey).await.unwrap());
-        let records = list_archived(&pool, community).await.unwrap();
-        assert_eq!(records.len(), 1);
-        assert_eq!(records[0].consent_path, "self");
-        assert_eq!(records[0].reason.as_deref(), Some("rotated"));
-        assert!(list_archived(&pool, foreign).await.unwrap().is_empty());
-        assert!(unarchive(&pool, community, &pubkey).await.unwrap());
-        assert!(!unarchive(&pool, community, &pubkey).await.unwrap());
-        assert!(!is_archived(&pool, community, &pubkey).await.unwrap());
     }
 
     #[tokio::test]
