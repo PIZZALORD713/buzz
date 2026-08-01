@@ -2961,6 +2961,93 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn relay_invites_preserve_claim_scope_limits_policy_and_retention() {
+        let pool = connect(":memory:").await.unwrap();
+        let community = ensure_configured_community(&pool, "invites.local")
+            .await
+            .unwrap()
+            .id;
+        let foreign = ensure_configured_community(&pool, "foreign-invites.local")
+            .await
+            .unwrap()
+            .id;
+        let now = chrono::Utc::now().timestamp();
+        let bounded = [7_u8; 32];
+        sqlx::query("INSERT INTO relay_invites (community_id,id,token_hash,max_uses,expires_at,created_by) VALUES (?1,?2,?3,1,?4,'owner')")
+            .bind(community.as_uuid().to_string()).bind(Uuid::new_v4().to_string()).bind(bounded.as_slice()).bind(now + 3600).execute(&pool).await.unwrap();
+
+        assert_eq!(
+            claim_relay_invite(&pool, foreign, &bounded, "alice", None)
+                .await
+                .unwrap(),
+            crate::relay_invite::ClaimOutcome::Invalid
+        );
+        assert_eq!(
+            claim_relay_invite(&pool, community, &bounded, "alice", Some("v1"))
+                .await
+                .unwrap(),
+            crate::relay_invite::ClaimOutcome::Joined {
+                use_count: 1,
+                uses_remaining: Some(0)
+            }
+        );
+        assert_eq!(
+            claim_relay_invite(&pool, community, &bounded, "alice", Some("v1"))
+                .await
+                .unwrap(),
+            crate::relay_invite::ClaimOutcome::AlreadyMember {
+                use_count: 1,
+                uses_remaining: Some(0)
+            }
+        );
+        assert_eq!(
+            claim_relay_invite(&pool, community, &bounded, "bob", None)
+                .await
+                .unwrap(),
+            crate::relay_invite::ClaimOutcome::Exhausted
+        );
+        assert_eq!(sqlx::query_scalar::<_, i64>("SELECT count(*) FROM join_policy_acceptances WHERE community_id=?1 AND pubkey='alice' AND policy_version='v1'").bind(community.as_uuid().to_string()).fetch_one(&pool).await.unwrap(), 1);
+
+        let unlimited = [8_u8; 32];
+        sqlx::query("INSERT INTO relay_invites (community_id,id,token_hash,max_uses,expires_at,created_by) VALUES (?1,?2,?3,NULL,?4,'owner')")
+            .bind(community.as_uuid().to_string()).bind(Uuid::new_v4().to_string()).bind(unlimited.as_slice()).bind(now + 3600).execute(&pool).await.unwrap();
+        assert_eq!(
+            claim_relay_invite(&pool, community, &unlimited, "carol", None)
+                .await
+                .unwrap(),
+            crate::relay_invite::ClaimOutcome::Joined {
+                use_count: 1,
+                uses_remaining: None
+            }
+        );
+        assert_eq!(
+            claim_relay_invite(&pool, community, &unlimited, "dave", None)
+                .await
+                .unwrap(),
+            crate::relay_invite::ClaimOutcome::Joined {
+                use_count: 2,
+                uses_remaining: None
+            }
+        );
+
+        let expired = [9_u8; 32];
+        sqlx::query("INSERT INTO relay_invites (community_id,id,token_hash,max_uses,expires_at,created_by) VALUES (?1,?2,?3,1,?4,'owner')")
+            .bind(community.as_uuid().to_string()).bind(Uuid::new_v4().to_string()).bind(expired.as_slice()).bind(now - 10).execute(&pool).await.unwrap();
+        assert_eq!(
+            claim_relay_invite(&pool, community, &expired, "erin", None)
+                .await
+                .unwrap(),
+            crate::relay_invite::ClaimOutcome::Expired
+        );
+        assert_eq!(
+            reap_expired_relay_invites(&pool, chrono::Utc::now())
+                .await
+                .unwrap(),
+            1
+        );
+    }
+
+    #[tokio::test]
     async fn core_slice_survives_temporary_file_reopen() {
         let path = std::env::temp_dir().join(format!("buzz-db-{}.sqlite", Uuid::new_v4()));
         let path_string = path.to_string_lossy().into_owned();
