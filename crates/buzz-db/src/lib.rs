@@ -1162,18 +1162,36 @@ impl Db {
         cursor: Option<(DateTime<Utc>, Uuid)>,
         limit: i64,
     ) -> Result<Vec<admin_moderation::AdminReport>> {
-        admin_moderation::list_reports(
-            self.pg_pool()?,
-            community_id,
-            status,
-            report_type,
-            target_kind,
-            after,
-            before,
-            cursor,
-            limit,
-        )
-        .await
+        match &self.backend {
+            DbBackend::SQLite(pool) => {
+                sqlite::admin_list_reports(
+                    pool,
+                    community_id,
+                    status,
+                    report_type,
+                    target_kind,
+                    after,
+                    before,
+                    cursor,
+                    limit,
+                )
+                .await
+            }
+            DbBackend::Postgres => {
+                admin_moderation::list_reports(
+                    self.pg_pool()?,
+                    community_id,
+                    status,
+                    report_type,
+                    target_kind,
+                    after,
+                    before,
+                    cursor,
+                    limit,
+                )
+                .await
+            }
+        }
     }
 
     /// Fetch one report for the deployment-global read-only admin plane.
@@ -1181,7 +1199,10 @@ impl Db {
         &self,
         id: Uuid,
     ) -> Result<Option<admin_moderation::AdminReportDetail>> {
-        admin_moderation::get_report(self.pg_pool()?, id).await
+        match &self.backend {
+            DbBackend::SQLite(pool) => sqlite::admin_get_report(pool, id).await,
+            DbBackend::Postgres => admin_moderation::get_report(self.pg_pool()?, id).await,
+        }
     }
 
     /// List feedback for the deployment-global read-only admin plane.
@@ -1189,7 +1210,10 @@ impl Db {
         &self,
         limit: i64,
     ) -> Result<Vec<admin_moderation::AdminFeedback>> {
-        admin_moderation::list_feedback(self.pg_pool()?, limit).await
+        match &self.backend {
+            DbBackend::SQLite(pool) => sqlite::admin_list_feedback(pool, limit).await,
+            DbBackend::Postgres => admin_moderation::list_feedback(self.pg_pool()?, limit).await,
+        }
     }
 
     /// Fetch one feedback submission for the deployment-global admin plane.
@@ -1197,7 +1221,10 @@ impl Db {
         &self,
         id: Uuid,
     ) -> Result<Option<admin_moderation::AdminFeedback>> {
-        admin_moderation::get_feedback(self.pg_pool()?, id).await
+        match &self.backend {
+            DbBackend::SQLite(pool) => sqlite::admin_get_feedback(pool, id).await,
+            DbBackend::Postgres => admin_moderation::get_feedback(self.pg_pool()?, id).await,
+        }
     }
 
     /// Return total number of communities on this relay.
@@ -4927,7 +4954,14 @@ impl Db {
         community: CommunityId,
         feedback: product_feedback::NewProductFeedback<'_>,
     ) -> Result<Uuid> {
-        product_feedback::insert(self.pg_pool()?, community, feedback).await
+        match &self.backend {
+            DbBackend::SQLite(pool) => {
+                sqlite::insert_product_feedback(pool, community, feedback).await
+            }
+            DbBackend::Postgres => {
+                product_feedback::insert(self.pg_pool()?, community, feedback).await
+            }
+        }
     }
 
     /// List product feedback across the deployment, newest first.
@@ -4935,7 +4969,10 @@ impl Db {
         &self,
         limit: i64,
     ) -> Result<Vec<product_feedback::ProductFeedbackRecord>> {
-        product_feedback::list(self.pg_pool()?, limit).await
+        match &self.backend {
+            DbBackend::SQLite(pool) => sqlite::list_product_feedback(pool, limit).await,
+            DbBackend::Postgres => product_feedback::list(self.pg_pool()?, limit).await,
+        }
     }
 
     /// Insert a tenant-scoped NIP-56 report row, idempotent by report event id.

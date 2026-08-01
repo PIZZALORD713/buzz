@@ -300,7 +300,24 @@ pub(crate) async fn migrate(pool: &SqlitePool) -> Result<()> {
         tx.commit().await?;
         version = 8;
     }
-    if version != 8 {
+    if version < 9 {
+        let mut tx = pool.begin().await?;
+        for statement in [
+            "CREATE TABLE IF NOT EXISTS product_feedback (id TEXT PRIMARY KEY NOT NULL, community_id TEXT NOT NULL, event_id BLOB NOT NULL UNIQUE CHECK (length(event_id) = 32), submitter_pubkey BLOB NOT NULL CHECK (length(submitter_pubkey) = 32), category TEXT CHECK (category IN ('bug', 'praise', 'needs-work')), body TEXT NOT NULL CHECK (length(trim(body)) > 0), tags TEXT NOT NULL DEFAULT '[]' CHECK (json_valid(tags) AND json_type(tags) = 'array'), event_created_at INTEGER NOT NULL, received_at INTEGER NOT NULL DEFAULT (unixepoch()), FOREIGN KEY (community_id) REFERENCES communities(id) ON DELETE CASCADE)",
+            "CREATE TABLE IF NOT EXISTS moderation_reports (id TEXT PRIMARY KEY NOT NULL, community_id TEXT NOT NULL, report_event_id BLOB NOT NULL CHECK (length(report_event_id) = 32), reporter_pubkey BLOB NOT NULL CHECK (length(reporter_pubkey) = 32), target_kind TEXT NOT NULL CHECK (target_kind IN ('event', 'pubkey', 'blob')), target_event_id BLOB CHECK (target_event_id IS NULL OR length(target_event_id) = 32), target_pubkey BLOB CHECK (target_pubkey IS NULL OR length(target_pubkey) = 32), target_blob_sha256 BLOB CHECK (target_blob_sha256 IS NULL OR length(target_blob_sha256) = 32), channel_id TEXT, report_type TEXT NOT NULL, note TEXT, status TEXT NOT NULL DEFAULT 'open' CHECK (status IN ('open', 'resolved', 'dismissed', 'escalated')), resolved_by BLOB, resolved_at INTEGER, action_id TEXT, created_at INTEGER NOT NULL DEFAULT (unixepoch()), CHECK ((target_kind = 'event' AND target_event_id IS NOT NULL AND target_pubkey IS NULL AND target_blob_sha256 IS NULL) OR (target_kind = 'pubkey' AND target_event_id IS NULL AND target_pubkey IS NOT NULL AND target_blob_sha256 IS NULL) OR (target_kind = 'blob' AND target_event_id IS NULL AND target_pubkey IS NULL AND target_blob_sha256 IS NOT NULL)), FOREIGN KEY (community_id) REFERENCES communities(id) ON DELETE CASCADE, FOREIGN KEY (channel_id) REFERENCES channels(id))",
+            "CREATE INDEX IF NOT EXISTS idx_product_feedback_received ON product_feedback (received_at DESC, id)",
+            "CREATE INDEX IF NOT EXISTS idx_product_feedback_community_received ON product_feedback (community_id, received_at DESC, id)",
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_moderation_reports_event ON moderation_reports (community_id, report_event_id)",
+            "CREATE INDEX IF NOT EXISTS idx_moderation_reports_created ON moderation_reports (created_at DESC, id DESC)",
+            "CREATE INDEX IF NOT EXISTS idx_moderation_reports_status ON moderation_reports (community_id, status, created_at DESC)",
+        ] { sqlx::query(statement).execute(&mut *tx).await?; }
+        sqlx::query("UPDATE schema_version SET version = 9 WHERE singleton = 1")
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        version = 9;
+    }
+    if version != 9 {
         return Err(crate::DbError::InvalidData(format!(
             "unsupported SQLite schema version {version}"
         )));
@@ -1668,6 +1685,186 @@ pub(crate) async fn claim_relay_invite(
         uses_remaining: max_uses.map(|n| n - new_count),
     })
 }
+pub(crate) async fn insert_product_feedback(
+    pool: &SqlitePool,
+    community: CommunityId,
+    feedback: crate::product_feedback::NewProductFeedback<'_>,
+) -> Result<Uuid> {
+    let id = Uuid::new_v4();
+    sqlx::query("INSERT INTO product_feedback (id, community_id, event_id, submitter_pubkey, category, body, tags, event_created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) ON CONFLICT(event_id) DO UPDATE SET event_id = excluded.event_id")
+        .bind(id.to_string()).bind(community.as_uuid().to_string()).bind(feedback.event_id).bind(feedback.submitter_pubkey).bind(feedback.category).bind(feedback.body).bind(feedback.tags.to_string()).bind(feedback.event_created_at.timestamp()).execute(pool).await?;
+    Ok(
+        sqlx::query_scalar::<_, String>("SELECT id FROM product_feedback WHERE event_id = ?1")
+            .bind(feedback.event_id)
+            .fetch_one(pool)
+            .await?
+            .parse::<Uuid>()
+            .map_err(|e| crate::DbError::InvalidData(e.to_string()))?,
+    )
+}
+
+pub(crate) async fn list_product_feedback(
+    pool: &SqlitePool,
+    limit: i64,
+) -> Result<Vec<crate::product_feedback::ProductFeedbackRecord>> {
+    let rows = sqlx::query("SELECT id, community_id, event_id, submitter_pubkey, category, body, tags, event_created_at, received_at FROM product_feedback ORDER BY received_at DESC, id LIMIT ?1").bind(limit).fetch_all(pool).await?;
+    rows.into_iter()
+        .map(|r| {
+            Ok(crate::product_feedback::ProductFeedbackRecord {
+                id: r
+                    .get::<String, _>("id")
+                    .parse::<Uuid>()
+                    .map_err(|e| crate::DbError::InvalidData(e.to_string()))?,
+                community_id: r
+                    .get::<String, _>("community_id")
+                    .parse::<Uuid>()
+                    .map_err(|e| crate::DbError::InvalidData(e.to_string()))?,
+                event_id: hex::encode(r.get::<Vec<u8>, _>("event_id")),
+                submitter_pubkey: hex::encode(r.get::<Vec<u8>, _>("submitter_pubkey")),
+                category: r.get("category"),
+                body: r.get("body"),
+                tags: serde_json::from_str(&r.get::<String, _>("tags"))
+                    .map_err(|e| crate::DbError::InvalidData(e.to_string()))?,
+                event_created_at: timestamp(r.get("event_created_at"))?,
+                received_at: timestamp(r.get("received_at"))?,
+            })
+        })
+        .collect()
+}
+
+pub(crate) async fn admin_list_feedback(
+    pool: &SqlitePool,
+    limit: i64,
+) -> Result<Vec<crate::admin_moderation::AdminFeedback>> {
+    let rows = sqlx::query("SELECT f.id, f.community_id, c.host AS community_host, f.event_id, f.submitter_pubkey, f.category, f.body, f.tags, f.event_created_at, f.received_at FROM product_feedback f JOIN communities c ON c.id=f.community_id ORDER BY f.received_at DESC, f.id DESC LIMIT ?1").bind(limit.clamp(1, 200)).fetch_all(pool).await?;
+    rows.into_iter().map(admin_feedback_row).collect()
+}
+
+fn admin_feedback_row(
+    r: sqlx::sqlite::SqliteRow,
+) -> Result<crate::admin_moderation::AdminFeedback> {
+    Ok(crate::admin_moderation::AdminFeedback {
+        id: r
+            .get::<String, _>("id")
+            .parse::<Uuid>()
+            .map_err(|e| crate::DbError::InvalidData(e.to_string()))?,
+        community_id: r
+            .get::<String, _>("community_id")
+            .parse::<Uuid>()
+            .map_err(|e| crate::DbError::InvalidData(e.to_string()))?,
+        community_host: r.get("community_host"),
+        event_id: hex::encode(r.get::<Vec<u8>, _>("event_id")),
+        submitter_pubkey: hex::encode(r.get::<Vec<u8>, _>("submitter_pubkey")),
+        category: r.get("category"),
+        body: r.get("body"),
+        tags: serde_json::from_str(&r.get::<String, _>("tags"))
+            .map_err(|e| crate::DbError::InvalidData(e.to_string()))?,
+        event_created_at: timestamp(r.get("event_created_at"))?,
+        received_at: timestamp(r.get("received_at"))?,
+    })
+}
+
+pub(crate) async fn admin_get_feedback(
+    pool: &SqlitePool,
+    id: Uuid,
+) -> Result<Option<crate::admin_moderation::AdminFeedback>> {
+    sqlx::query("SELECT f.id, f.community_id, c.host AS community_host, f.event_id, f.submitter_pubkey, f.category, f.body, f.tags, f.event_created_at, f.received_at FROM product_feedback f JOIN communities c ON c.id=f.community_id WHERE f.id=?1").bind(id.to_string()).fetch_optional(pool).await?.map(admin_feedback_row).transpose()
+}
+pub(crate) async fn admin_list_reports(
+    pool: &SqlitePool,
+    community_id: Option<Uuid>,
+    status: Option<&str>,
+    report_type: Option<&str>,
+    target_kind: Option<&str>,
+    after: Option<chrono::DateTime<chrono::Utc>>,
+    before: Option<chrono::DateTime<chrono::Utc>>,
+    cursor: Option<(chrono::DateTime<chrono::Utc>, Uuid)>,
+    limit: i64,
+) -> Result<Vec<crate::admin_moderation::AdminReport>> {
+    let (cursor_time, cursor_id) = cursor.map_or((None, None), |(t, id)| {
+        (Some(t.timestamp()), Some(id.to_string()))
+    });
+    let rows = sqlx::query("SELECT r.id, r.community_id, c.host AS community_host, r.report_event_id, r.reporter_pubkey, r.target_kind, r.target_event_id, r.target_pubkey, r.target_blob_sha256, r.channel_id, r.report_type, r.note, r.status, r.resolved_by, r.resolved_at, r.action_id, r.created_at FROM moderation_reports r JOIN communities c ON c.id=r.community_id WHERE (?1 IS NULL OR r.community_id=?1) AND (?2 IS NULL OR r.status=?2) AND (?3 IS NULL OR r.report_type=?3) AND (?4 IS NULL OR r.target_kind=?4) AND (?5 IS NULL OR r.created_at>=?5) AND (?6 IS NULL OR r.created_at<?6) AND (?7 IS NULL OR r.created_at<?7 OR (r.created_at=?7 AND r.id<?8)) ORDER BY r.created_at DESC, r.id DESC LIMIT ?9").bind(community_id.map(|v| v.to_string())).bind(status).bind(report_type).bind(target_kind).bind(after.map(|v| v.timestamp())).bind(before.map(|v| v.timestamp())).bind(cursor_time).bind(cursor_id).bind(limit.clamp(1, 200)).fetch_all(pool).await?;
+    rows.into_iter().map(|r| admin_report_row(&r)).collect()
+}
+
+fn admin_report_row(r: &sqlx::sqlite::SqliteRow) -> Result<crate::admin_moderation::AdminReport> {
+    let kind: String = r.get("target_kind");
+    let target = match kind.as_str() {
+        "event" => r
+            .try_get::<Option<Vec<u8>>, _>("target_event_id")?
+            .unwrap_or_default(),
+        "pubkey" => r
+            .try_get::<Option<Vec<u8>>, _>("target_pubkey")?
+            .unwrap_or_default(),
+        "blob" => r
+            .try_get::<Option<Vec<u8>>, _>("target_blob_sha256")?
+            .unwrap_or_default(),
+        _ => Vec::new(),
+    };
+    Ok(crate::admin_moderation::AdminReport {
+        id: r
+            .get::<String, _>("id")
+            .parse::<Uuid>()
+            .map_err(|e| crate::DbError::InvalidData(e.to_string()))?,
+        community_id: r
+            .get::<String, _>("community_id")
+            .parse::<Uuid>()
+            .map_err(|e| crate::DbError::InvalidData(e.to_string()))?,
+        community_host: r.get("community_host"),
+        report_event_id: hex::encode(r.get::<Vec<u8>, _>("report_event_id")),
+        reporter_pubkey: hex::encode(r.get::<Vec<u8>, _>("reporter_pubkey")),
+        target_kind: kind,
+        target: hex::encode(target),
+        channel_id: r
+            .try_get::<Option<String>, _>("channel_id")?
+            .map(|value| {
+                Uuid::parse_str(&value)
+                    .map_err(|error| crate::DbError::InvalidData(error.to_string()))
+            })
+            .transpose()?,
+        report_type: r.get("report_type"),
+        note: r.get("note"),
+        status: r.get("status"),
+        resolved_by: r
+            .try_get::<Option<Vec<u8>>, _>("resolved_by")?
+            .map(hex::encode),
+        resolved_at: optional_timestamp(r.try_get("resolved_at")?)?,
+        action_id: r
+            .try_get::<Option<String>, _>("action_id")?
+            .map(|value| {
+                Uuid::parse_str(&value)
+                    .map_err(|error| crate::DbError::InvalidData(error.to_string()))
+            })
+            .transpose()?,
+        created_at: timestamp(r.get("created_at"))?,
+    })
+}
+
+pub(crate) async fn admin_get_report(
+    pool: &SqlitePool,
+    id: Uuid,
+) -> Result<Option<crate::admin_moderation::AdminReportDetail>> {
+    let row = sqlx::query("SELECT r.id, r.community_id, c.host AS community_host, r.report_event_id, r.reporter_pubkey, r.target_kind, r.target_event_id, r.target_pubkey, r.target_blob_sha256, r.channel_id, r.report_type, r.note, r.status, r.resolved_by, r.resolved_at, r.action_id, r.created_at, e.pubkey AS message_author_pubkey, e.content AS message_content, e.created_at AS message_created_at FROM moderation_reports r JOIN communities c ON c.id=r.community_id LEFT JOIN events e ON r.target_kind='event' AND e.community_id=r.community_id AND e.id=r.target_event_id WHERE r.id=?1").bind(id.to_string()).fetch_optional(pool).await?;
+    row.map(|r| {
+        let report = admin_report_row(&r)?;
+        let message = r
+            .try_get::<Option<Vec<u8>>, _>("message_author_pubkey")?
+            .map(
+                |author| -> Result<crate::admin_moderation::AdminReportedMessage> {
+                    Ok(crate::admin_moderation::AdminReportedMessage {
+                        author_pubkey: hex::encode(author),
+                        content: r.get("message_content"),
+                        created_at: timestamp(r.get("message_created_at"))?,
+                        deleted_at: None,
+                    })
+                },
+            )
+            .transpose()?;
+        Ok(crate::admin_moderation::AdminReportDetail { report, message })
+    })
+    .transpose()
+}
 pub(crate) async fn repo_name_owner(
     pool: &SqlitePool,
     community: CommunityId,
@@ -2355,7 +2552,7 @@ mod tests {
                 .fetch_one(&upgraded)
                 .await
                 .unwrap(),
-            8
+            9
         );
         for (table, column) in [
             ("channels", "participant_hash"),
@@ -2482,7 +2679,7 @@ mod tests {
                 .fetch_one(&upgraded)
                 .await
                 .unwrap(),
-            8
+            9
         );
         assert_eq!(
             sqlx::query_scalar::<_, i64>(
@@ -2880,6 +3077,119 @@ mod tests {
                 .await
                 .unwrap()
         );
+    }
+
+    #[tokio::test]
+    async fn product_feedback_is_deployment_idempotent_with_first_provenance() {
+        let pool = connect(":memory:").await.unwrap();
+        let first = ensure_configured_community(&pool, "feedback-first.local")
+            .await
+            .unwrap()
+            .id;
+        let second = ensure_configured_community(&pool, "feedback-second.local")
+            .await
+            .unwrap()
+            .id;
+        let event_id = vec![21_u8; 32];
+        let submitter = vec![22_u8; 32];
+        let tags = serde_json::json!([["category", "bug"]]);
+        let created_at = chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap();
+        let feedback = || crate::product_feedback::NewProductFeedback {
+            event_id: &event_id,
+            submitter_pubkey: &submitter,
+            category: Some("bug"),
+            body: "same signed feedback",
+            tags: &tags,
+            event_created_at: created_at,
+        };
+
+        let first_id = insert_product_feedback(&pool, first, feedback())
+            .await
+            .unwrap();
+        let replay_id = insert_product_feedback(&pool, second, feedback())
+            .await
+            .unwrap();
+        assert_eq!(replay_id, first_id);
+
+        let rows = list_product_feedback(&pool, 10).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].community_id, *first.as_uuid());
+        assert_eq!(rows[0].event_id, hex::encode(&event_id));
+        assert_eq!(rows[0].tags, tags);
+
+        let admin = admin_get_feedback(&pool, first_id).await.unwrap().unwrap();
+        assert_eq!(admin.community_id, *first.as_uuid());
+        assert_eq!(admin.community_host, "feedback-first.local");
+        assert_eq!(admin_list_feedback(&pool, 0).await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn admin_report_reads_filter_and_preserve_tenant_event_join() {
+        let pool = connect(":memory:").await.unwrap();
+        let community = ensure_configured_community(&pool, "reports.local")
+            .await
+            .unwrap()
+            .id;
+        let foreign = ensure_configured_community(&pool, "reports-foreign.local")
+            .await
+            .unwrap()
+            .id;
+        let report_id = Uuid::new_v4();
+        let target = vec![31_u8; 32];
+        let author = vec![32_u8; 32];
+        sqlx::query("INSERT INTO events (community_id,id,pubkey,created_at,kind,tags_json,content,sig,received_at,event_json) VALUES (?1,?2,?3,100,9,'[]','reported message',?4,100,'{}')")
+            .bind(community.as_uuid().to_string())
+            .bind(&target)
+            .bind(&author)
+            .bind(vec![33_u8; 64])
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO moderation_reports (id,community_id,report_event_id,reporter_pubkey,target_kind,target_event_id,report_type) VALUES (?1,?2,?3,?4,'event',?5,'spam')")
+            .bind(report_id.to_string())
+            .bind(community.as_uuid().to_string())
+            .bind(vec![34_u8; 32])
+            .bind(vec![35_u8; 32])
+            .bind(&target)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        assert!(admin_list_reports(
+            &pool,
+            Some(*foreign.as_uuid()),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            10,
+        )
+        .await
+        .unwrap()
+        .is_empty());
+        let reports = admin_list_reports(
+            &pool,
+            Some(*community.as_uuid()),
+            Some("open"),
+            Some("spam"),
+            Some("event"),
+            None,
+            None,
+            None,
+            10,
+        )
+        .await
+        .unwrap();
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].target, hex::encode(&target));
+
+        let detail = admin_get_report(&pool, report_id).await.unwrap().unwrap();
+        let message = detail.message.unwrap();
+        assert_eq!(message.author_pubkey, hex::encode(author));
+        assert_eq!(message.content, "reported message");
+        assert_eq!(message.deleted_at, None);
     }
 
     #[tokio::test]
