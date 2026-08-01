@@ -1560,6 +1560,74 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reaction_helpers_preserve_dedupe_aggregation_and_tenant_scope() {
+        let pool = connect("sqlite::memory:").await.unwrap();
+        let community = ensure_configured_community(&pool, "reactions.example")
+            .await
+            .unwrap()
+            .id;
+        let foreign = ensure_configured_community(&pool, "foreign.example")
+            .await
+            .unwrap()
+            .id;
+        let target = vec![1_u8; 32];
+        let actor = vec![2_u8; 32];
+        let source = vec![3_u8; 32];
+        let at = chrono::DateTime::from_timestamp(100, 0).unwrap();
+        assert!(
+            add_reaction(&pool, community, &target, at, &actor, "👍", None)
+                .await
+                .unwrap()
+        );
+        assert!(
+            !add_reaction(&pool, community, &target, at, &actor, "👍", None)
+                .await
+                .unwrap()
+        );
+        assert!(
+            set_reaction_event_id(&pool, community, &target, at, &actor, "👍", &source)
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            get_active_reaction_record(&pool, community, &target, at, &actor, "👍")
+                .await
+                .unwrap()
+                .unwrap()
+                .reaction_event_id,
+            Some(source)
+        );
+        let groups = get_reactions(&pool, community, &target, at, 10, None)
+            .await
+            .unwrap();
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].count, 1);
+        assert!(get_reactions(&pool, foreign, &target, at, 10, None)
+            .await
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            get_reactions_bulk(&pool, community, &[(&target, at)])
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(remove_reaction(&pool, community, &target, at, &actor, "👍")
+            .await
+            .unwrap());
+        assert!(get_reactions(&pool, community, &target, at, 10, None)
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(
+            add_reaction(&pool, community, &target, at, &actor, "👍", None)
+                .await
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
     async fn core_slice_survives_temporary_file_reopen() {
         let path = std::env::temp_dir().join(format!("buzz-db-{}.sqlite", Uuid::new_v4()));
         let path_string = path.to_string_lossy().into_owned();
