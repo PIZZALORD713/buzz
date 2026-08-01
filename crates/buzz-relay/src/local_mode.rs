@@ -4,6 +4,7 @@
 //! AppState so the spike can measure the coupling before a durable storage seam exists.
 
 use std::net::SocketAddr;
+use std::str::FromStr;
 use std::sync::Arc;
 
 use anyhow::Context;
@@ -15,7 +16,9 @@ use axum::Router;
 use futures_util::{SinkExt, StreamExt};
 use nostr::filter::MatchEventOptions;
 use nostr::{Event, Filter, Kind};
-use tokio::sync::{broadcast, RwLock};
+use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
+use sqlx::SqlitePool;
+use tokio::sync::broadcast;
 use tracing::{info, warn};
 use uuid::Uuid;
 
@@ -24,6 +27,7 @@ use buzz_relay::protocol::{ClientMessage, RelayMessage};
 pub(crate) struct Config {
     bind_addr: SocketAddr,
     relay_url: String,
+    database_url: String,
 }
 
 impl Config {
@@ -40,24 +44,37 @@ impl Config {
             .context("invalid BUZZ_BIND_ADDR")?;
         let relay_url =
             std::env::var("BUZZ_RELAY_URL").unwrap_or_else(|_| format!("ws://{bind_addr}"));
+        let database_url =
+            std::env::var("BUZZ_LOCAL_DB").unwrap_or_else(|_| "sqlite://buzz-local-mode.db".into());
         Ok(Some(Self {
             bind_addr,
             relay_url,
+            database_url,
         }))
     }
 }
 
 #[derive(Clone)]
 struct LocalState {
-    events: Arc<RwLock<Vec<Event>>>,
+    db: SqlitePool,
     fanout: broadcast::Sender<Event>,
     relay_url: Arc<str>,
 }
 
 pub(crate) async fn run(config: Config) -> anyhow::Result<()> {
+    let options = SqliteConnectOptions::from_str(&config.database_url)?.create_if_missing(true);
+    let db = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(options)
+        .await?;
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS events (id TEXT PRIMARY KEY, event_json TEXT NOT NULL)",
+    )
+    .execute(&db)
+    .await?;
     let (fanout, _) = broadcast::channel(1024);
     let state = LocalState {
-        events: Arc::new(RwLock::new(Vec::new())),
+        db,
         fanout,
         relay_url: config.relay_url.into(),
     };
@@ -67,7 +84,7 @@ pub(crate) async fn run(config: Config) -> anyhow::Result<()> {
         .route("/_readiness", get(|| async { "ok" }))
         .with_state(state);
     let listener = tokio::net::TcpListener::bind(config.bind_addr).await?;
-    info!(bind_addr = %config.bind_addr, "BUZZ_LOCAL_MODE active: in-memory store and fan-out; external services bypassed");
+    info!(bind_addr = %config.bind_addr, "BUZZ_LOCAL_MODE active: SQLite store and in-process fan-out; external services bypassed");
     axum::serve(listener, app).await?;
     Ok(())
 }
@@ -116,18 +133,25 @@ async fn serve_socket(socket: WebSocket, state: LocalState) {
                             let _ = tx.send(Message::Text(RelayMessage::ok(&id, false, "invalid: bad signature").into())).await;
                             continue;
                         }
-                        let inserted = {
-                            let mut events = state.events.write().await;
-                            if events.iter().any(|stored| stored.id == event.id) { false } else {
-                                events.push(event.clone());
-                                true
+                        let event_json = match serde_json::to_string(&event) {
+                            Ok(json) => json,
+                            Err(error) => {
+                                let _ = tx.send(Message::Text(RelayMessage::ok(&id, false, &format!("error: {error}")).into())).await;
+                                continue;
                             }
                         };
+                        let inserted = sqlx::query("INSERT OR IGNORE INTO events (id, event_json) VALUES (?, ?)")
+                            .bind(&id)
+                            .bind(event_json)
+                            .execute(&state.db)
+                            .await
+                            .map(|result| result.rows_affected() == 1)
+                            .unwrap_or(false);
                         if inserted { let _ = state.fanout.send(event); }
                         let _ = tx.send(Message::Text(RelayMessage::ok(&id, true, if inserted { "" } else { "duplicate" }).into())).await;
                     }
                     ClientMessage::Req { sub_id, filters } if authenticated => {
-                        let events = state.events.read().await.clone();
+                        let events = load_events(&state.db).await;
                         for event in events.iter().filter(|event| matches_any(&filters, event)) {
                             if tx.send(Message::Text(RelayMessage::event(&sub_id, event).into())).await.is_err() { return; }
                         }
@@ -136,7 +160,7 @@ async fn serve_socket(socket: WebSocket, state: LocalState) {
                         subscriptions.push((sub_id, filters));
                     }
                     ClientMessage::Count { sub_id, filters } if authenticated => {
-                        let count = state.events.read().await.iter().filter(|event| matches_any(&filters, event)).count() as u64;
+                        let count = load_events(&state.db).await.iter().filter(|event| matches_any(&filters, event)).count() as u64;
                         let _ = tx.send(Message::Text(RelayMessage::count(&sub_id, count).into())).await;
                     }
                     ClientMessage::Close(sub_id) => subscriptions.retain(|(existing, _)| existing != &sub_id),
@@ -174,4 +198,14 @@ fn matches_any(filters: &[Filter], event: &Event) -> bool {
         || filters
             .iter()
             .any(|filter| filter.match_event(event, MatchEventOptions::default()))
+}
+
+async fn load_events(db: &SqlitePool) -> Vec<Event> {
+    sqlx::query_scalar::<_, String>("SELECT event_json FROM events ORDER BY rowid")
+        .fetch_all(db)
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|json| serde_json::from_str(&json).ok())
+        .collect()
 }
