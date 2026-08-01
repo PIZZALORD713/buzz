@@ -3,7 +3,11 @@ import test from "node:test";
 
 import {
   clearCommunityStorage,
+  deriveCommunityName,
   initFirstCommunity,
+  isLocalCommunityRelayUrl,
+  LOCAL_COMMUNITY_NAME,
+  LOCAL_COMMUNITY_RELAY_URL,
   migrateLegacyCommunityStorage,
   shouldAutoConnectDefaultRelay,
 } from "./communityStorage.ts";
@@ -47,6 +51,16 @@ test("migrateLegacyCommunityStorage does not overwrite new community state", () 
 
   assert.equal(storage.getItem("buzz-communities"), '[{"id":"new"}]');
   assert.equal(storage.getItem("buzz-active-community-id"), "new");
+});
+
+test("only the local sentinel identifies the desktop-managed workspace", () => {
+  assert.equal(isLocalCommunityRelayUrl(LOCAL_COMMUNITY_RELAY_URL), true);
+  assert.equal(
+    deriveCommunityName(LOCAL_COMMUNITY_RELAY_URL),
+    LOCAL_COMMUNITY_NAME,
+  );
+  assert.equal(isLocalCommunityRelayUrl("ws://127.0.0.1:4317"), false);
+  assert.equal(isLocalCommunityRelayUrl("ws://localhost:4317"), false);
 });
 
 test("signed-build relay defaults auto-connect during first-run onboarding", () => {

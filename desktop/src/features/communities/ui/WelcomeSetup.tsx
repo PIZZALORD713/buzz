@@ -1,6 +1,10 @@
 import * as React from "react";
 import { Check, Copy } from "lucide-react";
 
+import {
+  LOCAL_COMMUNITY_NAME,
+  LOCAL_COMMUNITY_RELAY_URL,
+} from "@/features/communities/communityStorage";
 import { HostedCommunityOnboarding } from "@/features/communities/ui/HostedCommunityOnboarding";
 import { useCommunityOnboarding } from "@/features/onboarding/communityOnboarding";
 import { InviteRedeemForm } from "@/features/onboarding/ui/InviteRedeemForm";
@@ -92,6 +96,15 @@ export function WelcomeSetup({
     [communityOnboarding, page],
   );
 
+  const startLocalCommunity = React.useCallback(() => {
+    communityOnboarding.start({
+      source: "first-community",
+      firstCommunityPage: "join",
+      communityName: LOCAL_COMMUNITY_NAME,
+      relayUrl: LOCAL_COMMUNITY_RELAY_URL,
+    });
+  }, [communityOnboarding]);
+
   const transitionDirection =
     transitionMode === "backward" ? "backward" : "forward";
   const welcomeEffect =
@@ -124,6 +137,19 @@ export function WelcomeSetup({
                 </p>
               </div>
               <div className="flex w-full flex-1 translate-y-16 flex-col items-center justify-center gap-20 py-8">
+                <Card
+                  asChild
+                  className={COMMUNITY_OPTION_CARD_CLASS}
+                  variant="textured"
+                >
+                  <button
+                    data-testid="community-choice-local"
+                    onClick={startLocalCommunity}
+                    type="button"
+                  >
+                    Use this device
+                  </button>
+                </Card>
                 <Card
                   asChild
                   className={COMMUNITY_OPTION_CARD_CLASS}
