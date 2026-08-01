@@ -3847,17 +3847,34 @@ impl Db {
         channel_ids: Option<&[Uuid]>,
         expires_at: Option<DateTime<Utc>>,
     ) -> Result<Uuid> {
-        api_token::create_api_token(
-            self.pg_pool()?,
-            *community_id.as_uuid(),
-            token_hash,
-            owner_pubkey,
-            name,
-            scopes,
-            channel_ids,
-            expires_at,
-        )
-        .await
+        match &self.backend {
+            DbBackend::SQLite(pool) => {
+                sqlite::create_api_token(
+                    pool,
+                    community_id,
+                    token_hash,
+                    owner_pubkey,
+                    name,
+                    scopes,
+                    channel_ids,
+                    expires_at,
+                )
+                .await
+            }
+            DbBackend::Postgres => {
+                api_token::create_api_token(
+                    self.pg_pool()?,
+                    *community_id.as_uuid(),
+                    token_hash,
+                    owner_pubkey,
+                    name,
+                    scopes,
+                    channel_ids,
+                    expires_at,
+                )
+                .await
+            }
+        }
     }
 
     /// Atomic conditional INSERT with 10-token limit (per (community, owner)).
@@ -3872,17 +3889,34 @@ impl Db {
         channel_ids: Option<&[Uuid]>,
         expires_at: Option<DateTime<Utc>>,
     ) -> Result<Option<Uuid>> {
-        api_token::create_api_token_if_under_limit(
-            self.pg_pool()?,
-            *community_id.as_uuid(),
-            token_hash,
-            owner_pubkey,
-            name,
-            scopes,
-            channel_ids,
-            expires_at,
-        )
-        .await
+        match &self.backend {
+            DbBackend::SQLite(pool) => {
+                sqlite::create_api_token_if_under_limit(
+                    pool,
+                    community_id,
+                    token_hash,
+                    owner_pubkey,
+                    name,
+                    scopes,
+                    channel_ids,
+                    expires_at,
+                )
+                .await
+            }
+            DbBackend::Postgres => {
+                api_token::create_api_token_if_under_limit(
+                    self.pg_pool()?,
+                    *community_id.as_uuid(),
+                    token_hash,
+                    owner_pubkey,
+                    name,
+                    scopes,
+                    channel_ids,
+                    expires_at,
+                )
+                .await
+            }
+        }
     }
 
     /// Look up an active (non-revoked) API token by its SHA-256 hash,
@@ -3896,22 +3930,25 @@ impl Db {
         community_id: CommunityId,
         hash: &[u8],
     ) -> Result<Option<ApiTokenRecord>> {
-        let row = sqlx::query(
-            r#"
+        match &self.backend {
+            DbBackend::SQLite(pool) => {
+                sqlite::get_api_token_by_hash(pool, community_id, hash, false).await
+            }
+            DbBackend::Postgres => {
+                let row = sqlx::query(
+                    r#"
             SELECT id, token_hash, owner_pubkey, name, scopes, channel_ids,
                    created_at, expires_at, last_used_at, revoked_at
             FROM api_tokens
             WHERE community_id = $1 AND token_hash = $2 AND revoked_at IS NULL
             "#,
-        )
-        .bind(community_id.as_uuid())
-        .bind(hash)
-        .fetch_optional(self.pg_pool()?)
-        .await?;
-
-        match row {
-            None => Ok(None),
-            Some(r) => parse_api_token_row(r).map(Some),
+                )
+                .bind(community_id.as_uuid())
+                .bind(hash)
+                .fetch_optional(self.pg_pool()?)
+                .await?;
+                row.map(parse_api_token_row).transpose()
+            }
         }
     }
 
@@ -3921,24 +3958,30 @@ impl Db {
         community_id: CommunityId,
         hash: &[u8],
     ) -> Result<Option<ApiTokenRecord>> {
-        api_token::get_api_token_by_hash_including_revoked(
-            self.pg_pool()?,
-            *community_id.as_uuid(),
-            hash,
-        )
-        .await
+        match &self.backend {
+            DbBackend::SQLite(pool) => {
+                sqlite::get_api_token_by_hash(pool, community_id, hash, true).await
+            }
+            DbBackend::Postgres => {
+                api_token::get_api_token_by_hash_including_revoked(
+                    self.pg_pool()?,
+                    *community_id.as_uuid(),
+                    hash,
+                )
+                .await
+            }
+        }
     }
 
     /// Record a token usage (update `last_used_at`), scoped to community.
     pub async fn touch_api_token(&self, community_id: CommunityId, hash: &[u8]) -> Result<()> {
-        sqlx::query(
-            "UPDATE api_tokens SET last_used_at = NOW() WHERE community_id = $1 AND token_hash = $2",
-        )
-        .bind(community_id.as_uuid())
-        .bind(hash)
-        .execute(self.pg_pool()?)
-        .await?;
-        Ok(())
+        match &self.backend {
+            DbBackend::SQLite(pool) => sqlite::touch_api_token(pool, community_id, hash).await,
+            DbBackend::Postgres => {
+                sqlx::query("UPDATE api_tokens SET last_used_at = NOW() WHERE community_id = $1 AND token_hash = $2").bind(community_id.as_uuid()).bind(hash).execute(self.pg_pool()?).await?;
+                Ok(())
+            }
+        }
     }
 
     /// Alias for [`Self::touch_api_token`].
@@ -3952,36 +3995,41 @@ impl Db {
 
     /// List all active (non-revoked) tokens in a community, newest first.
     pub async fn list_active_tokens(&self, community_id: CommunityId) -> Result<Vec<TokenSummary>> {
-        let rows = sqlx::query(
-            r#"
+        match &self.backend {
+            DbBackend::SQLite(pool) => sqlite::list_active_tokens(pool, community_id).await,
+            DbBackend::Postgres => {
+                let rows = sqlx::query(
+                    r#"
             SELECT id, name, owner_pubkey, scopes, created_at, expires_at
             FROM api_tokens
             WHERE community_id = $1 AND revoked_at IS NULL
             ORDER BY created_at DESC
             LIMIT 1000
             "#,
-        )
-        .bind(community_id.as_uuid())
-        .fetch_all(self.pg_pool()?)
-        .await?;
+                )
+                .bind(community_id.as_uuid())
+                .fetch_all(self.pg_pool()?)
+                .await?;
 
-        let mut out = Vec::with_capacity(rows.len());
-        for row in rows {
-            let id: Uuid = row.try_get("id")?;
-            let scopes_json: serde_json::Value = row.try_get("scopes")?;
-            let scopes: Vec<String> = serde_json::from_value(scopes_json)
-                .map_err(|e| DbError::InvalidData(format!("scopes JSON: {e}")))?;
+                let mut out = Vec::with_capacity(rows.len());
+                for row in rows {
+                    let id: Uuid = row.try_get("id")?;
+                    let scopes_json: serde_json::Value = row.try_get("scopes")?;
+                    let scopes: Vec<String> = serde_json::from_value(scopes_json)
+                        .map_err(|e| DbError::InvalidData(format!("scopes JSON: {e}")))?;
 
-            out.push(TokenSummary {
-                id,
-                name: row.try_get("name")?,
-                owner_pubkey: row.try_get("owner_pubkey")?,
-                scopes,
-                created_at: row.try_get("created_at")?,
-                expires_at: row.try_get("expires_at")?,
-            });
+                    out.push(TokenSummary {
+                        id,
+                        name: row.try_get("name")?,
+                        owner_pubkey: row.try_get("owner_pubkey")?,
+                        scopes,
+                        created_at: row.try_get("created_at")?,
+                        expires_at: row.try_get("expires_at")?,
+                    });
+                }
+                Ok(out)
+            }
         }
-        Ok(out)
     }
 
     /// List all tokens for a (community, owner) pair (including revoked).
@@ -3990,7 +4038,15 @@ impl Db {
         community_id: CommunityId,
         pubkey: &[u8],
     ) -> Result<Vec<ApiTokenRecord>> {
-        api_token::list_tokens_by_owner(self.pg_pool()?, *community_id.as_uuid(), pubkey).await
+        match &self.backend {
+            DbBackend::SQLite(pool) => {
+                sqlite::list_tokens_by_owner(pool, community_id, pubkey).await
+            }
+            DbBackend::Postgres => {
+                api_token::list_tokens_by_owner(self.pg_pool()?, *community_id.as_uuid(), pubkey)
+                    .await
+            }
+        }
     }
 
     /// Revoke a single token by ID, scoped to (community, owner).
@@ -4001,14 +4057,21 @@ impl Db {
         owner_pubkey: &[u8],
         revoked_by: &[u8],
     ) -> Result<bool> {
-        api_token::revoke_token(
-            self.pg_pool()?,
-            *community_id.as_uuid(),
-            id,
-            owner_pubkey,
-            revoked_by,
-        )
-        .await
+        match &self.backend {
+            DbBackend::SQLite(pool) => {
+                sqlite::revoke_token(pool, community_id, id, owner_pubkey, revoked_by).await
+            }
+            DbBackend::Postgres => {
+                api_token::revoke_token(
+                    self.pg_pool()?,
+                    *community_id.as_uuid(),
+                    id,
+                    owner_pubkey,
+                    revoked_by,
+                )
+                .await
+            }
+        }
     }
 
     /// Revoke all active tokens for a (community, owner) pair.
@@ -4018,13 +4081,20 @@ impl Db {
         owner_pubkey: &[u8],
         revoked_by: &[u8],
     ) -> Result<u64> {
-        api_token::revoke_all_tokens(
-            self.pg_pool()?,
-            *community_id.as_uuid(),
-            owner_pubkey,
-            revoked_by,
-        )
-        .await
+        match &self.backend {
+            DbBackend::SQLite(pool) => {
+                sqlite::revoke_all_tokens(pool, community_id, owner_pubkey, revoked_by).await
+            }
+            DbBackend::Postgres => {
+                api_token::revoke_all_tokens(
+                    self.pg_pool()?,
+                    *community_id.as_uuid(),
+                    owner_pubkey,
+                    revoked_by,
+                )
+                .await
+            }
+        }
     }
 
     /// Create a new workflow.

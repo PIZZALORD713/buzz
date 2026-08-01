@@ -255,7 +255,19 @@ pub(crate) async fn migrate(pool: &SqlitePool) -> Result<()> {
         tx.commit().await?;
         version = 5;
     }
-    if version != 5 {
+    if version < 6 {
+        let mut tx = pool.begin().await?;
+        sqlx::query("CREATE TABLE IF NOT EXISTS api_tokens (community_id TEXT NOT NULL, id TEXT NOT NULL, token_hash BLOB NOT NULL, owner_pubkey BLOB NOT NULL, name TEXT NOT NULL, scopes TEXT NOT NULL, channel_ids TEXT, created_at INTEGER NOT NULL DEFAULT (unixepoch()), expires_at INTEGER, last_used_at INTEGER, revoked_at INTEGER, revoked_by BLOB, created_by_self_mint INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (community_id, id), UNIQUE (community_id, token_hash), FOREIGN KEY (community_id) REFERENCES communities(id) ON DELETE CASCADE)")
+            .execute(&mut *tx).await?;
+        sqlx::query("CREATE INDEX IF NOT EXISTS idx_api_tokens_owner ON api_tokens (community_id, owner_pubkey, created_at DESC)")
+            .execute(&mut *tx).await?;
+        sqlx::query("UPDATE schema_version SET version = 6 WHERE singleton = 1")
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        version = 6;
+    }
+    if version != 6 {
         return Err(crate::DbError::InvalidData(format!(
             "unsupported SQLite schema version {version}"
         )));
@@ -1042,6 +1054,162 @@ pub(crate) async fn list_hidden_dms(
         .collect()
 }
 
+pub(crate) async fn create_api_token(
+    pool: &SqlitePool,
+    community_id: CommunityId,
+    token_hash: &[u8],
+    owner_pubkey: &[u8],
+    name: &str,
+    scopes: &[String],
+    channel_ids: Option<&[Uuid]>,
+    expires_at: Option<chrono::DateTime<chrono::Utc>>,
+) -> Result<Uuid> {
+    let id = Uuid::new_v4();
+    let scopes =
+        serde_json::to_string(scopes).map_err(|e| crate::DbError::InvalidData(e.to_string()))?;
+    let channel_ids = channel_ids
+        .map(|ids| {
+            serde_json::to_string(&ids.iter().map(Uuid::to_string).collect::<Vec<_>>())
+                .map_err(|e| crate::DbError::InvalidData(format!("channel_ids serialization: {e}")))
+        })
+        .transpose()?;
+    sqlx::query("INSERT INTO api_tokens (community_id, id, token_hash, owner_pubkey, name, scopes, channel_ids, expires_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)")
+        .bind(community_id.as_uuid().to_string()).bind(id.to_string()).bind(token_hash).bind(owner_pubkey)
+        .bind(name).bind(scopes).bind(channel_ids).bind(expires_at.map(|v| v.timestamp())).execute(pool).await?;
+    Ok(id)
+}
+
+pub(crate) async fn create_api_token_if_under_limit(
+    pool: &SqlitePool,
+    community_id: CommunityId,
+    token_hash: &[u8],
+    owner_pubkey: &[u8],
+    name: &str,
+    scopes: &[String],
+    channel_ids: Option<&[Uuid]>,
+    expires_at: Option<chrono::DateTime<chrono::Utc>>,
+) -> Result<Option<Uuid>> {
+    let id = Uuid::new_v4();
+    let scopes =
+        serde_json::to_string(scopes).map_err(|e| crate::DbError::InvalidData(e.to_string()))?;
+    let channel_ids = channel_ids
+        .map(|ids| {
+            serde_json::to_string(&ids.iter().map(Uuid::to_string).collect::<Vec<_>>())
+                .map_err(|e| crate::DbError::InvalidData(format!("channel_ids serialization: {e}")))
+        })
+        .transpose()?;
+    let result = sqlx::query("INSERT INTO api_tokens (community_id, id, token_hash, owner_pubkey, name, scopes, channel_ids, expires_at, created_by_self_mint) SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 1 WHERE (SELECT COUNT(*) FROM api_tokens WHERE community_id = ?1 AND owner_pubkey = ?9 AND revoked_at IS NULL AND (expires_at IS NULL OR expires_at > unixepoch())) < 10")
+        .bind(community_id.as_uuid().to_string()).bind(id.to_string()).bind(token_hash).bind(owner_pubkey).bind(name).bind(scopes).bind(channel_ids).bind(expires_at.map(|v| v.timestamp())).bind(owner_pubkey).execute(pool).await?;
+    Ok((result.rows_affected() == 1).then_some(id))
+}
+
+pub(crate) async fn get_api_token_by_hash(
+    pool: &SqlitePool,
+    community_id: CommunityId,
+    hash: &[u8],
+    include_revoked: bool,
+) -> Result<Option<crate::ApiTokenRecord>> {
+    let query = if include_revoked {
+        "SELECT id, token_hash, owner_pubkey, name, scopes, channel_ids, created_at, expires_at, last_used_at, revoked_at FROM api_tokens WHERE community_id = ?1 AND token_hash = ?2"
+    } else {
+        "SELECT id, token_hash, owner_pubkey, name, scopes, channel_ids, created_at, expires_at, last_used_at, revoked_at FROM api_tokens WHERE community_id = ?1 AND token_hash = ?2 AND revoked_at IS NULL"
+    };
+    let row = sqlx::query(query)
+        .bind(community_id.as_uuid().to_string())
+        .bind(hash)
+        .fetch_optional(pool)
+        .await?;
+    row.map(api_token_record).transpose()
+}
+
+pub(crate) async fn touch_api_token(
+    pool: &SqlitePool,
+    community_id: CommunityId,
+    hash: &[u8],
+) -> Result<()> {
+    sqlx::query("UPDATE api_tokens SET last_used_at = unixepoch() WHERE community_id = ?1 AND token_hash = ?2").bind(community_id.as_uuid().to_string()).bind(hash).execute(pool).await?;
+    Ok(())
+}
+
+pub(crate) async fn list_active_tokens(
+    pool: &SqlitePool,
+    community_id: CommunityId,
+) -> Result<Vec<crate::TokenSummary>> {
+    let rows = sqlx::query("SELECT id, name, owner_pubkey, scopes, created_at, expires_at FROM api_tokens WHERE community_id = ?1 AND revoked_at IS NULL ORDER BY created_at DESC LIMIT 1000").bind(community_id.as_uuid().to_string()).fetch_all(pool).await?;
+    rows.into_iter()
+        .map(|row| {
+            Ok(crate::TokenSummary {
+                id: Uuid::parse_str(row.get::<String, _>("id").as_str())
+                    .map_err(|e| crate::DbError::InvalidData(e.to_string()))?,
+                name: row.get("name"),
+                owner_pubkey: row.get("owner_pubkey"),
+                scopes: serde_json::from_str(&row.get::<String, _>("scopes"))
+                    .map_err(|e| crate::DbError::InvalidData(format!("scopes JSON: {e}")))?,
+                created_at: timestamp(row.get("created_at"))?,
+                expires_at: optional_timestamp(row.try_get("expires_at")?)?,
+            })
+        })
+        .collect()
+}
+
+pub(crate) async fn list_tokens_by_owner(
+    pool: &SqlitePool,
+    community_id: CommunityId,
+    owner: &[u8],
+) -> Result<Vec<crate::ApiTokenRecord>> {
+    let rows = sqlx::query("SELECT id, token_hash, owner_pubkey, name, scopes, channel_ids, created_at, expires_at, last_used_at, revoked_at FROM api_tokens WHERE community_id = ?1 AND owner_pubkey = ?2 ORDER BY created_at DESC").bind(community_id.as_uuid().to_string()).bind(owner).fetch_all(pool).await?;
+    rows.into_iter().map(api_token_record).collect()
+}
+
+pub(crate) async fn revoke_token(
+    pool: &SqlitePool,
+    community_id: CommunityId,
+    id: Uuid,
+    owner: &[u8],
+    revoked_by: &[u8],
+) -> Result<bool> {
+    Ok(sqlx::query("UPDATE api_tokens SET revoked_at = unixepoch(), revoked_by = ?1 WHERE community_id = ?2 AND id = ?3 AND owner_pubkey = ?4 AND revoked_at IS NULL").bind(revoked_by).bind(community_id.as_uuid().to_string()).bind(id.to_string()).bind(owner).execute(pool).await?.rows_affected() > 0)
+}
+
+pub(crate) async fn revoke_all_tokens(
+    pool: &SqlitePool,
+    community_id: CommunityId,
+    owner: &[u8],
+    revoked_by: &[u8],
+) -> Result<u64> {
+    Ok(sqlx::query("UPDATE api_tokens SET revoked_at = unixepoch(), revoked_by = ?1 WHERE community_id = ?2 AND owner_pubkey = ?3 AND revoked_at IS NULL").bind(revoked_by).bind(community_id.as_uuid().to_string()).bind(owner).execute(pool).await?.rows_affected())
+}
+
+fn api_token_record(row: sqlx::sqlite::SqliteRow) -> Result<crate::ApiTokenRecord> {
+    let id = Uuid::parse_str(row.get::<String, _>("id").as_str())
+        .map_err(|e| crate::DbError::InvalidData(e.to_string()))?;
+    let channel_ids = row
+        .try_get::<Option<String>, _>("channel_ids")?
+        .map(|v| {
+            let ids: Vec<String> = serde_json::from_str(&v)
+                .map_err(|e| crate::DbError::InvalidData(format!("channel_ids JSON: {e}")))?;
+            ids.into_iter()
+                .map(|s| {
+                    Uuid::parse_str(&s)
+                        .map_err(|e| crate::DbError::InvalidData(format!("channel_ids UUID: {e}")))
+                })
+                .collect()
+        })
+        .transpose()?;
+    Ok(crate::ApiTokenRecord {
+        id,
+        token_hash: row.get("token_hash"),
+        owner_pubkey: row.get("owner_pubkey"),
+        name: row.get("name"),
+        scopes: serde_json::from_str(&row.get::<String, _>("scopes"))
+            .map_err(|e| crate::DbError::InvalidData(format!("scopes JSON: {e}")))?,
+        channel_ids,
+        created_at: timestamp(row.get("created_at"))?,
+        expires_at: optional_timestamp(row.try_get("expires_at")?)?,
+        last_used_at: optional_timestamp(row.try_get("last_used_at")?)?,
+        revoked_at: optional_timestamp(row.try_get("revoked_at")?)?,
+    })
+}
 pub(crate) async fn repo_name_owner(
     pool: &SqlitePool,
     community: CommunityId,
@@ -1729,7 +1897,7 @@ mod tests {
                 .fetch_one(&upgraded)
                 .await
                 .unwrap(),
-            5
+            6
         );
         for (table, column) in [
             ("channels", "participant_hash"),
