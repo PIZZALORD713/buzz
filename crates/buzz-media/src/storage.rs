@@ -442,14 +442,21 @@ impl MediaStorage {
                 .await
                 .map_err(|e| MediaError::StorageError(e.to_string()))?
                 .map_err(Self::fs_error)?;
-                let start = continuation_token
-                    .and_then(|token| {
-                        files
-                            .iter()
-                            .position(|(key, _)| key == &token)
-                            .map(|n| n + 1)
-                    })
-                    .unwrap_or(0);
+                if max_keys == 0 {
+                    return Err(MediaError::StorageError(
+                        "list page size must be nonzero".to_owned(),
+                    ));
+                }
+                let start = match continuation_token {
+                    Some(token) => files
+                        .iter()
+                        .position(|(key, _)| key == &token)
+                        .map(|n| n + 1)
+                        .ok_or_else(|| {
+                            MediaError::StorageError("unknown list continuation token".to_owned())
+                        })?,
+                    None => 0,
+                };
                 let remaining = files.split_off(start);
                 let is_truncated = remaining.len() > max_keys;
                 let objects: Vec<_> = remaining.into_iter().take(max_keys).collect();
@@ -593,6 +600,29 @@ mod tests {
         assert!(page.is_truncated);
         storage.delete(&key).await.unwrap();
         assert!(!storage.head(&key).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn filesystem_listing_rejects_zero_page_size_and_unknown_token() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = MediaStorage::filesystem(dir.path());
+        let key = format!("{}.bin", "b".repeat(64));
+        storage
+            .put(&key, b"x", "application/octet-stream")
+            .await
+            .unwrap();
+        assert!(storage
+            .list_page(None, 0)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("nonzero"));
+        assert!(storage
+            .list_page(Some("missing".to_owned()), 1)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("unknown list continuation token"));
     }
 
     #[test]

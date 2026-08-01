@@ -46,7 +46,7 @@ pub use error::PubSubError;
 use std::collections::HashMap;
 use std::future::pending;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use buzz_core::TenantContext;
 use dashmap::DashMap;
@@ -131,8 +131,20 @@ impl PubSubManager {
 
     /// Creates an in-process backend for a single relay process.
     pub fn in_process() -> Self {
+        Self::in_process_with_presence_ttl(Duration::from_secs(presence::PRESENCE_TTL_SECS))
+    }
+
+    #[cfg(test)]
+    fn in_process_with_presence_ttl(presence_ttl: Duration) -> Self {
         Self {
-            backend: PubSubBackend::InProcess(Arc::new(InProcessPubSubManager::new())),
+            backend: PubSubBackend::InProcess(Arc::new(InProcessPubSubManager::new(presence_ttl))),
+        }
+    }
+
+    #[cfg(not(test))]
+    fn in_process_with_presence_ttl(presence_ttl: Duration) -> Self {
+        Self {
+            backend: PubSubBackend::InProcess(Arc::new(InProcessPubSubManager::new(presence_ttl))),
         }
     }
 
@@ -309,20 +321,27 @@ impl PubSubManager {
 /// Process-local pub/sub, presence, and control-plane fan-out for single-node relays.
 struct InProcessPubSubManager {
     topics: DashMap<EventTopicKey, usize>,
-    presence: DashMap<(buzz_core::CommunityId, String), String>,
+    presence: DashMap<(buzz_core::CommunityId, String), PresenceLease>,
+    presence_ttl: Duration,
     broadcast_tx: broadcast::Sender<ChannelEvent>,
     cache_invalidation_tx: broadcast::Sender<ScopedCacheInvalidation>,
     conn_control_tx: broadcast::Sender<ScopedConnControl>,
 }
 
+struct PresenceLease {
+    status: String,
+    expires_at: Instant,
+}
+
 impl InProcessPubSubManager {
-    fn new() -> Self {
+    fn new(presence_ttl: Duration) -> Self {
         let (broadcast_tx, _) = broadcast::channel(4096);
         let (cache_invalidation_tx, _) = broadcast::channel(4096);
         let (conn_control_tx, _) = broadcast::channel(4096);
         Self {
             topics: DashMap::new(),
             presence: DashMap::new(),
+            presence_ttl,
             broadcast_tx,
             cache_invalidation_tx,
             conn_control_tx,
@@ -406,8 +425,13 @@ impl InProcessPubSubManager {
         pubkey: &PublicKey,
         status: &str,
     ) -> Result<(), PubSubError> {
-        self.presence
-            .insert((ctx.community(), pubkey.to_hex()), status.to_owned());
+        self.presence.insert(
+            (ctx.community(), pubkey.to_hex()),
+            PresenceLease {
+                status: status.to_owned(),
+                expires_at: Instant::now() + self.presence_ttl,
+            },
+        );
         Ok(())
     }
     async fn clear_presence(
@@ -423,10 +447,8 @@ impl InProcessPubSubManager {
         ctx: &TenantContext,
         pubkey: &PublicKey,
     ) -> Result<Option<String>, PubSubError> {
-        Ok(self
-            .presence
-            .get(&(ctx.community(), pubkey.to_hex()))
-            .map(|v| v.clone()))
+        let key = (ctx.community(), pubkey.to_hex());
+        Ok(self.active_presence(&key))
     }
     async fn get_presence_bulk(
         &self,
@@ -437,11 +459,20 @@ impl InProcessPubSubManager {
             .iter()
             .filter_map(|p| {
                 let hex = p.to_hex();
-                self.presence
-                    .get(&(ctx.community(), hex.clone()))
-                    .map(|v| (hex, v.clone()))
+                self.active_presence(&(ctx.community(), hex.clone()))
+                    .map(|status| (hex, status))
             })
             .collect())
+    }
+
+    fn active_presence(&self, key: &(buzz_core::CommunityId, String)) -> Option<String> {
+        let lease = self.presence.get(key)?;
+        if lease.expires_at > Instant::now() {
+            return Some(lease.status.clone());
+        }
+        drop(lease);
+        self.presence.remove(key);
+        None
     }
 }
 
@@ -1003,6 +1034,32 @@ mod tests {
         assert_eq!(manager.get_presence(&b, &key).await.unwrap(), None);
         manager.clear_presence(&a, &key).await.unwrap();
         assert_eq!(manager.get_presence(&a, &key).await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn in_process_presence_lease_expires_without_disconnect() {
+        let manager = PubSubManager::in_process_with_presence_ttl(Duration::from_millis(5));
+        let tenant = ctx(1, "lease.example");
+        let pubkey = Keys::generate().public_key();
+        manager
+            .set_presence(&tenant, &pubkey, "online")
+            .await
+            .unwrap();
+        assert_eq!(
+            manager
+                .get_presence(&tenant, &pubkey)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("online")
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert_eq!(manager.get_presence(&tenant, &pubkey).await.unwrap(), None);
+        assert!(manager
+            .get_presence_bulk(&tenant, &[pubkey])
+            .await
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
