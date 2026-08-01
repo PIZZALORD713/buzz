@@ -317,7 +317,26 @@ pub(crate) async fn migrate(pool: &SqlitePool) -> Result<()> {
         tx.commit().await?;
         version = 9;
     }
-    if version != 9 {
+    if version < 10 {
+        let mut tx = pool.begin().await?;
+        for statement in [
+            "CREATE TABLE IF NOT EXISTS community_bans (community_id TEXT NOT NULL, pubkey BLOB NOT NULL CHECK (length(pubkey) = 32), banned INTEGER NOT NULL DEFAULT 0 CHECK (banned IN (0, 1)), ban_expires_at INTEGER, ban_reason TEXT, muted_until INTEGER, mute_reason TEXT, actor_pubkey BLOB NOT NULL CHECK (length(actor_pubkey) = 32), created_at INTEGER NOT NULL DEFAULT (unixepoch()), updated_at INTEGER NOT NULL DEFAULT (unixepoch()), PRIMARY KEY (community_id, pubkey), FOREIGN KEY (community_id) REFERENCES communities(id) ON DELETE CASCADE)",
+            "CREATE TABLE IF NOT EXISTS moderation_actions (community_id TEXT NOT NULL, id TEXT NOT NULL, actor_pubkey BLOB NOT NULL CHECK (length(actor_pubkey) = 32), action TEXT NOT NULL CHECK (action IN ('delete_message', 'kick', 'ban', 'unban', 'timeout', 'untimeout', 'dismiss_report', 'escalate', 'resolve:delete', 'resolve:kick', 'resolve:ban', 'resolve:timeout')), target_pubkey BLOB CHECK (target_pubkey IS NULL OR length(target_pubkey) = 32), target_event_id BLOB CHECK (target_event_id IS NULL OR length(target_event_id) = 32), channel_id TEXT, reason_code TEXT, public_reason TEXT, private_reason TEXT, matched_principal TEXT CHECK (matched_principal IS NULL OR matched_principal IN ('self', 'owner')), created_at INTEGER NOT NULL DEFAULT (unixepoch()), PRIMARY KEY (community_id, id), FOREIGN KEY (community_id) REFERENCES communities(id) ON DELETE CASCADE, FOREIGN KEY (channel_id) REFERENCES channels(id))",
+            "CREATE INDEX IF NOT EXISTS idx_moderation_actions_created ON moderation_actions (community_id, created_at DESC, id DESC)",
+            "CREATE INDEX IF NOT EXISTS idx_moderation_actions_target_pubkey ON moderation_actions (community_id, target_pubkey) WHERE target_pubkey IS NOT NULL",
+            "CREATE INDEX IF NOT EXISTS idx_community_bans_active ON community_bans (community_id, updated_at DESC)",
+            "CREATE TRIGGER IF NOT EXISTS moderation_reports_action_tenant_insert BEFORE INSERT ON moderation_reports WHEN NEW.action_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM moderation_actions WHERE community_id=NEW.community_id AND id=NEW.action_id) BEGIN SELECT RAISE(ABORT, 'moderation report action must belong to community'); END",
+            "CREATE TRIGGER IF NOT EXISTS moderation_reports_action_tenant_update BEFORE UPDATE OF action_id, community_id ON moderation_reports WHEN NEW.action_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM moderation_actions WHERE community_id=NEW.community_id AND id=NEW.action_id) BEGIN SELECT RAISE(ABORT, 'moderation report action must belong to community'); END",
+            "CREATE TRIGGER IF NOT EXISTS moderation_actions_channel_tenant_insert BEFORE INSERT ON moderation_actions WHEN NEW.channel_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM channels WHERE community_id=NEW.community_id AND id=NEW.channel_id) BEGIN SELECT RAISE(ABORT, 'moderation action channel must belong to community'); END",
+            "CREATE TRIGGER IF NOT EXISTS moderation_actions_channel_tenant_update BEFORE UPDATE OF channel_id, community_id ON moderation_actions WHEN NEW.channel_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM channels WHERE community_id=NEW.community_id AND id=NEW.channel_id) BEGIN SELECT RAISE(ABORT, 'moderation action channel must belong to community'); END",
+        ] { sqlx::query(statement).execute(&mut *tx).await?; }
+        sqlx::query("UPDATE schema_version SET version = 10 WHERE singleton = 1")
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        version = 10;
+    }
+    if version != 10 {
         return Err(crate::DbError::InvalidData(format!(
             "unsupported SQLite schema version {version}"
         )));
@@ -1732,6 +1751,230 @@ pub(crate) async fn list_product_feedback(
         .collect()
 }
 
+fn moderation_report_row(r: sqlx::sqlite::SqliteRow) -> Result<crate::moderation::ReportRecord> {
+    let target = match r.get::<String, _>("target_kind").as_str() {
+        "event" => crate::moderation::ReportTarget::Event(r.get("target_event_id")),
+        "pubkey" => crate::moderation::ReportTarget::Pubkey(r.get("target_pubkey")),
+        "blob" => crate::moderation::ReportTarget::Blob(r.get("target_blob_sha256")),
+        other => {
+            return Err(crate::DbError::InvalidData(format!(
+                "invalid report target_kind: {other}"
+            )))
+        }
+    };
+    Ok(crate::moderation::ReportRecord {
+        id: parse_uuid(r.get("id"))?,
+        report_event_id: r.get("report_event_id"),
+        reporter_pubkey: r.get("reporter_pubkey"),
+        target,
+        channel_id: optional_uuid(r.try_get("channel_id")?)?,
+        report_type: r.get("report_type"),
+        note: r.get("note"),
+        status: r.get("status"),
+        resolved_by: r.get("resolved_by"),
+        resolved_at: optional_timestamp(r.try_get("resolved_at")?)?,
+        action_id: optional_uuid(r.try_get("action_id")?)?,
+        created_at: timestamp(r.get("created_at"))?,
+    })
+}
+
+fn parse_uuid(value: String) -> Result<Uuid> {
+    Uuid::parse_str(&value).map_err(|e| crate::DbError::InvalidData(e.to_string()))
+}
+fn optional_uuid(value: Option<String>) -> Result<Option<Uuid>> {
+    value.map(parse_uuid).transpose()
+}
+
+pub(crate) async fn insert_moderation_report(
+    pool: &SqlitePool,
+    community: CommunityId,
+    report: crate::moderation::NewReport<'_>,
+) -> Result<Uuid> {
+    let id = Uuid::new_v4();
+    let (kind, event, pubkey, blob) = match &report.target {
+        crate::moderation::ReportTarget::Event(v) => ("event", Some(v.as_slice()), None, None),
+        crate::moderation::ReportTarget::Pubkey(v) => ("pubkey", None, Some(v.as_slice()), None),
+        crate::moderation::ReportTarget::Blob(v) => ("blob", None, None, Some(v.as_slice())),
+    };
+    sqlx::query("INSERT INTO moderation_reports (id, community_id, report_event_id, reporter_pubkey, target_kind, target_event_id, target_pubkey, target_blob_sha256, channel_id, report_type, note) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11) ON CONFLICT(community_id, report_event_id) DO NOTHING")
+        .bind(id.to_string()).bind(community.as_uuid().to_string()).bind(report.report_event_id).bind(report.reporter_pubkey).bind(kind).bind(event).bind(pubkey).bind(blob).bind(report.channel_id.map(|v| v.to_string())).bind(report.report_type).bind(report.note).execute(pool).await?;
+    parse_uuid(
+        sqlx::query_scalar(
+            "SELECT id FROM moderation_reports WHERE community_id=?1 AND report_event_id=?2",
+        )
+        .bind(community.as_uuid().to_string())
+        .bind(report.report_event_id)
+        .fetch_one(pool)
+        .await?,
+    )
+}
+
+const REPORT_COLUMNS: &str = "id, report_event_id, reporter_pubkey, target_kind, target_event_id, target_pubkey, target_blob_sha256, channel_id, report_type, note, status, resolved_by, resolved_at, action_id, created_at";
+pub(crate) async fn list_moderation_reports(
+    pool: &SqlitePool,
+    community: CommunityId,
+    status: Option<&str>,
+    limit: i64,
+) -> Result<Vec<crate::moderation::ReportRecord>> {
+    let q = format!("SELECT {REPORT_COLUMNS} FROM moderation_reports WHERE community_id=?1 AND (?2 IS NULL OR status=?2) ORDER BY created_at DESC, id DESC LIMIT ?3");
+    sqlx::query(sqlx::AssertSqlSafe(q))
+        .bind(community.as_uuid().to_string())
+        .bind(status)
+        .bind(limit)
+        .fetch_all(pool)
+        .await?
+        .into_iter()
+        .map(moderation_report_row)
+        .collect()
+}
+pub(crate) async fn get_moderation_report(
+    pool: &SqlitePool,
+    community: CommunityId,
+    id: Uuid,
+) -> Result<Option<crate::moderation::ReportRecord>> {
+    let q =
+        format!("SELECT {REPORT_COLUMNS} FROM moderation_reports WHERE community_id=?1 AND id=?2");
+    sqlx::query(sqlx::AssertSqlSafe(q))
+        .bind(community.as_uuid().to_string())
+        .bind(id.to_string())
+        .fetch_optional(pool)
+        .await?
+        .map(moderation_report_row)
+        .transpose()
+}
+pub(crate) async fn get_moderation_report_by_event(
+    pool: &SqlitePool,
+    community: CommunityId,
+    event: &[u8],
+) -> Result<Option<crate::moderation::ReportRecord>> {
+    let q=format!("SELECT {REPORT_COLUMNS} FROM moderation_reports WHERE community_id=?1 AND report_event_id=?2");
+    sqlx::query(sqlx::AssertSqlSafe(q))
+        .bind(community.as_uuid().to_string())
+        .bind(event)
+        .fetch_optional(pool)
+        .await?
+        .map(moderation_report_row)
+        .transpose()
+}
+pub(crate) async fn resolve_moderation_report(
+    pool: &SqlitePool,
+    community: CommunityId,
+    id: Uuid,
+    status: &str,
+    actor: &[u8],
+    action_id: Option<Uuid>,
+) -> Result<bool> {
+    Ok(sqlx::query("UPDATE moderation_reports SET status=?3,resolved_by=?4,resolved_at=unixepoch(),action_id=?5 WHERE community_id=?1 AND id=?2 AND status='open'").bind(community.as_uuid().to_string()).bind(id.to_string()).bind(status).bind(actor).bind(action_id.map(|v|v.to_string())).execute(pool).await?.rows_affected()>0)
+}
+pub(crate) async fn ban_member(
+    pool: &SqlitePool,
+    community: CommunityId,
+    pubkey: &[u8],
+    actor: &[u8],
+    reason: Option<&str>,
+    expires: Option<chrono::DateTime<chrono::Utc>>,
+) -> Result<()> {
+    sqlx::query("INSERT INTO community_bans (community_id,pubkey,banned,ban_expires_at,ban_reason,actor_pubkey) VALUES (?1,?2,1,?3,?4,?5) ON CONFLICT(community_id,pubkey) DO UPDATE SET banned=1,ban_expires_at=excluded.ban_expires_at,ban_reason=excluded.ban_reason,actor_pubkey=excluded.actor_pubkey,updated_at=unixepoch()").bind(community.as_uuid().to_string()).bind(pubkey).bind(expires.map(|v|v.timestamp())).bind(reason).bind(actor).execute(pool).await?;
+    Ok(())
+}
+pub(crate) async fn unban_member(
+    pool: &SqlitePool,
+    community: CommunityId,
+    pubkey: &[u8],
+    actor: &[u8],
+) -> Result<bool> {
+    Ok(sqlx::query("UPDATE community_bans SET banned=0,ban_expires_at=NULL,ban_reason=NULL,actor_pubkey=?3,updated_at=unixepoch() WHERE community_id=?1 AND pubkey=?2 AND banned=1").bind(community.as_uuid().to_string()).bind(pubkey).bind(actor).execute(pool).await?.rows_affected()>0)
+}
+pub(crate) async fn timeout_member(
+    pool: &SqlitePool,
+    community: CommunityId,
+    pubkey: &[u8],
+    actor: &[u8],
+    until: chrono::DateTime<chrono::Utc>,
+    reason: Option<&str>,
+) -> Result<()> {
+    sqlx::query("INSERT INTO community_bans (community_id,pubkey,muted_until,mute_reason,actor_pubkey) VALUES (?1,?2,?3,?4,?5) ON CONFLICT(community_id,pubkey) DO UPDATE SET muted_until=excluded.muted_until,mute_reason=excluded.mute_reason,actor_pubkey=excluded.actor_pubkey,updated_at=unixepoch()").bind(community.as_uuid().to_string()).bind(pubkey).bind(until.timestamp()).bind(reason).bind(actor).execute(pool).await?;
+    Ok(())
+}
+pub(crate) async fn untimeout_member(
+    pool: &SqlitePool,
+    community: CommunityId,
+    pubkey: &[u8],
+    actor: &[u8],
+) -> Result<bool> {
+    Ok(sqlx::query("UPDATE community_bans SET muted_until=NULL,mute_reason=NULL,actor_pubkey=?3,updated_at=unixepoch() WHERE community_id=?1 AND pubkey=?2 AND muted_until>unixepoch()").bind(community.as_uuid().to_string()).bind(pubkey).bind(actor).execute(pool).await?.rows_affected()>0)
+}
+pub(crate) async fn restriction_state(
+    pool: &SqlitePool,
+    community: CommunityId,
+    pubkey: &[u8],
+) -> Result<crate::moderation::RestrictionState> {
+    let row=sqlx::query("SELECT banned AND (ban_expires_at IS NULL OR ban_expires_at>unixepoch()) AS banned, CASE WHEN muted_until>unixepoch() THEN muted_until END AS muted_until FROM community_bans WHERE community_id=?1 AND pubkey=?2").bind(community.as_uuid().to_string()).bind(pubkey).fetch_optional(pool).await?;
+    Ok(match row {
+        Some(r) => crate::moderation::RestrictionState {
+            banned: r.get::<i64, _>("banned") != 0,
+            muted_until: optional_timestamp(r.try_get("muted_until")?)?,
+        },
+        None => Default::default(),
+    })
+}
+fn ban_row(r: sqlx::sqlite::SqliteRow) -> Result<crate::moderation::BanRecord> {
+    Ok(crate::moderation::BanRecord {
+        pubkey: r.get("pubkey"),
+        banned: r.get::<i64, _>("banned") != 0,
+        ban_expires_at: optional_timestamp(r.try_get("ban_expires_at")?)?,
+        ban_reason: r.get("ban_reason"),
+        muted_until: optional_timestamp(r.try_get("muted_until")?)?,
+        mute_reason: r.get("mute_reason"),
+        actor_pubkey: r.get("actor_pubkey"),
+        updated_at: timestamp(r.get("updated_at"))?,
+    })
+}
+pub(crate) async fn get_ban(
+    pool: &SqlitePool,
+    community: CommunityId,
+    pubkey: &[u8],
+) -> Result<Option<crate::moderation::BanRecord>> {
+    sqlx::query("SELECT pubkey,banned AND (ban_expires_at IS NULL OR ban_expires_at>unixepoch()) AS banned,ban_expires_at,ban_reason,muted_until,mute_reason,actor_pubkey,updated_at FROM community_bans WHERE community_id=?1 AND pubkey=?2").bind(community.as_uuid().to_string()).bind(pubkey).fetch_optional(pool).await?.map(ban_row).transpose()
+}
+pub(crate) async fn list_restricted(
+    pool: &SqlitePool,
+    community: CommunityId,
+) -> Result<Vec<crate::moderation::BanRecord>> {
+    sqlx::query("SELECT pubkey,banned AND (ban_expires_at IS NULL OR ban_expires_at>unixepoch()) AS banned,ban_expires_at,ban_reason,muted_until,mute_reason,actor_pubkey,updated_at FROM community_bans WHERE community_id=?1 AND ((banned=1 AND (ban_expires_at IS NULL OR ban_expires_at>unixepoch())) OR muted_until>unixepoch()) ORDER BY updated_at DESC,pubkey").bind(community.as_uuid().to_string()).fetch_all(pool).await?.into_iter().map(ban_row).collect()
+}
+pub(crate) async fn insert_moderation_action(
+    pool: &SqlitePool,
+    community: CommunityId,
+    a: crate::moderation::NewAction<'_>,
+) -> Result<Uuid> {
+    let id = Uuid::new_v4();
+    sqlx::query("INSERT INTO moderation_actions (community_id,id,actor_pubkey,action,target_pubkey,target_event_id,channel_id,reason_code,public_reason,private_reason,matched_principal) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)").bind(community.as_uuid().to_string()).bind(id.to_string()).bind(a.actor_pubkey).bind(a.action).bind(a.target_pubkey).bind(a.target_event_id).bind(a.channel_id.map(|v|v.to_string())).bind(a.reason_code).bind(a.public_reason).bind(a.private_reason).bind(a.matched_principal).execute(pool).await?;
+    Ok(id)
+}
+fn action_row(r: sqlx::sqlite::SqliteRow) -> Result<crate::moderation::ActionRecord> {
+    Ok(crate::moderation::ActionRecord {
+        id: parse_uuid(r.get("id"))?,
+        actor_pubkey: r.get("actor_pubkey"),
+        action: r.get("action"),
+        target_pubkey: r.get("target_pubkey"),
+        target_event_id: r.get("target_event_id"),
+        channel_id: optional_uuid(r.try_get("channel_id")?)?,
+        reason_code: r.get("reason_code"),
+        public_reason: r.get("public_reason"),
+        private_reason: r.get("private_reason"),
+        matched_principal: r.get("matched_principal"),
+        created_at: timestamp(r.get("created_at"))?,
+    })
+}
+pub(crate) async fn list_moderation_actions(
+    pool: &SqlitePool,
+    community: CommunityId,
+    limit: i64,
+) -> Result<Vec<crate::moderation::ActionRecord>> {
+    sqlx::query("SELECT id,actor_pubkey,action,target_pubkey,target_event_id,channel_id,reason_code,public_reason,private_reason,matched_principal,created_at FROM moderation_actions WHERE community_id=?1 ORDER BY created_at DESC,id DESC LIMIT ?2").bind(community.as_uuid().to_string()).bind(limit).fetch_all(pool).await?.into_iter().map(action_row).collect()
+}
+
 pub(crate) async fn admin_list_feedback(
     pool: &SqlitePool,
     limit: i64,
@@ -2552,7 +2795,7 @@ mod tests {
                 .fetch_one(&upgraded)
                 .await
                 .unwrap(),
-            9
+            10
         );
         for (table, column) in [
             ("channels", "participant_hash"),
@@ -2679,7 +2922,7 @@ mod tests {
                 .fetch_one(&upgraded)
                 .await
                 .unwrap(),
-            9
+            10
         );
         assert_eq!(
             sqlx::query_scalar::<_, i64>(
@@ -3190,6 +3433,147 @@ mod tests {
         assert_eq!(message.author_pubkey, hex::encode(author));
         assert_eq!(message.content, "reported message");
         assert_eq!(message.deleted_at, None);
+    }
+
+    #[tokio::test]
+    async fn moderation_mutations_restrictions_and_audit_are_scoped() {
+        let pool = connect(":memory:").await.unwrap();
+        let community = ensure_configured_community(&pool, "moderation.local")
+            .await
+            .unwrap()
+            .id;
+        let foreign = ensure_configured_community(&pool, "moderation-foreign.local")
+            .await
+            .unwrap()
+            .id;
+        let report_event = vec![41_u8; 32];
+        let reporter = vec![42_u8; 32];
+        let target = vec![43_u8; 32];
+        let actor = vec![44_u8; 32];
+        let report = || crate::moderation::NewReport {
+            report_event_id: &report_event,
+            reporter_pubkey: &reporter,
+            target: crate::moderation::ReportTarget::Event(target.clone()),
+            channel_id: None,
+            report_type: "spam",
+            note: Some("first note"),
+        };
+        let id = insert_moderation_report(&pool, community, report())
+            .await
+            .unwrap();
+        assert_eq!(
+            insert_moderation_report(&pool, community, report())
+                .await
+                .unwrap(),
+            id
+        );
+        assert_eq!(
+            list_moderation_reports(&pool, community, Some("open"), 10)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(
+            get_moderation_report_by_event(&pool, foreign, &report_event)
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        let action_id = insert_moderation_action(
+            &pool,
+            community,
+            crate::moderation::NewAction {
+                actor_pubkey: &actor,
+                action: "resolve:ban",
+                target_pubkey: Some(&target),
+                target_event_id: None,
+                channel_id: None,
+                reason_code: Some("spam"),
+                public_reason: None,
+                private_reason: Some("audit context"),
+                matched_principal: Some("self"),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(resolve_moderation_report(
+            &pool,
+            community,
+            id,
+            "resolved",
+            &actor,
+            Some(action_id)
+        )
+        .await
+        .unwrap());
+        assert!(
+            !resolve_moderation_report(&pool, community, id, "dismissed", &actor, None)
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            get_moderation_report(&pool, community, id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            "resolved"
+        );
+
+        let expired = chrono::Utc::now() - chrono::Duration::seconds(10);
+        let future = chrono::Utc::now() + chrono::Duration::hours(1);
+        ban_member(
+            &pool,
+            community,
+            &target,
+            &actor,
+            Some("expired"),
+            Some(expired),
+        )
+        .await
+        .unwrap();
+        timeout_member(&pool, community, &target, &actor, future, Some("active"))
+            .await
+            .unwrap();
+        let state = restriction_state(&pool, community, &target).await.unwrap();
+        assert!(!state.banned);
+        assert_eq!(
+            state.muted_until.map(|v| v.timestamp()),
+            Some(future.timestamp())
+        );
+        assert_eq!(list_restricted(&pool, community).await.unwrap().len(), 1);
+        assert!(list_restricted(&pool, foreign).await.unwrap().is_empty());
+        assert!(untimeout_member(&pool, community, &target, &actor)
+            .await
+            .unwrap());
+        assert!(!untimeout_member(&pool, community, &target, &actor)
+            .await
+            .unwrap());
+        ban_member(&pool, community, &target, &actor, None, None)
+            .await
+            .unwrap();
+        assert!(
+            restriction_state(&pool, community, &target)
+                .await
+                .unwrap()
+                .banned
+        );
+        assert!(unban_member(&pool, community, &target, &actor)
+            .await
+            .unwrap());
+        assert!(!unban_member(&pool, community, &target, &actor)
+            .await
+            .unwrap());
+        assert_eq!(
+            list_moderation_actions(&pool, community, 10).await.unwrap()[0].id,
+            action_id
+        );
+        assert!(list_moderation_actions(&pool, foreign, 10)
+            .await
+            .unwrap()
+            .is_empty());
     }
 
     #[tokio::test]
