@@ -244,8 +244,12 @@ pub(crate) async fn migrate(pool: &SqlitePool) -> Result<()> {
             "CREATE TRIGGER events_fts_insert AFTER INSERT ON events WHEN new.kind IN (0, 9, 40002, 45001, 45003) BEGIN INSERT INTO events_fts(rowid, content) VALUES (new.rowid, new.content); END",
             "CREATE TRIGGER events_fts_delete AFTER DELETE ON events WHEN old.kind IN (0, 9, 40002, 45001, 45003) BEGIN INSERT INTO events_fts(events_fts, rowid, content) VALUES ('delete', old.rowid, old.content); END",
             "CREATE TRIGGER events_fts_update AFTER UPDATE OF content, kind ON events BEGIN INSERT INTO events_fts(events_fts, rowid, content) SELECT 'delete', old.rowid, old.content WHERE old.kind IN (0, 9, 40002, 45001, 45003); INSERT INTO events_fts(rowid, content) SELECT new.rowid, new.content WHERE new.kind IN (0, 9, 40002, 45001, 45003); END",
-            "INSERT OR IGNORE INTO channel_members (channel_id, pubkey, role, joined_at, invited_by, hidden_at, removed_at) SELECT winner.id, cm.pubkey, cm.role, cm.joined_at, cm.invited_by, cm.hidden_at, cm.removed_at FROM channels duplicate JOIN channels winner ON winner.id = (SELECT MIN(candidate.id) FROM channels candidate WHERE candidate.community_id = duplicate.community_id AND candidate.participant_hash = duplicate.participant_hash AND candidate.channel_type = 'dm' AND candidate.deleted_at IS NULL) JOIN channel_members cm ON cm.channel_id = duplicate.id WHERE duplicate.channel_type = 'dm' AND duplicate.deleted_at IS NULL AND duplicate.participant_hash IS NOT NULL AND duplicate.id <> winner.id",
-            "UPDATE channels SET deleted_at = unixepoch() WHERE channel_type = 'dm' AND deleted_at IS NULL AND participant_hash IS NOT NULL AND id <> (SELECT MIN(candidate.id) FROM channels candidate WHERE candidate.community_id = channels.community_id AND candidate.participant_hash = channels.participant_hash AND candidate.channel_type = 'dm' AND candidate.deleted_at IS NULL)",
+            "CREATE TEMP TABLE dm_channel_merges (loser_id TEXT PRIMARY KEY, winner_id TEXT NOT NULL)",
+            "INSERT INTO dm_channel_merges (loser_id, winner_id) SELECT id, winner_id FROM (SELECT id, FIRST_VALUE(id) OVER (PARTITION BY community_id, participant_hash ORDER BY created_at ASC, id ASC) AS winner_id, ROW_NUMBER() OVER (PARTITION BY community_id, participant_hash ORDER BY created_at ASC, id ASC) AS ordinal FROM channels WHERE channel_type = 'dm' AND deleted_at IS NULL AND participant_hash IS NOT NULL) ranked WHERE ordinal > 1",
+            "UPDATE events SET channel_id = (SELECT winner_id FROM dm_channel_merges WHERE loser_id = events.channel_id) WHERE channel_id IN (SELECT loser_id FROM dm_channel_merges)",
+            "INSERT INTO channel_members (channel_id, pubkey, role, joined_at, invited_by, hidden_at, removed_at) SELECT merges.winner_id, members.pubkey, members.role, members.joined_at, members.invited_by, members.hidden_at, members.removed_at FROM channel_members members JOIN dm_channel_merges merges ON merges.loser_id = members.channel_id WHERE true ON CONFLICT(channel_id, pubkey) DO UPDATE SET joined_at = MIN(channel_members.joined_at, excluded.joined_at), invited_by = COALESCE(channel_members.invited_by, excluded.invited_by), hidden_at = CASE WHEN channel_members.hidden_at IS NULL OR excluded.hidden_at IS NULL THEN NULL ELSE MIN(channel_members.hidden_at, excluded.hidden_at) END, removed_at = CASE WHEN channel_members.removed_at IS NULL OR excluded.removed_at IS NULL THEN NULL ELSE MIN(channel_members.removed_at, excluded.removed_at) END",
+            "DELETE FROM channels WHERE id IN (SELECT loser_id FROM dm_channel_merges)",
+            "DROP TABLE dm_channel_merges",
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_channels_dm_hash ON channels (community_id, participant_hash) WHERE channel_type = 'dm' AND deleted_at IS NULL",
             "CREATE TABLE IF NOT EXISTS git_repo_names (community_id TEXT NOT NULL, repo_id TEXT NOT NULL, owner_pubkey TEXT NOT NULL, created_at INTEGER NOT NULL DEFAULT (unixepoch()), PRIMARY KEY (community_id, repo_id), FOREIGN KEY (community_id) REFERENCES communities(id) ON DELETE CASCADE)",
         ] {
@@ -1930,7 +1934,26 @@ mod tests {
     async fn repairs_old_v3_fts_privacy_and_dm_uniqueness_on_upgrade() {
         let path =
             std::env::temp_dir().join(format!("buzz-db-v3-upgrade-{}.sqlite", Uuid::new_v4()));
-        let pool = connect(path.to_str().unwrap()).await.unwrap();
+        let options = SqliteConnectOptions::from_str(&format!("sqlite://{}", path.display()))
+            .unwrap()
+            .create_if_missing(true)
+            .foreign_keys(true);
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(options)
+            .await
+            .unwrap();
+        for statement in SCHEMA.split(';').map(str::trim).filter(|s| !s.is_empty()) {
+            sqlx::query(statement).execute(&pool).await.unwrap();
+        }
+        sqlx::query("CREATE TABLE schema_version (singleton INTEGER PRIMARY KEY CHECK (singleton = 1), version INTEGER NOT NULL)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO schema_version (singleton, version) VALUES (1, 3)")
+            .execute(&pool)
+            .await
+            .unwrap();
         let community = ensure_configured_community(&pool, "v3-upgrade.example")
             .await
             .unwrap()
@@ -1952,15 +1975,35 @@ mod tests {
                 .unwrap();
         }
 
-        // Recreate the objects emitted by the original v3 migration, including its
-        // broad denylist policy and direct events content table.
+        let winner = "00000000-0000-0000-0000-000000000001";
+        let loser = "00000000-0000-0000-0000-000000000002";
+        let participant_hash = vec![9_u8; 32];
+        for (id, created_at) in [(winner, 100_i64), (loser, 101_i64)] {
+            sqlx::query("INSERT INTO channels (id, community_id, name, channel_type, visibility, participant_hash, created_by, created_at, updated_at) VALUES (?1, ?2, 'dm', 'dm', 'private', ?3, ?4, ?5, ?5)")
+                .bind(id)
+                .bind(community.as_uuid().to_string())
+                .bind(&participant_hash)
+                .bind(vec![10_u8; 32])
+                .bind(created_at)
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+        sqlx::query("INSERT INTO channel_members (channel_id, pubkey, role, joined_at) VALUES (?1, ?2, 'member', 100), (?3, ?4, 'member', 101)")
+            .bind(winner)
+            .bind(vec![11_u8; 32])
+            .bind(loser)
+            .bind(vec![12_u8; 32])
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE events SET channel_id = ?1 WHERE content = 'private orchard'")
+            .bind(loser)
+            .execute(&pool)
+            .await
+            .unwrap();
+
         for statement in [
-            "DROP TRIGGER events_fts_insert",
-            "DROP TRIGGER events_fts_delete",
-            "DROP TRIGGER events_fts_update",
-            "DROP TABLE events_fts",
-            "DROP VIEW searchable_events",
-            "DROP INDEX idx_channels_dm_hash",
             "CREATE VIRTUAL TABLE events_fts USING fts5(content, content='events', content_rowid='rowid', tokenize='unicode61')",
             "INSERT INTO events_fts(events_fts) VALUES ('rebuild')",
             "CREATE TRIGGER events_fts_insert AFTER INSERT ON events WHEN new.kind NOT IN (1059, 30300, 30350, 30622, 44100, 44101, 44200) BEGIN INSERT INTO events_fts(rowid, content) VALUES (new.rowid, new.content); END",
@@ -2036,6 +2079,34 @@ mod tests {
                 .await
                 .unwrap(),
             1
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM channels WHERE community_id = ?1 AND participant_hash = ?2 AND channel_type = 'dm' AND deleted_at IS NULL")
+                .bind(community.as_uuid().to_string())
+                .bind(&participant_hash)
+                .fetch_one(&upgraded)
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT count(*) FROM channel_members WHERE channel_id = ?1"
+            )
+            .bind(winner)
+            .fetch_one(&upgraded)
+            .await
+            .unwrap(),
+            2
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, String>(
+                "SELECT channel_id FROM events WHERE content = 'private orchard'"
+            )
+            .fetch_one(&upgraded)
+            .await
+            .unwrap(),
+            winner
         );
 
         for (id, kind, content) in [
