@@ -44,10 +44,12 @@ pub mod topic;
 pub use error::PubSubError;
 
 use std::collections::HashMap;
+use std::future::pending;
 use std::sync::Arc;
 use std::time::Duration;
 
 use buzz_core::TenantContext;
+use dashmap::DashMap;
 use nostr::PublicKey;
 use tokio::sync::{broadcast, mpsc, Mutex};
 
@@ -106,6 +108,7 @@ pub struct PubSubManager {
 
 enum PubSubBackend {
     Redis(Arc<RedisPubSubManager>),
+    InProcess(Arc<InProcessPubSubManager>),
 }
 
 impl PubSubManager {
@@ -126,11 +129,19 @@ impl PubSubManager {
         })
     }
 
+    /// Creates an in-process backend for a single relay process.
+    pub fn in_process() -> Self {
+        Self {
+            backend: PubSubBackend::InProcess(Arc::new(InProcessPubSubManager::new())),
+        }
+    }
+
     /// Runs the backend event subscriber. Process-local backends may implement
     /// this as a pending task because publication already reaches local receivers.
     pub async fn run_subscriber(self: Arc<Self>) {
         match &self.backend {
             PubSubBackend::Redis(backend) => Arc::clone(backend).run_subscriber().await,
+            PubSubBackend::InProcess(_) => pending::<()>().await,
         }
     }
 
@@ -142,6 +153,7 @@ impl PubSubManager {
                     .run_cache_invalidation_subscriber()
                     .await
             }
+            PubSubBackend::InProcess(_) => pending::<()>().await,
         }
     }
 
@@ -151,6 +163,7 @@ impl PubSubManager {
             PubSubBackend::Redis(backend) => {
                 Arc::clone(backend).run_conn_control_subscriber().await
             }
+            PubSubBackend::InProcess(_) => pending::<()>().await,
         }
     }
 
@@ -158,6 +171,7 @@ impl PubSubManager {
     pub fn subscribe_local(&self) -> broadcast::Receiver<ChannelEvent> {
         match &self.backend {
             PubSubBackend::Redis(backend) => backend.subscribe_local(),
+            PubSubBackend::InProcess(backend) => backend.subscribe_local(),
         }
     }
 
@@ -165,6 +179,7 @@ impl PubSubManager {
     pub async fn retain_topic(&self, ctx: &TenantContext, topic: EventTopic) {
         match &self.backend {
             PubSubBackend::Redis(backend) => backend.retain_topic(ctx, topic).await,
+            PubSubBackend::InProcess(backend) => backend.retain_topic(ctx, topic).await,
         }
     }
 
@@ -172,6 +187,7 @@ impl PubSubManager {
     pub async fn release_topic(&self, ctx: &TenantContext, topic: EventTopic) {
         match &self.backend {
             PubSubBackend::Redis(backend) => backend.release_topic(ctx, topic).await,
+            PubSubBackend::InProcess(backend) => backend.release_topic(ctx, topic).await,
         }
     }
 
@@ -179,6 +195,7 @@ impl PubSubManager {
     pub async fn topic_refcount(&self, ctx: &TenantContext, topic: EventTopic) -> usize {
         match &self.backend {
             PubSubBackend::Redis(backend) => backend.topic_refcount(ctx, topic).await,
+            PubSubBackend::InProcess(backend) => backend.topic_refcount(ctx, topic).await,
         }
     }
 
@@ -186,6 +203,7 @@ impl PubSubManager {
     pub fn subscribe_cache_invalidations(&self) -> broadcast::Receiver<ScopedCacheInvalidation> {
         match &self.backend {
             PubSubBackend::Redis(backend) => backend.subscribe_cache_invalidations(),
+            PubSubBackend::InProcess(backend) => backend.subscribe_cache_invalidations(),
         }
     }
 
@@ -193,6 +211,7 @@ impl PubSubManager {
     pub fn subscribe_conn_control(&self) -> broadcast::Receiver<ScopedConnControl> {
         match &self.backend {
             PubSubBackend::Redis(backend) => backend.subscribe_conn_control(),
+            PubSubBackend::InProcess(backend) => backend.subscribe_conn_control(),
         }
     }
 
@@ -206,6 +225,9 @@ impl PubSubManager {
             PubSubBackend::Redis(backend) => {
                 backend.publish_cache_invalidation(ctx, invalidation).await
             }
+            PubSubBackend::InProcess(backend) => {
+                backend.publish_cache_invalidation(ctx, invalidation).await
+            }
         }
     }
 
@@ -217,6 +239,7 @@ impl PubSubManager {
     ) -> Result<i64, PubSubError> {
         match &self.backend {
             PubSubBackend::Redis(backend) => backend.publish_conn_control(ctx, command).await,
+            PubSubBackend::InProcess(backend) => backend.publish_conn_control(ctx, command).await,
         }
     }
 
@@ -229,6 +252,7 @@ impl PubSubManager {
     ) -> Result<i64, PubSubError> {
         match &self.backend {
             PubSubBackend::Redis(backend) => backend.publish_event(ctx, topic, event).await,
+            PubSubBackend::InProcess(backend) => backend.publish_event(ctx, topic, event).await,
         }
     }
 
@@ -241,6 +265,7 @@ impl PubSubManager {
     ) -> Result<(), PubSubError> {
         match &self.backend {
             PubSubBackend::Redis(backend) => backend.set_presence(ctx, pubkey, status).await,
+            PubSubBackend::InProcess(backend) => backend.set_presence(ctx, pubkey, status).await,
         }
     }
 
@@ -252,6 +277,7 @@ impl PubSubManager {
     ) -> Result<(), PubSubError> {
         match &self.backend {
             PubSubBackend::Redis(backend) => backend.clear_presence(ctx, pubkey).await,
+            PubSubBackend::InProcess(backend) => backend.clear_presence(ctx, pubkey).await,
         }
     }
 
@@ -263,6 +289,7 @@ impl PubSubManager {
     ) -> Result<Option<String>, PubSubError> {
         match &self.backend {
             PubSubBackend::Redis(backend) => backend.get_presence(ctx, pubkey).await,
+            PubSubBackend::InProcess(backend) => backend.get_presence(ctx, pubkey).await,
         }
     }
 
@@ -274,7 +301,147 @@ impl PubSubManager {
     ) -> Result<HashMap<String, String>, PubSubError> {
         match &self.backend {
             PubSubBackend::Redis(backend) => backend.get_presence_bulk(ctx, pubkeys).await,
+            PubSubBackend::InProcess(backend) => backend.get_presence_bulk(ctx, pubkeys).await,
         }
+    }
+}
+
+/// Process-local pub/sub, presence, and control-plane fan-out for single-node relays.
+struct InProcessPubSubManager {
+    topics: DashMap<EventTopicKey, usize>,
+    presence: DashMap<(buzz_core::CommunityId, String), String>,
+    broadcast_tx: broadcast::Sender<ChannelEvent>,
+    cache_invalidation_tx: broadcast::Sender<ScopedCacheInvalidation>,
+    conn_control_tx: broadcast::Sender<ScopedConnControl>,
+}
+
+impl InProcessPubSubManager {
+    fn new() -> Self {
+        let (broadcast_tx, _) = broadcast::channel(4096);
+        let (cache_invalidation_tx, _) = broadcast::channel(4096);
+        let (conn_control_tx, _) = broadcast::channel(4096);
+        Self {
+            topics: DashMap::new(),
+            presence: DashMap::new(),
+            broadcast_tx,
+            cache_invalidation_tx,
+            conn_control_tx,
+        }
+    }
+    fn subscribe_local(&self) -> broadcast::Receiver<ChannelEvent> {
+        self.broadcast_tx.subscribe()
+    }
+    async fn retain_topic(&self, ctx: &TenantContext, topic: EventTopic) {
+        self.topics
+            .entry(EventTopicKey::from_context(ctx, topic))
+            .and_modify(|n| *n += 1)
+            .or_insert(1);
+    }
+    async fn release_topic(&self, ctx: &TenantContext, topic: EventTopic) {
+        let key = EventTopicKey::from_context(ctx, topic);
+        if let Some(mut entry) = self.topics.get_mut(&key) {
+            *entry -= 1;
+            if *entry == 0 {
+                drop(entry);
+                self.topics.remove(&key);
+            }
+        }
+    }
+    async fn topic_refcount(&self, ctx: &TenantContext, topic: EventTopic) -> usize {
+        self.topics
+            .get(&EventTopicKey::from_context(ctx, topic))
+            .map(|n| *n)
+            .unwrap_or(0)
+    }
+    fn subscribe_cache_invalidations(&self) -> broadcast::Receiver<ScopedCacheInvalidation> {
+        self.cache_invalidation_tx.subscribe()
+    }
+    fn subscribe_conn_control(&self) -> broadcast::Receiver<ScopedConnControl> {
+        self.conn_control_tx.subscribe()
+    }
+    async fn publish_cache_invalidation(
+        &self,
+        ctx: &TenantContext,
+        invalidation: &CacheInvalidation,
+    ) -> Result<i64, PubSubError> {
+        Ok(self
+            .cache_invalidation_tx
+            .send(ScopedCacheInvalidation {
+                community_id: ctx.community(),
+                invalidation: invalidation.clone(),
+            })
+            .unwrap_or(0) as i64)
+    }
+    async fn publish_conn_control(
+        &self,
+        ctx: &TenantContext,
+        command: &ConnControl,
+    ) -> Result<i64, PubSubError> {
+        Ok(self
+            .conn_control_tx
+            .send(ScopedConnControl {
+                community_id: ctx.community(),
+                command: command.clone(),
+            })
+            .unwrap_or(0) as i64)
+    }
+    async fn publish_event(
+        &self,
+        ctx: &TenantContext,
+        topic: EventTopic,
+        event: &nostr::Event,
+    ) -> Result<i64, PubSubError> {
+        Ok(self
+            .broadcast_tx
+            .send(ChannelEvent {
+                community_id: ctx.community(),
+                topic,
+                event: event.clone(),
+            })
+            .unwrap_or(0) as i64)
+    }
+    async fn set_presence(
+        &self,
+        ctx: &TenantContext,
+        pubkey: &PublicKey,
+        status: &str,
+    ) -> Result<(), PubSubError> {
+        self.presence
+            .insert((ctx.community(), pubkey.to_hex()), status.to_owned());
+        Ok(())
+    }
+    async fn clear_presence(
+        &self,
+        ctx: &TenantContext,
+        pubkey: &PublicKey,
+    ) -> Result<(), PubSubError> {
+        self.presence.remove(&(ctx.community(), pubkey.to_hex()));
+        Ok(())
+    }
+    async fn get_presence(
+        &self,
+        ctx: &TenantContext,
+        pubkey: &PublicKey,
+    ) -> Result<Option<String>, PubSubError> {
+        Ok(self
+            .presence
+            .get(&(ctx.community(), pubkey.to_hex()))
+            .map(|v| v.clone()))
+    }
+    async fn get_presence_bulk(
+        &self,
+        ctx: &TenantContext,
+        pubkeys: &[PublicKey],
+    ) -> Result<HashMap<String, String>, PubSubError> {
+        Ok(pubkeys
+            .iter()
+            .filter_map(|p| {
+                let hex = p.to_hex();
+                self.presence
+                    .get(&(ctx.community(), hex.clone()))
+                    .map(|v| (hex, v.clone()))
+            })
+            .collect())
     }
 }
 
@@ -790,6 +957,52 @@ mod tests {
 
         manager.release_topic(&ctx, topic).await;
         assert_eq!(manager.topic_refcount(&ctx, topic).await, 0);
+    }
+
+    #[tokio::test]
+    async fn in_process_fanout_presence_and_control_are_community_scoped() {
+        let manager = PubSubManager::in_process();
+        let a = ctx(1, "a.example");
+        let b = ctx(2, "b.example");
+        let topic = EventTopic::Global;
+        manager.retain_topic(&a, topic).await;
+        manager.retain_topic(&a, topic).await;
+        assert_eq!(manager.topic_refcount(&a, topic).await, 2);
+        manager.release_topic(&a, topic).await;
+        assert_eq!(manager.topic_refcount(&a, topic).await, 1);
+
+        let mut events = manager.subscribe_local();
+        let mut invalidations = manager.subscribe_cache_invalidations();
+        let mut controls = manager.subscribe_conn_control();
+        let event = EventBuilder::new(Kind::TextNote, "local")
+            .tags([])
+            .sign_with_keys(&Keys::generate())
+            .unwrap();
+        assert_eq!(manager.publish_event(&a, topic, &event).await.unwrap(), 1);
+        assert_eq!(events.recv().await.unwrap().community_id, a.community());
+        manager
+            .publish_cache_invalidation(&a, &CacheInvalidation::AccessibleAll)
+            .await
+            .unwrap();
+        assert_eq!(
+            invalidations.recv().await.unwrap().community_id,
+            a.community()
+        );
+        manager
+            .publish_conn_control(&b, &ConnControl::DisconnectCommunity)
+            .await
+            .unwrap();
+        assert_eq!(controls.recv().await.unwrap().community_id, b.community());
+
+        let key = Keys::generate().public_key();
+        manager.set_presence(&a, &key, "online").await.unwrap();
+        assert_eq!(
+            manager.get_presence(&a, &key).await.unwrap().as_deref(),
+            Some("online")
+        );
+        assert_eq!(manager.get_presence(&b, &key).await.unwrap(), None);
+        manager.clear_presence(&a, &key).await.unwrap();
+        assert_eq!(manager.get_presence(&a, &key).await.unwrap(), None);
     }
 
     #[test]
