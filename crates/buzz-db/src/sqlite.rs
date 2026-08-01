@@ -3,6 +3,7 @@
 //! This module deliberately contains a separate, minimal schema rather than
 //! attempting to translate the production PostgreSQL migrations.
 
+use sha2::{Digest, Sha256};
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use sqlx::{Row, SqlitePool};
 use std::str::FromStr;
@@ -336,7 +337,29 @@ pub(crate) async fn migrate(pool: &SqlitePool) -> Result<()> {
         tx.commit().await?;
         version = 10;
     }
-    if version != 10 {
+    if version < 11 {
+        let mut tx = pool.begin().await?;
+        for statement in [
+            "CREATE TABLE IF NOT EXISTS workflows (community_id TEXT NOT NULL, id TEXT NOT NULL, name TEXT NOT NULL, owner_pubkey BLOB NOT NULL, channel_id TEXT, definition TEXT NOT NULL CHECK (json_valid(definition)), definition_hash BLOB NOT NULL, status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active','disabled','archived')), enabled INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0,1)), created_at INTEGER NOT NULL DEFAULT (unixepoch()), updated_at INTEGER NOT NULL DEFAULT (unixepoch()), PRIMARY KEY (community_id,id), FOREIGN KEY (community_id) REFERENCES communities(id) ON DELETE CASCADE, FOREIGN KEY (channel_id) REFERENCES channels(id))",
+            "CREATE INDEX IF NOT EXISTS idx_workflows_channel_active ON workflows (community_id,channel_id,status,enabled)",
+            "CREATE TRIGGER IF NOT EXISTS workflows_owner_tenant_insert BEFORE INSERT ON workflows WHEN NOT EXISTS (SELECT 1 FROM users WHERE community_id=NEW.community_id AND pubkey=NEW.owner_pubkey) BEGIN SELECT RAISE(ABORT, 'workflow owner must belong to community'); END",
+            "CREATE TRIGGER IF NOT EXISTS workflows_owner_tenant_update BEFORE UPDATE OF owner_pubkey, community_id ON workflows WHEN NOT EXISTS (SELECT 1 FROM users WHERE community_id=NEW.community_id AND pubkey=NEW.owner_pubkey) BEGIN SELECT RAISE(ABORT, 'workflow owner must belong to community'); END",
+            "CREATE TRIGGER IF NOT EXISTS workflows_channel_tenant_insert BEFORE INSERT ON workflows WHEN NEW.channel_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM channels WHERE community_id=NEW.community_id AND id=NEW.channel_id) BEGIN SELECT RAISE(ABORT, 'workflow channel must belong to community'); END",
+            "CREATE TRIGGER IF NOT EXISTS workflows_channel_tenant_update BEFORE UPDATE OF channel_id, community_id ON workflows WHEN NEW.channel_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM channels WHERE community_id=NEW.community_id AND id=NEW.channel_id) BEGIN SELECT RAISE(ABORT, 'workflow channel must belong to community'); END",
+            "CREATE TABLE IF NOT EXISTS workflow_runs (community_id TEXT NOT NULL, id TEXT NOT NULL, workflow_id TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','running','waiting_approval','completed','failed','cancelled')), trigger_event_id BLOB, current_step INTEGER NOT NULL DEFAULT 0, execution_trace TEXT NOT NULL DEFAULT '[]' CHECK (json_valid(execution_trace)), trigger_context TEXT CHECK (trigger_context IS NULL OR json_valid(trigger_context)), started_at INTEGER, completed_at INTEGER, error_message TEXT, created_at INTEGER NOT NULL DEFAULT (unixepoch()), PRIMARY KEY (community_id,id), FOREIGN KEY (community_id,workflow_id) REFERENCES workflows(community_id,id) ON DELETE CASCADE)",
+            "CREATE INDEX IF NOT EXISTS idx_workflow_runs_workflow ON workflow_runs (community_id,workflow_id,created_at DESC)",
+            "CREATE TABLE IF NOT EXISTS workflow_approvals (community_id TEXT NOT NULL, token BLOB NOT NULL, workflow_id TEXT NOT NULL, run_id TEXT NOT NULL, step_id TEXT NOT NULL, step_index INTEGER NOT NULL, approver_spec TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','granted','denied','expired')), approver_pubkey BLOB, note TEXT, granted_at INTEGER, denied_at INTEGER, expires_at INTEGER NOT NULL, created_at INTEGER NOT NULL DEFAULT (unixepoch()), PRIMARY KEY (community_id,token), FOREIGN KEY (community_id,workflow_id) REFERENCES workflows(community_id,id) ON DELETE CASCADE, FOREIGN KEY (community_id,run_id) REFERENCES workflow_runs(community_id,id) ON DELETE CASCADE)",
+            "CREATE INDEX IF NOT EXISTS idx_workflow_approvals_run ON workflow_approvals (community_id,run_id,step_index,created_at)",
+            "CREATE TABLE IF NOT EXISTS scheduled_workflow_fires (community_id TEXT NOT NULL, workflow_id TEXT NOT NULL, scheduled_for INTEGER NOT NULL, claimed_at INTEGER NOT NULL DEFAULT (unixepoch()), workflow_run_id TEXT, PRIMARY KEY (community_id,workflow_id,scheduled_for), FOREIGN KEY (community_id,workflow_id) REFERENCES workflows(community_id,id) ON DELETE CASCADE, FOREIGN KEY (community_id,workflow_run_id) REFERENCES workflow_runs(community_id,id))",
+            "CREATE INDEX IF NOT EXISTS idx_scheduled_fires_claimed_at ON scheduled_workflow_fires (claimed_at)",
+        ] { sqlx::query(statement).execute(&mut *tx).await?; }
+        sqlx::query("UPDATE schema_version SET version=11 WHERE singleton=1")
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        version = 11;
+    }
+    if version != 11 {
         return Err(crate::DbError::InvalidData(format!(
             "unsupported SQLite schema version {version}"
         )));
@@ -1704,6 +1727,421 @@ pub(crate) async fn claim_relay_invite(
         uses_remaining: max_uses.map(|n| n - new_count),
     })
 }
+fn workflow_row(r: sqlx::sqlite::SqliteRow) -> Result<crate::workflow::WorkflowRecord> {
+    Ok(crate::workflow::WorkflowRecord {
+        id: parse_uuid(r.get("id"))?,
+        community_id: CommunityId::from_uuid(parse_uuid(r.get("community_id"))?),
+        name: r.get("name"),
+        owner_pubkey: r.get("owner_pubkey"),
+        channel_id: optional_uuid(r.try_get("channel_id")?)?,
+        definition: serde_json::from_str(&r.get::<String, _>("definition"))
+            .map_err(|e| crate::DbError::InvalidData(e.to_string()))?,
+        definition_hash: r.get("definition_hash"),
+        status: r.get::<String, _>("status").parse()?,
+        enabled: r.get::<i64, _>("enabled") != 0,
+        created_at: timestamp(r.get("created_at"))?,
+        updated_at: timestamp(r.get("updated_at"))?,
+    })
+}
+const WF_COLS:&str="id,community_id,name,owner_pubkey,channel_id,definition,definition_hash,status,enabled,created_at,updated_at";
+pub(crate) async fn create_workflow(
+    pool: &SqlitePool,
+    c: CommunityId,
+    ch: Option<Uuid>,
+    owner: &[u8],
+    name: &str,
+    def: &str,
+    hash: &[u8],
+) -> Result<Uuid> {
+    let id = Uuid::new_v4();
+    sqlx::query("INSERT INTO workflows(community_id,id,name,owner_pubkey,channel_id,definition,definition_hash) VALUES(?1,?2,?3,?4,?5,?6,?7)").bind(c.as_uuid().to_string()).bind(id.to_string()).bind(name).bind(owner).bind(ch.map(|v|v.to_string())).bind(def).bind(hash).execute(pool).await?;
+    Ok(id)
+}
+pub(crate) async fn upsert_workflow(
+    pool: &SqlitePool,
+    c: CommunityId,
+    id: Uuid,
+    ch: Option<Uuid>,
+    owner: &[u8],
+    name: &str,
+    def: &str,
+    hash: &[u8],
+) -> Result<()> {
+    let n=sqlx::query("INSERT INTO workflows(community_id,id,name,owner_pubkey,channel_id,definition,definition_hash) VALUES(?1,?2,?3,?4,?5,?6,?7) ON CONFLICT(community_id,id) DO UPDATE SET name=excluded.name,definition=excluded.definition,definition_hash=excluded.definition_hash,updated_at=unixepoch() WHERE workflows.owner_pubkey=excluded.owner_pubkey AND workflows.channel_id IS excluded.channel_id").bind(c.as_uuid().to_string()).bind(id.to_string()).bind(name).bind(owner).bind(ch.map(|v|v.to_string())).bind(def).bind(hash).execute(pool).await?.rows_affected();
+    if n == 0 {
+        return Err(crate::DbError::AccessDenied(format!(
+            "workflow {id} belongs to a different owner or channel"
+        )));
+    }
+    Ok(())
+}
+pub(crate) async fn get_workflow(
+    pool: &SqlitePool,
+    c: CommunityId,
+    id: Uuid,
+) -> Result<crate::workflow::WorkflowRecord> {
+    let q = format!("SELECT {WF_COLS} FROM workflows WHERE community_id=?1 AND id=?2");
+    sqlx::query(sqlx::AssertSqlSafe(q))
+        .bind(c.as_uuid().to_string())
+        .bind(id.to_string())
+        .fetch_optional(pool)
+        .await?
+        .ok_or_else(|| crate::DbError::NotFound(format!("workflow {id}")))
+        .and_then(workflow_row)
+}
+pub(crate) async fn list_channel_workflows(
+    pool: &SqlitePool,
+    c: CommunityId,
+    ch: Uuid,
+    limit: Option<i64>,
+    offset: Option<i64>,
+) -> Result<Vec<crate::workflow::WorkflowRecord>> {
+    let q=format!("SELECT {WF_COLS} FROM workflows WHERE community_id=?1 AND channel_id=?2 ORDER BY created_at DESC,id DESC LIMIT ?3 OFFSET ?4");
+    sqlx::query(sqlx::AssertSqlSafe(q))
+        .bind(c.as_uuid().to_string())
+        .bind(ch.to_string())
+        .bind(
+            limit
+                .unwrap_or(crate::workflow::LIST_DEFAULT_LIMIT)
+                .clamp(1, crate::workflow::LIST_MAX_LIMIT),
+        )
+        .bind(offset.unwrap_or(0).max(0))
+        .fetch_all(pool)
+        .await?
+        .into_iter()
+        .map(workflow_row)
+        .collect()
+}
+pub(crate) async fn list_enabled_channel_workflows(
+    pool: &SqlitePool,
+    c: CommunityId,
+    ch: Uuid,
+) -> Result<Vec<crate::workflow::WorkflowRecord>> {
+    let q=format!("SELECT {WF_COLS} FROM workflows WHERE community_id=?1 AND channel_id=?2 AND status='active' AND enabled=1 ORDER BY created_at DESC,id DESC LIMIT ?3");
+    sqlx::query(sqlx::AssertSqlSafe(q))
+        .bind(c.as_uuid().to_string())
+        .bind(ch.to_string())
+        .bind(crate::workflow::LIST_MAX_LIMIT)
+        .fetch_all(pool)
+        .await?
+        .into_iter()
+        .map(workflow_row)
+        .collect()
+}
+pub(crate) async fn list_all_enabled_workflows(
+    pool: &SqlitePool,
+) -> Result<Vec<crate::workflow::WorkflowRecord>> {
+    let q="SELECT w.id,w.community_id,w.name,w.owner_pubkey,w.channel_id,w.definition,w.definition_hash,w.status,w.enabled,w.created_at,w.updated_at FROM workflows w JOIN communities c ON c.id=w.community_id WHERE w.status='active' AND w.enabled=1 AND json_extract(w.definition,'$.trigger.on')='schedule' AND c.archived_at IS NULL ORDER BY w.created_at,w.id LIMIT ?1";
+    sqlx::query(sqlx::AssertSqlSafe(q))
+        .bind(crate::workflow::LIST_MAX_LIMIT)
+        .fetch_all(pool)
+        .await?
+        .into_iter()
+        .map(workflow_row)
+        .collect()
+}
+pub(crate) async fn claim_scheduled_workflow_fire(
+    pool: &SqlitePool,
+    c: CommunityId,
+    w: Uuid,
+    at: chrono::DateTime<chrono::Utc>,
+) -> Result<Option<crate::workflow::ScheduledWorkflowFireClaim>> {
+    let n=sqlx::query("INSERT INTO scheduled_workflow_fires(community_id,workflow_id,scheduled_for) SELECT community_id,id,?3 FROM workflows WHERE community_id=?1 AND id=?2 ON CONFLICT DO NOTHING").bind(c.as_uuid().to_string()).bind(w.to_string()).bind(at.timestamp()).execute(pool).await?.rows_affected();
+    if n == 0 {
+        return Ok(None);
+    };
+    let claimed:i64=sqlx::query_scalar("SELECT claimed_at FROM scheduled_workflow_fires WHERE community_id=?1 AND workflow_id=?2 AND scheduled_for=?3").bind(c.as_uuid().to_string()).bind(w.to_string()).bind(at.timestamp()).fetch_one(pool).await?;
+    Ok(Some(crate::workflow::ScheduledWorkflowFireClaim {
+        community_id: c,
+        workflow_id: w,
+        scheduled_for: at,
+        claimed_at: timestamp(claimed)?,
+    }))
+}
+pub(crate) async fn latest_scheduled_workflow_fire(
+    pool: &SqlitePool,
+    c: CommunityId,
+    w: Uuid,
+) -> Result<Option<chrono::DateTime<chrono::Utc>>> {
+    optional_timestamp(sqlx::query_scalar("SELECT MAX(scheduled_for) FROM scheduled_workflow_fires WHERE community_id=?1 AND workflow_id=?2").bind(c.as_uuid().to_string()).bind(w.to_string()).fetch_one(pool).await?)
+}
+pub(crate) async fn attach_scheduled_workflow_run(
+    pool: &SqlitePool,
+    c: CommunityId,
+    w: Uuid,
+    at: chrono::DateTime<chrono::Utc>,
+    run: Uuid,
+) -> Result<bool> {
+    Ok(sqlx::query("UPDATE scheduled_workflow_fires SET workflow_run_id=?4 WHERE community_id=?1 AND workflow_id=?2 AND scheduled_for=?3 AND workflow_run_id IS NULL").bind(c.as_uuid().to_string()).bind(w.to_string()).bind(at.timestamp()).bind(run.to_string()).execute(pool).await?.rows_affected()==1)
+}
+pub(crate) async fn prune_scheduled_workflow_fires_before(
+    pool: &SqlitePool,
+    at: chrono::DateTime<chrono::Utc>,
+) -> Result<u64> {
+    Ok(
+        sqlx::query("DELETE FROM scheduled_workflow_fires WHERE claimed_at<?1")
+            .bind(at.timestamp())
+            .execute(pool)
+            .await?
+            .rows_affected(),
+    )
+}
+async fn require_workflow_change(result: sqlx::sqlite::SqliteQueryResult, id: Uuid) -> Result<()> {
+    if result.rows_affected() == 0 {
+        Err(crate::DbError::NotFound(format!("workflow {id}")))
+    } else {
+        Ok(())
+    }
+}
+pub(crate) async fn update_workflow(
+    pool: &SqlitePool,
+    c: CommunityId,
+    id: Uuid,
+    name: &str,
+    def: &str,
+    hash: &[u8],
+) -> Result<()> {
+    require_workflow_change(sqlx::query("UPDATE workflows SET name=?1,definition=?2,definition_hash=?3,updated_at=unixepoch() WHERE community_id=?4 AND id=?5").bind(name).bind(def).bind(hash).bind(c.as_uuid().to_string()).bind(id.to_string()).execute(pool).await?,id).await
+}
+pub(crate) async fn update_workflow_status(
+    pool: &SqlitePool,
+    c: CommunityId,
+    id: Uuid,
+    status: crate::workflow::WorkflowStatus,
+) -> Result<()> {
+    require_workflow_change(
+        sqlx::query(
+            "UPDATE workflows SET status=?1,updated_at=unixepoch() WHERE community_id=?2 AND id=?3",
+        )
+        .bind(status.to_string())
+        .bind(c.as_uuid().to_string())
+        .bind(id.to_string())
+        .execute(pool)
+        .await?,
+        id,
+    )
+    .await
+}
+pub(crate) async fn set_workflow_enabled(
+    pool: &SqlitePool,
+    c: CommunityId,
+    id: Uuid,
+    on: bool,
+) -> Result<()> {
+    require_workflow_change(sqlx::query("UPDATE workflows SET enabled=?1,updated_at=unixepoch() WHERE community_id=?2 AND id=?3").bind(on).bind(c.as_uuid().to_string()).bind(id.to_string()).execute(pool).await?,id).await
+}
+pub(crate) async fn disable_workflows_for_owner_in_channel(
+    pool: &SqlitePool,
+    c: CommunityId,
+    ch: Uuid,
+    owner: &[u8],
+) -> Result<u64> {
+    Ok(sqlx::query("UPDATE workflows SET enabled=0,updated_at=unixepoch() WHERE community_id=?1 AND channel_id=?2 AND owner_pubkey=?3 AND enabled=1").bind(c.as_uuid().to_string()).bind(ch.to_string()).bind(owner).execute(pool).await?.rows_affected())
+}
+pub(crate) async fn delete_workflow(pool: &SqlitePool, c: CommunityId, id: Uuid) -> Result<()> {
+    require_workflow_change(
+        sqlx::query("DELETE FROM workflows WHERE community_id=?1 AND id=?2")
+            .bind(c.as_uuid().to_string())
+            .bind(id.to_string())
+            .execute(pool)
+            .await?,
+        id,
+    )
+    .await
+}
+pub(crate) async fn delete_workflow_for_owner(
+    pool: &SqlitePool,
+    c: CommunityId,
+    id: Uuid,
+    owner: &[u8],
+) -> Result<Option<Uuid>> {
+    let row=sqlx::query("DELETE FROM workflows WHERE community_id=?1 AND id=?2 AND owner_pubkey=?3 RETURNING channel_id").bind(c.as_uuid().to_string()).bind(id.to_string()).bind(owner).fetch_optional(pool).await?.ok_or_else(||crate::DbError::NotFound(format!("workflow {id}")))?;
+    optional_uuid(row.try_get("channel_id")?)
+}
+pub(crate) async fn find_workflow_by_owner_and_name(
+    pool: &SqlitePool,
+    c: CommunityId,
+    owner: &[u8],
+    name: &str,
+) -> Result<Option<crate::workflow::WorkflowRecord>> {
+    let q=format!("SELECT {WF_COLS} FROM workflows WHERE community_id=?1 AND owner_pubkey=?2 AND name=?3 LIMIT 1");
+    sqlx::query(sqlx::AssertSqlSafe(q))
+        .bind(c.as_uuid().to_string())
+        .bind(owner)
+        .bind(name)
+        .fetch_optional(pool)
+        .await?
+        .map(workflow_row)
+        .transpose()
+}
+fn run_row(r: sqlx::sqlite::SqliteRow) -> Result<crate::workflow::WorkflowRunRecord> {
+    Ok(crate::workflow::WorkflowRunRecord {
+        id: parse_uuid(r.get("id"))?,
+        community_id: CommunityId::from_uuid(parse_uuid(r.get("community_id"))?),
+        workflow_id: parse_uuid(r.get("workflow_id"))?,
+        status: r.get::<String, _>("status").parse()?,
+        trigger_event_id: r.get("trigger_event_id"),
+        current_step: r.get::<i64, _>("current_step") as i32,
+        execution_trace: serde_json::from_str(&r.get::<String, _>("execution_trace"))
+            .map_err(|e| crate::DbError::InvalidData(e.to_string()))?,
+        trigger_context: r
+            .try_get::<Option<String>, _>("trigger_context")?
+            .map(|v| {
+                serde_json::from_str(&v).map_err(|e| crate::DbError::InvalidData(e.to_string()))
+            })
+            .transpose()?,
+        started_at: optional_timestamp(r.try_get("started_at")?)?,
+        completed_at: optional_timestamp(r.try_get("completed_at")?)?,
+        error_message: r.get("error_message"),
+        created_at: timestamp(r.get("created_at"))?,
+    })
+}
+const RUN_COLS:&str="community_id,id,workflow_id,status,trigger_event_id,current_step,execution_trace,trigger_context,started_at,completed_at,error_message,created_at";
+pub(crate) async fn create_workflow_run(
+    pool: &SqlitePool,
+    c: CommunityId,
+    w: Uuid,
+    event: Option<&[u8]>,
+    ctx: Option<&serde_json::Value>,
+) -> Result<Uuid> {
+    let id = Uuid::new_v4();
+    sqlx::query("INSERT INTO workflow_runs(community_id,id,workflow_id,trigger_event_id,trigger_context) VALUES(?1,?2,?3,?4,?5)").bind(c.as_uuid().to_string()).bind(id.to_string()).bind(w.to_string()).bind(event).bind(ctx.map(|v|v.to_string())).execute(pool).await?;
+    Ok(id)
+}
+pub(crate) async fn get_workflow_run(
+    pool: &SqlitePool,
+    c: CommunityId,
+    id: Uuid,
+) -> Result<crate::workflow::WorkflowRunRecord> {
+    let q = format!("SELECT {RUN_COLS} FROM workflow_runs WHERE community_id=?1 AND id=?2");
+    sqlx::query(sqlx::AssertSqlSafe(q))
+        .bind(c.as_uuid().to_string())
+        .bind(id.to_string())
+        .fetch_optional(pool)
+        .await?
+        .ok_or_else(|| crate::DbError::NotFound(format!("workflow_run {id}")))
+        .and_then(run_row)
+}
+pub(crate) async fn list_workflow_runs(
+    pool: &SqlitePool,
+    c: CommunityId,
+    w: Uuid,
+    limit: i64,
+) -> Result<Vec<crate::workflow::WorkflowRunRecord>> {
+    let q=format!("SELECT {RUN_COLS} FROM workflow_runs WHERE community_id=?1 AND workflow_id=?2 ORDER BY created_at DESC,id DESC LIMIT ?3");
+    sqlx::query(sqlx::AssertSqlSafe(q))
+        .bind(c.as_uuid().to_string())
+        .bind(w.to_string())
+        .bind(limit.min(1000))
+        .fetch_all(pool)
+        .await?
+        .into_iter()
+        .map(run_row)
+        .collect()
+}
+pub(crate) async fn update_workflow_run(
+    pool: &SqlitePool,
+    c: CommunityId,
+    id: Uuid,
+    status: crate::workflow::RunStatus,
+    step: i32,
+    trace: &serde_json::Value,
+    error: Option<&str>,
+) -> Result<()> {
+    let st = status.to_string();
+    let n=sqlx::query("UPDATE workflow_runs SET status=?1,current_step=?2,execution_trace=?3,error_message=?4,started_at=CASE WHEN ?1='running' AND started_at IS NULL THEN unixepoch() ELSE started_at END,completed_at=CASE WHEN ?1 IN ('completed','failed','cancelled') THEN unixepoch() ELSE completed_at END WHERE community_id=?5 AND id=?6").bind(st).bind(step).bind(trace.to_string()).bind(error).bind(c.as_uuid().to_string()).bind(id.to_string()).execute(pool).await?.rows_affected();
+    if n == 0 {
+        Err(crate::DbError::NotFound(format!("workflow_run {id}")))
+    } else {
+        Ok(())
+    }
+}
+fn approval_row(r: sqlx::sqlite::SqliteRow) -> Result<crate::workflow::ApprovalRecord> {
+    Ok(crate::workflow::ApprovalRecord {
+        token: r.get("token"),
+        workflow_id: parse_uuid(r.get("workflow_id"))?,
+        run_id: parse_uuid(r.get("run_id"))?,
+        step_id: r.get("step_id"),
+        step_index: r.get::<i64, _>("step_index") as i32,
+        approver_spec: r.get("approver_spec"),
+        status: r.get::<String, _>("status").parse()?,
+        approver_pubkey: r.get("approver_pubkey"),
+        note: r.get("note"),
+        expires_at: timestamp(r.get("expires_at"))?,
+        created_at: timestamp(r.get("created_at"))?,
+    })
+}
+const APPROVAL_COLS:&str="token,workflow_id,run_id,step_id,step_index,approver_spec,status,approver_pubkey,note,expires_at,created_at";
+pub(crate) async fn create_approval(
+    pool: &SqlitePool,
+    p: crate::workflow::CreateApprovalParams<'_>,
+) -> Result<()> {
+    let token = Sha256::digest(p.token.as_bytes()).to_vec();
+    sqlx::query("INSERT INTO workflow_approvals(community_id,token,workflow_id,run_id,step_id,step_index,approver_spec,expires_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)").bind(p.community_id.as_uuid().to_string()).bind(token).bind(p.workflow_id.to_string()).bind(p.run_id.to_string()).bind(p.step_id).bind(p.step_index).bind(p.approver_spec).bind(p.expires_at.timestamp()).execute(pool).await?;
+    Ok(())
+}
+pub(crate) async fn get_approval(
+    pool: &SqlitePool,
+    c: CommunityId,
+    token: &str,
+) -> Result<crate::workflow::ApprovalRecord> {
+    get_approval_by_hash(pool, c, &Sha256::digest(token.as_bytes())).await
+}
+pub(crate) async fn get_approval_by_hash(
+    pool: &SqlitePool,
+    c: CommunityId,
+    hash: &[u8],
+) -> Result<crate::workflow::ApprovalRecord> {
+    let q = format!(
+        "SELECT {APPROVAL_COLS} FROM workflow_approvals WHERE community_id=?1 AND token=?2"
+    );
+    sqlx::query(sqlx::AssertSqlSafe(q))
+        .bind(c.as_uuid().to_string())
+        .bind(hash)
+        .fetch_optional(pool)
+        .await?
+        .ok_or_else(|| crate::DbError::NotFound("approval token (hashed)".into()))
+        .and_then(approval_row)
+}
+pub(crate) async fn get_run_approvals(
+    pool: &SqlitePool,
+    c: CommunityId,
+    w: Uuid,
+    run: Uuid,
+) -> Result<Vec<crate::workflow::ApprovalRecord>> {
+    let q=format!("SELECT {APPROVAL_COLS} FROM workflow_approvals WHERE community_id=?1 AND run_id=?2 AND workflow_id=?3 ORDER BY step_index,created_at");
+    sqlx::query(sqlx::AssertSqlSafe(q))
+        .bind(c.as_uuid().to_string())
+        .bind(run.to_string())
+        .bind(w.to_string())
+        .fetch_all(pool)
+        .await?
+        .into_iter()
+        .map(approval_row)
+        .collect()
+}
+pub(crate) async fn update_approval(
+    pool: &SqlitePool,
+    c: CommunityId,
+    token: &str,
+    status: crate::workflow::ApprovalStatus,
+    pk: Option<&[u8]>,
+    note: Option<&str>,
+) -> Result<bool> {
+    update_approval_by_hash(pool, c, &Sha256::digest(token.as_bytes()), status, pk, note).await
+}
+pub(crate) async fn update_approval_by_hash(
+    pool: &SqlitePool,
+    c: CommunityId,
+    hash: &[u8],
+    status: crate::workflow::ApprovalStatus,
+    pk: Option<&[u8]>,
+    note: Option<&str>,
+) -> Result<bool> {
+    let st = status.to_string();
+    Ok(sqlx::query("UPDATE workflow_approvals SET status=?1,approver_pubkey=?2,note=?3,granted_at=CASE WHEN ?1='granted' THEN unixepoch() ELSE granted_at END,denied_at=CASE WHEN ?1='denied' THEN unixepoch() ELSE denied_at END WHERE community_id=?4 AND token=?5 AND status='pending'").bind(st).bind(pk).bind(note).bind(c.as_uuid().to_string()).bind(hash).execute(pool).await?.rows_affected()>0)
+}
+
 pub(crate) async fn insert_product_feedback(
     pool: &SqlitePool,
     community: CommunityId,
@@ -2795,7 +3233,7 @@ mod tests {
                 .fetch_one(&upgraded)
                 .await
                 .unwrap(),
-            10
+            11
         );
         for (table, column) in [
             ("channels", "participant_hash"),
@@ -2922,7 +3360,7 @@ mod tests {
                 .fetch_one(&upgraded)
                 .await
                 .unwrap(),
-            10
+            11
         );
         assert_eq!(
             sqlx::query_scalar::<_, i64>(
@@ -3739,6 +4177,134 @@ mod tests {
                 .unwrap(),
             1
         );
+    }
+
+    #[tokio::test]
+    async fn workflow_crud_runs_approvals_and_schedule_are_scoped() {
+        let pool = connect(":memory:").await.unwrap();
+        let community = ensure_configured_community(&pool, "workflow.local")
+            .await
+            .unwrap()
+            .id;
+        let foreign = ensure_configured_community(&pool, "workflow-foreign.local")
+            .await
+            .unwrap()
+            .id;
+        let owner = vec![51_u8; 32];
+        ensure_user(&pool, community, &owner).await.unwrap();
+        ensure_user(&pool, foreign, &owner).await.unwrap();
+        let hash = vec![52_u8; 32];
+        let definition = r#"{"trigger":{"on":"schedule"},"steps":[]}"#;
+        let workflow_id =
+            create_workflow(&pool, community, None, &owner, "daily", definition, &hash)
+                .await
+                .unwrap();
+        assert!(get_workflow(&pool, foreign, workflow_id).await.is_err());
+        assert_eq!(list_all_enabled_workflows(&pool).await.unwrap().len(), 1);
+
+        let scheduled = chrono::DateTime::from_timestamp(1_800_000_000, 0).unwrap();
+        assert!(
+            claim_scheduled_workflow_fire(&pool, community, workflow_id, scheduled)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            claim_scheduled_workflow_fire(&pool, community, workflow_id, scheduled)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            latest_scheduled_workflow_fire(&pool, community, workflow_id)
+                .await
+                .unwrap(),
+            Some(scheduled)
+        );
+
+        let context = serde_json::json!({"channel":"local"});
+        let run_id = create_workflow_run(
+            &pool,
+            community,
+            workflow_id,
+            Some(&[53_u8; 32]),
+            Some(&context),
+        )
+        .await
+        .unwrap();
+        assert!(
+            attach_scheduled_workflow_run(&pool, community, workflow_id, scheduled, run_id)
+                .await
+                .unwrap()
+        );
+        assert!(
+            !attach_scheduled_workflow_run(&pool, community, workflow_id, scheduled, run_id)
+                .await
+                .unwrap()
+        );
+        update_workflow_run(
+            &pool,
+            community,
+            run_id,
+            crate::workflow::RunStatus::Running,
+            1,
+            &serde_json::json!([{"step":0}]),
+            None,
+        )
+        .await
+        .unwrap();
+        let run = get_workflow_run(&pool, community, run_id).await.unwrap();
+        assert_eq!(run.trigger_context, Some(context));
+        assert!(run.started_at.is_some());
+
+        let expires = chrono::Utc::now() + chrono::Duration::hours(1);
+        create_approval(
+            &pool,
+            crate::workflow::CreateApprovalParams {
+                community_id: community,
+                token: "secret",
+                workflow_id,
+                run_id,
+                step_id: "approve",
+                step_index: 1,
+                approver_spec: "owner",
+                expires_at: expires,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(get_approval(&pool, foreign, "secret").await.is_err());
+        assert!(update_approval(
+            &pool,
+            community,
+            "secret",
+            crate::workflow::ApprovalStatus::Granted,
+            Some(&owner),
+            Some("ok")
+        )
+        .await
+        .unwrap());
+        assert!(!update_approval(
+            &pool,
+            community,
+            "secret",
+            crate::workflow::ApprovalStatus::Denied,
+            Some(&owner),
+            None
+        )
+        .await
+        .unwrap());
+        assert_eq!(
+            get_run_approvals(&pool, community, workflow_id, run_id)
+                .await
+                .unwrap()[0]
+                .status,
+            crate::workflow::ApprovalStatus::Granted
+        );
+        delete_workflow(&pool, community, workflow_id)
+            .await
+            .unwrap();
+        assert!(get_workflow_run(&pool, community, run_id).await.is_err());
     }
 
     #[tokio::test]
