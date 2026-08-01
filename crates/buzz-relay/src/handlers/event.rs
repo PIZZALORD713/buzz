@@ -525,7 +525,8 @@ async fn dispatch_persistent_event_inner(
             .iter()
             .any(|t| t.as_slice().first().map(|s| s.as_str()) == Some("buzz:workflow"));
 
-    if !buzz_core::kind::is_workflow_execution_kind(kind_u32)
+    if !state.config.profile.is_single_node()
+        && !buzz_core::kind::is_workflow_execution_kind(kind_u32)
         && !buzz_core::kind::is_command_kind(kind_u32)
         && !is_relay_workflow_msg
         && kind_u32 != KIND_GIFT_WRAP

@@ -80,8 +80,23 @@ pub async fn handle_command(
 enum PersistResult {
     /// Event was already processed — return idempotent success.
     Duplicate,
-    /// Event inserted — transaction is open, handler must commit after mutations.
-    Inserted(sqlx::Transaction<'static, sqlx::Postgres>),
+    /// Event inserted — PostgreSQL remains open until mutations finish; SQLite
+    /// committed the idempotency row atomically before the local mutation.
+    Inserted(CommandTransaction),
+}
+
+enum CommandTransaction {
+    Sqlite,
+    Postgres(sqlx::Transaction<'static, sqlx::Postgres>),
+}
+
+impl CommandTransaction {
+    async fn commit(self) -> Result<(), sqlx::Error> {
+        match self {
+            Self::Sqlite => Ok(()),
+            Self::Postgres(tx) => tx.commit().await,
+        }
+    }
 }
 
 /// Persist a command event inside a transaction. Returns the OPEN transaction
@@ -104,6 +119,12 @@ async fn persist_command_event(
     channel_id_override: Option<Uuid>,
 ) -> Result<PersistResult, IngestError> {
     let channel_id = channel_id_override.or_else(|| extract_channel_id(event));
+
+    if state.config.profile.is_single_node() {
+        return Err(IngestError::Rejected(
+            "unsupported_feature: this command is unavailable in the single-node profile".into(),
+        ));
+    }
 
     let mut tx = state
         .db
@@ -227,7 +248,7 @@ async fn persist_command_event(
         // Duplicate — rollback (implicit on drop) and signal idempotent success.
         Ok(PersistResult::Duplicate)
     } else {
-        Ok(PersistResult::Inserted(tx))
+        Ok(PersistResult::Inserted(CommandTransaction::Postgres(tx)))
     }
 }
 
@@ -345,27 +366,35 @@ async fn handle_dm_open(
         }
     }
 
-    // Persist the command event (idempotency) — returns open transaction
-    let tx = match persist_command_event(state, tenant, event, None).await? {
-        PersistResult::Duplicate => {
-            return Ok(IngestResult {
-                event_id: event.id.to_hex(),
-                accepted: true,
-                message: "duplicate: already processed".into(),
-            });
-        }
-        PersistResult::Inserted(tx) => tx,
-    };
-
-    // 4. Execute: open_dm
+    // SQLite couples the command idempotency row and DM mutation in one
+    // transaction. PostgreSQL retains the existing open-transaction path.
     let all_refs: Vec<&[u8]> = all_bytes.iter().map(|b| b.as_slice()).collect();
-    let (channel, was_created) = state
+    let sqlite_result = state
         .db
-        .open_dm(tenant.community(), &all_refs, &self_bytes)
+        .open_dm_sqlite_command(tenant.community(), &all_refs, &self_bytes, event)
         .await
         .map_err(|e| IngestError::Internal(format!("error: db open_dm: {e}")))?;
+    let (channel, was_created, tx) = if let Some(result) = sqlite_result {
+        (result.0, result.1, CommandTransaction::Sqlite)
+    } else {
+        let tx = match persist_command_event(state, tenant, event, None).await? {
+            PersistResult::Duplicate => {
+                return Ok(IngestResult {
+                    event_id: event.id.to_hex(),
+                    accepted: true,
+                    message: "duplicate: already processed".into(),
+                });
+            }
+            PersistResult::Inserted(tx) => tx,
+        };
+        let (channel, was_created) = state
+            .db
+            .open_dm(tenant.community(), &all_refs, &self_bytes)
+            .await
+            .map_err(|e| IngestError::Internal(format!("error: db open_dm: {e}")))?;
+        (channel, was_created, tx)
+    };
 
-    // Commit: event + mutation succeeded atomically.
     tx.commit()
         .await
         .map_err(|e| IngestError::Internal(format!("error: commit transaction: {e}")))?;
