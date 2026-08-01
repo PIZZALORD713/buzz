@@ -201,7 +201,24 @@ pub(crate) async fn migrate(pool: &SqlitePool) -> Result<()> {
         tx.commit().await?;
         version = 2;
     }
-    if version != 2 {
+    if version < 3 {
+        let mut tx = pool.begin().await?;
+        for statement in [
+            "CREATE VIRTUAL TABLE IF NOT EXISTS events_fts USING fts5(content, content='events', content_rowid='rowid', tokenize='unicode61')",
+            "CREATE TRIGGER IF NOT EXISTS events_fts_insert AFTER INSERT ON events WHEN new.kind NOT IN (1059, 30300, 30350, 30622, 44100, 44101, 44200) BEGIN INSERT INTO events_fts(rowid, content) VALUES (new.rowid, new.content); END",
+            "CREATE TRIGGER IF NOT EXISTS events_fts_delete AFTER DELETE ON events WHEN old.kind NOT IN (1059, 30300, 30350, 30622, 44100, 44101, 44200) BEGIN INSERT INTO events_fts(events_fts, rowid, content) VALUES ('delete', old.rowid, old.content); END",
+            "CREATE TRIGGER IF NOT EXISTS events_fts_update AFTER UPDATE OF content, kind ON events BEGIN INSERT INTO events_fts(events_fts, rowid, content) SELECT 'delete', old.rowid, old.content WHERE old.kind NOT IN (1059, 30300, 30350, 30622, 44100, 44101, 44200); INSERT INTO events_fts(rowid, content) SELECT new.rowid, new.content WHERE new.kind NOT IN (1059, 30300, 30350, 30622, 44100, 44101, 44200); END",
+            "INSERT INTO events_fts(rowid, content) SELECT rowid, content FROM events WHERE kind NOT IN (1059, 30300, 30350, 30622, 44100, 44101, 44200)",
+        ] {
+            sqlx::query(statement).execute(&mut *tx).await?;
+        }
+        sqlx::query("UPDATE schema_version SET version = 3 WHERE singleton = 1")
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        version = 3;
+    }
+    if version != 3 {
         return Err(crate::DbError::InvalidData(format!(
             "unsupported SQLite schema version {version}"
         )));
@@ -665,6 +682,202 @@ pub(crate) async fn remove_reaction_by_source_event_id(
     Ok(sqlx::query("UPDATE reactions SET removed_at = unixepoch() WHERE community_id = ?1 AND reaction_event_id = ?2 AND removed_at IS NULL")
         .bind(community.as_uuid().to_string()).bind(reaction_event_id)
         .execute(pool).await?.rows_affected() != 0)
+}
+
+pub(crate) async fn set_channel_add_policy(
+    pool: &SqlitePool,
+    community: CommunityId,
+    pubkey: &[u8],
+    policy: &str,
+) -> Result<()> {
+    if !matches!(policy, "anyone" | "owner_only" | "nobody") {
+        return Err(crate::DbError::InvalidData(format!(
+            "invalid channel_add_policy: {policy}"
+        )));
+    }
+    let result = sqlx::query(
+        "UPDATE users SET channel_add_policy = ?1 WHERE community_id = ?2 AND pubkey = ?3",
+    )
+    .bind(policy)
+    .bind(community.as_uuid().to_string())
+    .bind(pubkey)
+    .execute(pool)
+    .await?;
+    if result.rows_affected() == 0 {
+        return Err(crate::DbError::NotFound(
+            "pubkey not found in users table".into(),
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) async fn find_dm_by_participants(
+    pool: &SqlitePool,
+    community: CommunityId,
+    participant_hash: &[u8],
+) -> Result<Option<crate::channel::ChannelRecord>> {
+    let row = sqlx::query("SELECT id, name, channel_type, visibility, description, canvas, created_by, created_at, updated_at, archived_at, deleted_at, nip29_group_id, topic_required, max_members, topic, topic_set_by, topic_set_at, purpose, purpose_set_by, purpose_set_at, ttl_seconds, ttl_deadline FROM channels WHERE community_id = ?1 AND participant_hash = ?2 AND channel_type = 'dm' AND deleted_at IS NULL LIMIT 1")
+        .bind(community.as_uuid().to_string()).bind(participant_hash).fetch_optional(pool).await?;
+    row.map(channel_record).transpose()
+}
+
+pub(crate) async fn create_dm(
+    pool: &SqlitePool,
+    community: CommunityId,
+    participants: &[&[u8]],
+    created_by: &[u8],
+) -> Result<crate::channel::ChannelRecord> {
+    if !(2..=9).contains(&participants.len()) {
+        return Err(crate::DbError::InvalidData(
+            "DM requires 2-9 participants".into(),
+        ));
+    }
+    if participants.iter().any(|p| p.len() != 32) {
+        return Err(crate::DbError::InvalidData(
+            "DM participant pubkeys must be 32 bytes".into(),
+        ));
+    }
+    if !participants.contains(&created_by) {
+        return Err(crate::DbError::InvalidData(
+            "DM creator must be a participant".into(),
+        ));
+    }
+    let mut unique = participants.to_vec();
+    unique.sort_unstable();
+    unique.dedup();
+    if unique.len() != participants.len() {
+        return Err(crate::DbError::InvalidData(
+            "DM participants must be unique".into(),
+        ));
+    }
+    let hash = crate::dm::compute_participant_hash(participants);
+    let mut tx = pool.begin().await?;
+    let query = "SELECT id, name, channel_type, visibility, description, canvas, created_by, created_at, updated_at, archived_at, deleted_at, nip29_group_id, topic_required, max_members, topic, topic_set_by, topic_set_at, purpose, purpose_set_by, purpose_set_at, ttl_seconds, ttl_deadline FROM channels WHERE community_id = ?1 AND participant_hash = ?2 AND channel_type = 'dm' AND deleted_at IS NULL LIMIT 1";
+    if let Some(row) = sqlx::query(query)
+        .bind(community.as_uuid().to_string())
+        .bind(hash.as_slice())
+        .fetch_optional(&mut *tx)
+        .await?
+    {
+        tx.commit().await?;
+        return channel_record(row);
+    }
+    let id = Uuid::new_v4();
+    let name = if participants.len() == 2 {
+        "DM".to_owned()
+    } else {
+        format!("Group DM ({})", participants.len())
+    };
+    sqlx::query("INSERT INTO channels (id, community_id, name, channel_type, visibility, participant_hash, created_by) VALUES (?1, ?2, ?3, 'dm', 'private', ?4, ?5)")
+        .bind(id.to_string()).bind(community.as_uuid().to_string()).bind(name).bind(hash.as_slice()).bind(created_by).execute(&mut *tx).await?;
+    for participant in participants {
+        sqlx::query("INSERT INTO channel_members (channel_id, pubkey, role, invited_by) VALUES (?1, ?2, 'member', ?3)")
+            .bind(id.to_string()).bind(*participant).bind(created_by).execute(&mut *tx).await?;
+    }
+    let row = sqlx::query("SELECT id, name, channel_type, visibility, description, canvas, created_by, created_at, updated_at, archived_at, deleted_at, nip29_group_id, topic_required, max_members, topic, topic_set_by, topic_set_at, purpose, purpose_set_by, purpose_set_at, ttl_seconds, ttl_deadline FROM channels WHERE community_id = ?1 AND participant_hash = ?2 AND channel_type = 'dm' AND deleted_at IS NULL LIMIT 1")
+        .bind(community.as_uuid().to_string())
+        .bind(hash.as_slice())
+        .fetch_one(&mut *tx)
+        .await?;
+    let record = channel_record(row)?;
+    tx.commit().await?;
+    Ok(record)
+}
+
+pub(crate) async fn list_dms_for_user(
+    pool: &SqlitePool,
+    community: CommunityId,
+    pubkey: &[u8],
+    limit: u32,
+    cursor: Option<Uuid>,
+) -> Result<Vec<crate::dm::DmRecord>> {
+    let limit = limit.min(200) as i64;
+    let cursor_ts = if let Some(id) = cursor {
+        sqlx::query_scalar::<_, i64>(
+            "SELECT updated_at FROM channels WHERE id = ?1 AND community_id = ?2",
+        )
+        .bind(id.to_string())
+        .bind(community.as_uuid().to_string())
+        .fetch_optional(pool)
+        .await?
+    } else {
+        None
+    };
+    let rows = if let Some(ts) = cursor_ts {
+        sqlx::query("SELECT c.id, c.created_at, c.updated_at FROM channels c JOIN channel_members cm ON c.id = cm.channel_id AND cm.pubkey = ?2 AND cm.removed_at IS NULL AND cm.hidden_at IS NULL WHERE c.community_id = ?1 AND c.channel_type = 'dm' AND c.deleted_at IS NULL AND c.updated_at < ?3 ORDER BY c.updated_at DESC LIMIT ?4")
+            .bind(community.as_uuid().to_string()).bind(pubkey).bind(ts).bind(limit).fetch_all(pool).await?
+    } else {
+        sqlx::query("SELECT c.id, c.created_at, c.updated_at FROM channels c JOIN channel_members cm ON c.id = cm.channel_id AND cm.pubkey = ?2 AND cm.removed_at IS NULL AND cm.hidden_at IS NULL WHERE c.community_id = ?1 AND c.channel_type = 'dm' AND c.deleted_at IS NULL ORDER BY c.updated_at DESC LIMIT ?3")
+            .bind(community.as_uuid().to_string()).bind(pubkey).bind(limit).fetch_all(pool).await?
+    };
+    let mut out = Vec::with_capacity(rows.len());
+    for row in rows {
+        let id: String = row.try_get("id")?;
+        let channel_id = Uuid::parse_str(&id)
+            .map_err(|e| crate::DbError::InvalidData(format!("invalid SQLite channel id: {e}")))?;
+        let created_at = timestamp(row.try_get("created_at")?)?;
+        let updated_at = timestamp(row.try_get("updated_at")?)?;
+        let members = sqlx::query("SELECT cm.pubkey, cm.role, u.display_name FROM channel_members cm LEFT JOIN users u ON u.community_id = ?1 AND u.pubkey = cm.pubkey JOIN channels c ON c.id = cm.channel_id AND c.community_id = ?1 WHERE cm.channel_id = ?2 AND cm.removed_at IS NULL ORDER BY cm.joined_at ASC")
+            .bind(community.as_uuid().to_string()).bind(id).fetch_all(pool).await?;
+        let participants = members
+            .into_iter()
+            .map(|r| {
+                Ok(crate::dm::DmParticipant {
+                    pubkey: r.try_get("pubkey")?,
+                    display_name: r.try_get("display_name")?,
+                    role: r.try_get("role")?,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        out.push(crate::dm::DmRecord {
+            channel_id,
+            participants,
+            last_message_at: Some(updated_at),
+            created_at,
+        });
+    }
+    Ok(out)
+}
+
+pub(crate) async fn hide_dm(
+    pool: &SqlitePool,
+    community: CommunityId,
+    channel_id: Uuid,
+    pubkey: &[u8],
+) -> Result<()> {
+    let result = sqlx::query("UPDATE channel_members SET hidden_at = unixepoch() WHERE channel_id = ?1 AND pubkey = ?2 AND removed_at IS NULL AND EXISTS (SELECT 1 FROM channels c WHERE c.id = channel_members.channel_id AND c.community_id = ?3)").bind(channel_id.to_string()).bind(pubkey).bind(community.as_uuid().to_string()).execute(pool).await?;
+    if result.rows_affected() == 0 {
+        return Err(crate::DbError::NotFound(format!(
+            "no active membership for channel {channel_id}"
+        )));
+    }
+    Ok(())
+}
+
+pub(crate) async fn unhide_dm(
+    pool: &SqlitePool,
+    community: CommunityId,
+    channel_id: Uuid,
+    pubkey: &[u8],
+) -> Result<()> {
+    sqlx::query("UPDATE channel_members SET hidden_at = NULL WHERE channel_id = ?1 AND pubkey = ?2 AND removed_at IS NULL AND EXISTS (SELECT 1 FROM channels c WHERE c.id = channel_members.channel_id AND c.community_id = ?3)").bind(channel_id.to_string()).bind(pubkey).bind(community.as_uuid().to_string()).execute(pool).await?;
+    Ok(())
+}
+
+pub(crate) async fn list_hidden_dms(
+    pool: &SqlitePool,
+    community: CommunityId,
+    pubkey: &[u8],
+) -> Result<Vec<Uuid>> {
+    let rows = sqlx::query("SELECT cm.channel_id FROM channel_members cm JOIN channels c ON c.id = cm.channel_id AND c.community_id = ?1 WHERE cm.pubkey = ?2 AND cm.removed_at IS NULL AND cm.hidden_at IS NOT NULL AND c.channel_type = 'dm' AND c.deleted_at IS NULL ORDER BY cm.channel_id")
+        .bind(community.as_uuid().to_string()).bind(pubkey).fetch_all(pool).await?;
+    rows.into_iter()
+        .map(|r| {
+            let id: String = r.try_get("channel_id")?;
+            Uuid::parse_str(&id)
+                .map_err(|e| crate::DbError::InvalidData(format!("invalid SQLite channel id: {e}")))
+        })
+        .collect()
 }
 
 pub(crate) async fn open_dm(
@@ -1213,7 +1426,7 @@ mod tests {
                 .fetch_one(&upgraded)
                 .await
                 .unwrap(),
-            2
+            3
         );
         for (table, column) in [
             ("channels", "participant_hash"),

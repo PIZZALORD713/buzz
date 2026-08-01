@@ -1258,6 +1258,7 @@ async fn run_single_node(config: Config, tracer_init: telemetry::TracerInit) -> 
         "local",
         buzz_media::S3AddressingStyle::Path,
     )?;
+    let search = SearchService::sqlite(db.sqlite_pool_clone()?);
     let replay: Arc<dyn Nip98ReplayGuard> = Arc::new(InProcessNip98ReplayGuard::new());
     let (app_state, audit_shutdown) = AppState::new_with_backends(
         config,
@@ -1265,7 +1266,7 @@ async fn run_single_node(config: Config, tracer_init: telemetry::TracerInit) -> 
             db,
             redis_pool: None,
             pubsub,
-            search: SearchService::unsupported(),
+            search,
             media_storage: buzz_media::MediaStorage::filesystem(&media_root),
             git_store,
             nip98_replay: replay,

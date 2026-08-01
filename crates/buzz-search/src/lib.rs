@@ -30,12 +30,13 @@ pub use buzz_core::CommunityId;
 pub use error::SearchError;
 pub use query::{search, ChannelScope, SearchHit, SearchMode, SearchQuery, SearchResult};
 
-use sqlx::PgPool;
+use sqlx::{PgPool, SqlitePool};
 
 /// Search backend selected at startup.
 #[derive(Debug, Clone)]
 enum SearchBackend {
     Postgres(PgPool),
+    SQLite(SqlitePool),
     Unsupported,
 }
 
@@ -53,6 +54,13 @@ impl SearchService {
         }
     }
 
+    /// Build a search service over an existing SQLite pool with FTS5.
+    pub fn sqlite(pool: SqlitePool) -> Self {
+        Self {
+            backend: SearchBackend::SQLite(pool),
+        }
+    }
+
     /// Build a backend that explicitly reports search as unsupported.
     pub fn unsupported() -> Self {
         Self {
@@ -64,6 +72,7 @@ impl SearchService {
     pub async fn search(&self, query: &SearchQuery) -> Result<SearchResult, SearchError> {
         match &self.backend {
             SearchBackend::Postgres(pool) => query::search(pool, query).await,
+            SearchBackend::SQLite(pool) => query::search_sqlite(pool, query).await,
             SearchBackend::Unsupported => Err(SearchError::Unsupported),
         }
     }

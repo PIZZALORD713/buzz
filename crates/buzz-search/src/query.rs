@@ -9,7 +9,7 @@
 //! See conformance row 50.
 
 use buzz_core::CommunityId;
-use sqlx::{PgPool, QueryBuilder, Row};
+use sqlx::{PgPool, QueryBuilder, Row, SqlitePool};
 use uuid::Uuid;
 
 use crate::error::SearchError;
@@ -322,6 +322,132 @@ pub async fn search(pool: &PgPool, query: &SearchQuery) -> Result<SearchResult, 
     Ok(SearchResult { hits, page })
 }
 
+/// Execute a community-scoped SQLite FTS5 query.
+pub async fn search_sqlite(
+    pool: &SqlitePool,
+    query: &SearchQuery,
+) -> Result<SearchResult, SearchError> {
+    let Some(search_text) = normalized_search_text(&query.q) else {
+        return Ok(SearchResult {
+            hits: Vec::new(),
+            page: query.page.clamp(1, PAGE_MAX),
+        });
+    };
+    let per_page = if query.per_page == 0 {
+        PER_PAGE_DEFAULT
+    } else {
+        query.per_page.clamp(1, PER_PAGE_MAX)
+    };
+    let page = query.page.clamp(1, PAGE_MAX);
+    let offset = ((page - 1) as i64) * per_page as i64;
+    let terms: Vec<String> = search_text
+        .split_whitespace()
+        .filter(|term| !term.is_empty())
+        .map(|term| format!("\"{}\"", term.replace('"', "\"\"")))
+        .collect();
+    if terms.is_empty() {
+        return Ok(SearchResult { hits: vec![], page });
+    }
+    let expression = match query.mode {
+        SearchMode::FullText => terms.join(" AND "),
+        SearchMode::Prefix => terms
+            .iter()
+            .enumerate()
+            .map(|(index, term)| {
+                if index + 1 == terms.len() {
+                    format!("{term}*")
+                } else {
+                    term.clone()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(" AND "),
+    };
+    let mut qb: QueryBuilder<sqlx::Sqlite> = QueryBuilder::new(
+        "SELECT e.id, e.kind, e.pubkey, e.channel_id, e.created_at AS created_at_s, bm25(events_fts) AS score FROM events_fts JOIN events e ON e.rowid = events_fts.rowid WHERE events_fts MATCH ",
+    );
+    qb.push_bind(expression);
+    qb.push(" AND e.community_id = ")
+        .push_bind(query.community.as_uuid().to_string());
+    match &query.channel_scope {
+        ChannelScope::Any => {}
+        ChannelScope::ChannelLessOnly => {
+            qb.push(" AND e.channel_id IS NULL");
+        }
+        ChannelScope::Channels(ids) => {
+            qb.push(" AND e.channel_id IN (");
+            let mut separated = qb.separated(", ");
+            for id in ids {
+                separated.push_bind(id.to_string());
+            }
+            separated.push_unseparated(")");
+        }
+        ChannelScope::ChannelsOrChannelLess(ids) => {
+            qb.push(" AND (e.channel_id IN (");
+            let mut separated = qb.separated(", ");
+            for id in ids {
+                separated.push_bind(id.to_string());
+            }
+            separated.push_unseparated(") OR e.channel_id IS NULL)");
+        }
+    }
+    if let Some(kinds) = &query.kinds {
+        if !kinds.is_empty() {
+            qb.push(" AND e.kind IN (");
+            let mut separated = qb.separated(", ");
+            for kind in kinds {
+                separated.push_bind(*kind);
+            }
+            separated.push_unseparated(")");
+        }
+    }
+    if let Some(authors) = &query.authors {
+        if !authors.is_empty() {
+            qb.push(" AND e.pubkey IN (");
+            let mut separated = qb.separated(", ");
+            for author in authors {
+                separated.push_bind(author);
+            }
+            separated.push_unseparated(")");
+        }
+    }
+    if let Some(since) = query.since {
+        qb.push(" AND e.created_at >= ").push_bind(since);
+    }
+    if let Some(until) = query.until {
+        qb.push(" AND e.created_at <= ").push_bind(until);
+    }
+    qb.push(" ORDER BY score ASC, e.created_at DESC, e.id LIMIT ")
+        .push_bind(per_page as i64)
+        .push(" OFFSET ")
+        .push_bind(offset);
+    let rows = qb.build().fetch_all(pool).await?;
+    let mut hits = Vec::with_capacity(rows.len());
+    for row in rows {
+        let id_bytes: Vec<u8> = row.try_get("id")?;
+        let pk_bytes: Vec<u8> = row.try_get("pubkey")?;
+        let id = id_bytes.try_into().map_err(|v: Vec<u8>| {
+            sqlx::Error::Decode(format!("event id column is {} bytes, expected 32", v.len()).into())
+        })?;
+        let pubkey = pk_bytes.try_into().map_err(|v: Vec<u8>| {
+            sqlx::Error::Decode(format!("pubkey column is {} bytes, expected 32", v.len()).into())
+        })?;
+        let channel: Option<String> = row.try_get("channel_id")?;
+        hits.push(SearchHit {
+            event_id: id,
+            kind: row.try_get("kind")?,
+            pubkey,
+            channel_id: channel
+                .map(|value| Uuid::parse_str(&value))
+                .transpose()
+                .map_err(|error| sqlx::Error::Decode(error.into()))?,
+            created_at: row.try_get("created_at_s")?,
+            rank: -(row.try_get::<f64, _>("score")? as f32),
+        });
+    }
+    Ok(SearchResult { hits, page })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -341,6 +467,52 @@ mod tests {
             normalized_search_text("foo\0bar").as_deref(),
             Some("foo bar")
         );
+    }
+
+    #[tokio::test]
+    async fn sqlite_fts_is_tenant_scoped_prefix_capable_and_privacy_filtered() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        for statement in [
+            "CREATE TABLE events (community_id TEXT NOT NULL, id BLOB NOT NULL, pubkey BLOB NOT NULL, created_at INTEGER NOT NULL, kind INTEGER NOT NULL, content TEXT NOT NULL, channel_id TEXT, deleted_at INTEGER)",
+            "CREATE VIRTUAL TABLE events_fts USING fts5(content, content='events', content_rowid='rowid', tokenize='unicode61')",
+            "CREATE TRIGGER events_fts_insert AFTER INSERT ON events WHEN new.kind NOT IN (1059, 30300, 30350, 30622, 44100, 44101, 44200) BEGIN INSERT INTO events_fts(rowid, content) VALUES (new.rowid, new.content); END",
+        ] {
+            sqlx::query(statement).execute(&pool).await.unwrap();
+        }
+        let community = CommunityId::from_uuid(Uuid::new_v4());
+        let foreign = CommunityId::from_uuid(Uuid::new_v4());
+        let channel = Uuid::new_v4();
+        for (cid, id, kind, content, channel_id) in [
+            (community, vec![1; 32], 9, "project orchard", Some(channel)),
+            (community, vec![2; 32], 30300, "project private", None),
+            (foreign, vec![3; 32], 9, "project foreign", None),
+        ] {
+            sqlx::query("INSERT INTO events (community_id,id,pubkey,created_at,kind,content,channel_id) VALUES (?1,?2,?3,100,?4,?5,?6)")
+                .bind(cid.as_uuid().to_string()).bind(id).bind(vec![9; 32]).bind(kind).bind(content).bind(channel_id.map(|id| id.to_string())).execute(&pool).await.unwrap();
+        }
+        let result = search_sqlite(
+            &pool,
+            &SearchQuery {
+                community,
+                q: "pro".into(),
+                channel_scope: ChannelScope::Channels(vec![channel]),
+                kinds: None,
+                authors: None,
+                since: None,
+                until: None,
+                page: 1,
+                per_page: 100,
+                mode: SearchMode::Prefix,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.hits.len(), 1);
+        assert_eq!(result.hits[0].event_id, [1; 32]);
     }
 
     #[test]
