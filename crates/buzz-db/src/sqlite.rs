@@ -876,6 +876,32 @@ pub(crate) async fn get_event_by_id(
     row.map(stored_event).transpose()
 }
 
+pub(crate) async fn get_events_by_ids(
+    pool: &SqlitePool,
+    community: CommunityId,
+    ids: &[&[u8]],
+) -> Result<Vec<buzz_core::StoredEvent>> {
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut qb = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
+        "SELECT event_json, received_at, channel_id FROM events WHERE community_id = ",
+    );
+    qb.push_bind(community.as_uuid().to_string());
+    qb.push(" AND id IN (");
+    let mut separated = qb.separated(", ");
+    for id in ids {
+        separated.push_bind(*id);
+    }
+    separated.push_unseparated(")");
+    qb.build()
+        .fetch_all(pool)
+        .await?
+        .into_iter()
+        .map(stored_event)
+        .collect()
+}
+
 pub(crate) async fn query_events(
     pool: &SqlitePool,
     q: &crate::EventQuery,

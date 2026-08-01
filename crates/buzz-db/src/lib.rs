@@ -2046,7 +2046,12 @@ impl Db {
         community_id: CommunityId,
         ids: &[&[u8]],
     ) -> Result<Vec<StoredEvent>> {
-        event::get_events_by_ids(self.pg_pool()?, community_id, ids).await
+        match &self.backend {
+            DbBackend::SQLite(pool) => sqlite::get_events_by_ids(pool, community_id, ids).await,
+            DbBackend::Postgres => {
+                event::get_events_by_ids(self.pg_pool()?, community_id, ids).await
+            }
+        }
     }
 
     /// [`Db::get_events_by_ids`] with replica routing — same contract and
@@ -2062,6 +2067,9 @@ impl Db {
         community_id: CommunityId,
         ids: &[&[u8]],
     ) -> Result<Vec<StoredEvent>> {
+        if let DbBackend::SQLite(pool) = &self.backend {
+            return sqlite::get_events_by_ids(pool, community_id, ids).await;
+        }
         match self.route_read(path, RoutePredicate::Bounded).await {
             RouteDecision::Replica(mut tx, _entry, reason) => {
                 match event::get_events_by_ids_on(&mut tx, community_id, ids).await {
