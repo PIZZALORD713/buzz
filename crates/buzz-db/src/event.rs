@@ -163,7 +163,7 @@ const HUDDLE_LINK_CANDIDATE_LIMIT: i64 = 32;
 /// For NIP-33 parameterized replaceable events (kind 30000–39999): returns the first
 /// `d` tag's value, or `""` if no `d` tag is present (per NIP-33 spec).
 /// For all other events: returns `None` (column stays NULL).
-pub(crate) fn extract_d_tag(event: &Event) -> Option<String> {
+pub fn extract_d_tag(event: &Event) -> Option<String> {
     let kind_u32 = event.kind.as_u16() as u32;
     if !is_parameterized_replaceable(kind_u32) {
         return None;
