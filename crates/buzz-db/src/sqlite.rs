@@ -273,6 +273,18 @@ pub(crate) async fn migrate(pool: &SqlitePool) -> Result<()> {
         tx.commit().await?;
         version = 6;
     }
+    if version < 7 {
+        let mut tx = pool.begin().await?;
+        sqlx::query("CREATE TABLE IF NOT EXISTS thread_metadata (community_id TEXT NOT NULL, event_created_at INTEGER NOT NULL, event_id BLOB NOT NULL, channel_id TEXT NOT NULL, parent_event_id BLOB, parent_event_created_at INTEGER, root_event_id BLOB, root_event_created_at INTEGER, depth INTEGER NOT NULL DEFAULT 0, reply_count INTEGER NOT NULL DEFAULT 0, descendant_count INTEGER NOT NULL DEFAULT 0, last_reply_at INTEGER, broadcast INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (community_id, event_id), FOREIGN KEY (community_id) REFERENCES communities(id) ON DELETE CASCADE, FOREIGN KEY (channel_id) REFERENCES channels(id) ON DELETE CASCADE)")
+            .execute(&mut *tx).await?;
+        sqlx::query("CREATE INDEX IF NOT EXISTS idx_thread_metadata_root ON thread_metadata (community_id, root_event_id, event_created_at, event_id)")
+            .execute(&mut *tx).await?;
+        sqlx::query("UPDATE schema_version SET version = 7 WHERE singleton = 1")
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        version = 7;
+    }
     if version < 8 {
         let mut tx = pool.begin().await?;
         for statement in [
@@ -403,6 +415,296 @@ pub(crate) async fn insert_event(
     ))
 }
 
+async fn insert_thread_metadata_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    community: CommunityId,
+    meta: &crate::event::ThreadMetadataParams<'_>,
+) -> Result<()> {
+    let inserted = sqlx::query("INSERT INTO thread_metadata (community_id,event_created_at,event_id,channel_id,parent_event_id,parent_event_created_at,root_event_id,root_event_created_at,depth,broadcast) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10) ON CONFLICT DO NOTHING")
+        .bind(community.as_uuid().to_string()).bind(meta.event_created_at.timestamp()).bind(meta.event_id)
+        .bind(meta.channel_id.to_string()).bind(meta.parent_event_id).bind(meta.parent_event_created_at.map(|t| t.timestamp()))
+        .bind(meta.root_event_id).bind(meta.root_event_created_at.map(|t| t.timestamp())).bind(meta.depth).bind(meta.broadcast)
+        .execute(&mut **tx).await?.rows_affected() != 0;
+    if !inserted {
+        return Ok(());
+    }
+    if let Some(parent) = meta.parent_event_id {
+        let parent_at = meta
+            .parent_event_created_at
+            .unwrap_or(meta.event_created_at)
+            .timestamp();
+        sqlx::query("INSERT INTO thread_metadata (community_id,event_created_at,event_id,channel_id,depth,broadcast) VALUES (?1,?2,?3,?4,0,0) ON CONFLICT DO NOTHING")
+            .bind(community.as_uuid().to_string()).bind(parent_at).bind(parent).bind(meta.channel_id.to_string()).execute(&mut **tx).await?;
+        if let Some(root) = meta.root_event_id.filter(|root| *root != parent) {
+            let root_at = meta
+                .root_event_created_at
+                .unwrap_or(meta.event_created_at)
+                .timestamp();
+            sqlx::query("INSERT INTO thread_metadata (community_id,event_created_at,event_id,channel_id,depth,broadcast) VALUES (?1,?2,?3,?4,0,0) ON CONFLICT DO NOTHING")
+                .bind(community.as_uuid().to_string()).bind(root_at).bind(root).bind(meta.channel_id.to_string()).execute(&mut **tx).await?;
+        }
+        sqlx::query("UPDATE thread_metadata SET reply_count=reply_count+1,last_reply_at=unixepoch() WHERE community_id=?1 AND event_id=?2")
+            .bind(community.as_uuid().to_string()).bind(parent).execute(&mut **tx).await?;
+        if let Some(root) = meta.root_event_id {
+            sqlx::query("UPDATE thread_metadata SET descendant_count=descendant_count+1 WHERE community_id=?1 AND event_id=?2")
+                .bind(community.as_uuid().to_string()).bind(root).execute(&mut **tx).await?;
+        }
+    }
+    Ok(())
+}
+
+pub(crate) async fn get_thread_replies(
+    pool: &SqlitePool,
+    community: CommunityId,
+    root_event_id: &[u8],
+    depth_limit: Option<u32>,
+    limit: u32,
+    cursor: Option<&[u8]>,
+) -> Result<Vec<crate::thread::ThreadReply>> {
+    let cursor = cursor.filter(|value| value.len() >= 8).map(|value| {
+        (
+            i64::from_be_bytes(value[..8].try_into().expect("length checked")),
+            (value.len() > 8).then(|| value[8..].to_vec()),
+        )
+    });
+    let rows = sqlx::query("SELECT tm.event_id,tm.parent_event_id,tm.root_event_id,tm.channel_id,tm.depth,tm.event_created_at,tm.broadcast,e.pubkey,e.tags_json,e.content,e.event_json,e.received_at,e.channel_id AS event_channel_id FROM thread_metadata tm JOIN events e ON e.community_id=tm.community_id AND e.id=tm.event_id WHERE tm.community_id=?1 AND tm.root_event_id=?2 ORDER BY tm.event_created_at ASC,tm.event_id ASC")
+        .bind(community.as_uuid().to_string()).bind(root_event_id).fetch_all(pool).await?;
+    let mut replies = Vec::new();
+    for row in rows {
+        let created: i64 = row.try_get("event_created_at")?;
+        let id: Vec<u8> = row.try_get("event_id")?;
+        if depth_limit.is_some_and(|max| row.get::<i32, _>("depth") > max as i32)
+            || cursor.as_ref().is_some_and(|(at, cursor_id)| {
+                created < *at
+                    || (created == *at
+                        && cursor_id.as_ref().is_none_or(|cursor_id| id <= *cursor_id))
+            })
+        {
+            continue;
+        }
+        let channel: String = row.try_get("channel_id")?;
+        let parent_event_id = row.try_get("parent_event_id")?;
+        let root_event_id = row.try_get("root_event_id")?;
+        let depth = row.try_get("depth")?;
+        let broadcast = row.get::<i64, _>("broadcast") != 0;
+        let stored = stored_event(row)?;
+        replies.push(crate::thread::ThreadReply {
+            event_id: id,
+            parent_event_id,
+            root_event_id,
+            channel_id: Uuid::parse_str(&channel).map_err(|e| {
+                crate::DbError::InvalidData(format!("invalid SQLite channel id: {e}"))
+            })?,
+            pubkey: stored.event.pubkey.to_bytes().to_vec(),
+            tags: serde_json::to_value(&stored.event.tags)?,
+            content: stored.event.content.clone(),
+            stored_event: stored,
+            depth,
+            created_at: chrono::DateTime::from_timestamp(created, 0)
+                .ok_or(crate::DbError::InvalidTimestamp(created))?,
+            broadcast,
+        });
+        if replies.len() >= limit as usize {
+            break;
+        }
+    }
+    Ok(replies)
+}
+
+pub(crate) async fn get_channel_window(
+    pool: &SqlitePool,
+    community: CommunityId,
+    channel_id: Uuid,
+    limit: u32,
+    cursor: Option<(chrono::DateTime<chrono::Utc>, Vec<u8>)>,
+    kind_filter: Option<&[u32]>,
+) -> Result<crate::thread::ChannelWindow> {
+    let rows = sqlx::query("SELECT e.id,e.created_at,e.kind,e.event_json,e.received_at,e.channel_id,tm.reply_count,tm.descendant_count,tm.last_reply_at FROM events e LEFT JOIN thread_metadata tm ON tm.community_id=e.community_id AND tm.event_id=e.id WHERE e.community_id=?1 AND e.channel_id=?2 AND (tm.depth IS NULL OR tm.depth=0 OR (tm.depth=1 AND tm.broadcast=1)) ORDER BY e.created_at DESC,e.id ASC")
+        .bind(community.as_uuid().to_string()).bind(channel_id.to_string()).fetch_all(pool).await?;
+    let mut retained = Vec::new();
+    for row in rows {
+        let created: i64 = row.try_get("created_at")?;
+        let id: Vec<u8> = row.try_get("id")?;
+        let kind: i32 = row.try_get("kind")?;
+        if cursor.as_ref().is_some_and(|(at, cursor_id)| {
+            created > at.timestamp() || (created == at.timestamp() && id <= *cursor_id)
+        }) || kind_filter
+            .is_some_and(|kinds| !kinds.is_empty() && !kinds.contains(&(kind as u32)))
+        {
+            continue;
+        }
+        retained.push(row);
+        if retained.len() > limit as usize {
+            break;
+        }
+    }
+    let has_more = retained.len() > limit as usize;
+    retained.truncate(limit as usize);
+    let next_cursor = if has_more {
+        retained.last().map(|row| {
+            let created: i64 = row.get("created_at");
+            let id: Vec<u8> = row.get("id");
+            (
+                chrono::DateTime::from_timestamp(created, 0).expect("stored timestamps are valid"),
+                id,
+            )
+        })
+    } else {
+        None
+    };
+    let mut result = Vec::with_capacity(retained.len());
+    for row in retained {
+        let reply_count: Option<i32> = row.try_get("reply_count")?;
+        let root_id: Vec<u8> = row.try_get("id")?;
+        let summary = if reply_count.is_some_and(|count| count > 0) {
+            get_thread_summary(pool, community, &root_id).await?
+        } else {
+            None
+        };
+        result.push(crate::thread::ChannelWindowRow {
+            stored_event: stored_event(row)?,
+            thread_summary: summary,
+        });
+    }
+    Ok(crate::thread::ChannelWindow {
+        rows: result,
+        has_more,
+        next_cursor,
+    })
+}
+
+pub(crate) async fn get_thread_metadata_by_event(
+    pool: &SqlitePool,
+    community: CommunityId,
+    event_id: &[u8],
+) -> Result<Option<crate::thread::ThreadMetadataRecord>> {
+    let row = sqlx::query("SELECT event_id,event_created_at,channel_id,parent_event_id,root_event_id,depth,reply_count,descendant_count,broadcast FROM thread_metadata WHERE community_id=?1 AND event_id=?2")
+        .bind(community.as_uuid().to_string()).bind(event_id).fetch_optional(pool).await?;
+    row.map(|row| {
+        let event_created_at: i64 = row.try_get("event_created_at")?;
+        let channel_id: String = row.try_get("channel_id")?;
+        Ok(crate::thread::ThreadMetadataRecord {
+            event_id: row.try_get("event_id")?,
+            event_created_at: chrono::DateTime::from_timestamp(event_created_at, 0)
+                .ok_or(crate::DbError::InvalidTimestamp(event_created_at))?,
+            channel_id: Uuid::parse_str(&channel_id).map_err(|e| {
+                crate::DbError::InvalidData(format!("invalid SQLite channel id: {e}"))
+            })?,
+            parent_event_id: row.try_get("parent_event_id")?,
+            root_event_id: row.try_get("root_event_id")?,
+            depth: row.try_get("depth")?,
+            reply_count: row.try_get("reply_count")?,
+            descendant_count: row.try_get("descendant_count")?,
+            broadcast: row.try_get::<i64, _>("broadcast")? != 0,
+        })
+    })
+    .transpose()
+}
+
+pub(crate) async fn decrement_reply_count(
+    pool: &SqlitePool,
+    community: CommunityId,
+    parent: &[u8],
+    root: Option<&[u8]>,
+) -> Result<()> {
+    let mut tx = pool.begin().await?;
+    sqlx::query("UPDATE thread_metadata SET reply_count=MAX(reply_count-1,0) WHERE community_id=?1 AND event_id=?2")
+        .bind(community.as_uuid().to_string()).bind(parent).execute(&mut *tx).await?;
+    if let Some(root) = root {
+        sqlx::query("UPDATE thread_metadata SET descendant_count=MAX(descendant_count-1,0) WHERE community_id=?1 AND event_id=?2")
+            .bind(community.as_uuid().to_string()).bind(root).execute(&mut *tx).await?;
+    }
+    tx.commit().await?;
+    Ok(())
+}
+
+pub(crate) async fn get_thread_summary(
+    pool: &SqlitePool,
+    community: CommunityId,
+    event_id: &[u8],
+) -> Result<Option<crate::thread::ThreadSummary>> {
+    let row = sqlx::query("SELECT reply_count,descendant_count,last_reply_at FROM thread_metadata WHERE community_id=?1 AND event_id=?2")
+        .bind(community.as_uuid().to_string()).bind(event_id).fetch_optional(pool).await?;
+    let Some(row) = row else { return Ok(None) };
+    let last: Option<i64> = row.try_get("last_reply_at")?;
+    let participants = sqlx::query_scalar::<_, Vec<u8>>("SELECT e.pubkey FROM thread_metadata tm JOIN events e ON e.community_id=tm.community_id AND e.id=tm.event_id WHERE tm.community_id=?1 AND tm.root_event_id=?2 GROUP BY e.pubkey ORDER BY MAX(e.created_at) DESC LIMIT 10")
+        .bind(community.as_uuid().to_string()).bind(event_id).fetch_all(pool).await?;
+    Ok(Some(crate::thread::ThreadSummary {
+        reply_count: row.try_get("reply_count")?,
+        descendant_count: row.try_get("descendant_count")?,
+        last_reply_at: last
+            .map(|v| {
+                chrono::DateTime::from_timestamp(v, 0).ok_or(crate::DbError::InvalidTimestamp(v))
+            })
+            .transpose()?,
+        participants,
+    }))
+}
+
+pub(crate) async fn insert_event_with_thread_metadata(
+    pool: &SqlitePool,
+    community: CommunityId,
+    event: &nostr::Event,
+    channel_id: Option<Uuid>,
+    thread_meta: Option<crate::event::ThreadMetadataParams<'_>>,
+) -> Result<(buzz_core::StoredEvent, bool)> {
+    let kind = u32::from(event.kind.as_u16());
+    if kind == buzz_core::kind::KIND_AUTH {
+        return Err(crate::DbError::AuthEventRejected);
+    }
+    if buzz_core::kind::is_ephemeral(kind) {
+        return Err(crate::DbError::EphemeralEventRejected(event.kind.as_u16()));
+    }
+    let received_at = chrono::Utc::now();
+    let mut tx = pool.begin().await?;
+    let inserted = sqlx::query("INSERT INTO events (community_id,id,pubkey,created_at,kind,tags_json,content,sig,channel_id,received_at,event_json) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11) ON CONFLICT DO NOTHING")
+        .bind(community.as_uuid().to_string()).bind(event.id.as_bytes().as_slice()).bind(event.pubkey.to_bytes().as_slice())
+        .bind(event.created_at.as_secs() as i64).bind(event.kind.as_u16() as i32).bind(serde_json::to_string(&event.tags)?)
+        .bind(&event.content).bind(event.sig.serialize().as_slice()).bind(channel_id.map(|id| id.to_string()))
+        .bind(received_at.timestamp()).bind(serde_json::to_string(event)?).execute(&mut *tx).await?.rows_affected() != 0;
+    if inserted {
+        if let Some(meta) = &thread_meta {
+            insert_thread_metadata_tx(&mut tx, community, meta).await?;
+        }
+    }
+    tx.commit().await?;
+    Ok((
+        buzz_core::StoredEvent::with_received_at(event.clone(), received_at, channel_id, true),
+        inserted,
+    ))
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn insert_thread_metadata(
+    pool: &SqlitePool,
+    community: CommunityId,
+    event_id: &[u8],
+    event_created_at: chrono::DateTime<chrono::Utc>,
+    channel_id: Uuid,
+    parent_event_id: Option<&[u8]>,
+    parent_event_created_at: Option<chrono::DateTime<chrono::Utc>>,
+    root_event_id: Option<&[u8]>,
+    root_event_created_at: Option<chrono::DateTime<chrono::Utc>>,
+    depth: i32,
+    broadcast: bool,
+) -> Result<()> {
+    let meta = crate::event::ThreadMetadataParams {
+        event_id,
+        event_created_at,
+        channel_id,
+        parent_event_id,
+        parent_event_created_at,
+        root_event_id,
+        root_event_created_at,
+        depth,
+        broadcast,
+    };
+    let mut tx = pool.begin().await?;
+    insert_thread_metadata_tx(&mut tx, community, &meta).await?;
+    tx.commit().await?;
+    Ok(())
+}
+
 pub(crate) async fn replace_event(
     pool: &SqlitePool,
     community: CommunityId,
@@ -474,6 +776,35 @@ pub(crate) async fn soft_delete_event(
             .rows_affected()
             != 0,
     )
+}
+
+pub(crate) async fn soft_delete_event_and_update_thread(
+    pool: &SqlitePool,
+    community: CommunityId,
+    event_id: &[u8],
+    parent: Option<&[u8]>,
+    root: Option<&[u8]>,
+) -> Result<bool> {
+    let mut tx = pool.begin().await?;
+    let deleted = sqlx::query("DELETE FROM events WHERE community_id = ?1 AND id = ?2")
+        .bind(community.as_uuid().to_string())
+        .bind(event_id)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected()
+        != 0;
+    if deleted {
+        if let Some(parent) = parent {
+            sqlx::query("UPDATE thread_metadata SET reply_count=MAX(reply_count-1,0) WHERE community_id=?1 AND event_id=?2")
+                .bind(community.as_uuid().to_string()).bind(parent).execute(&mut *tx).await?;
+        }
+        if let Some(root) = root {
+            sqlx::query("UPDATE thread_metadata SET descendant_count=MAX(descendant_count-1,0) WHERE community_id=?1 AND event_id=?2")
+                .bind(community.as_uuid().to_string()).bind(root).execute(&mut *tx).await?;
+        }
+    }
+    tx.commit().await?;
+    Ok(deleted)
 }
 
 pub(crate) async fn get_event_by_id(
@@ -2549,6 +2880,84 @@ mod tests {
                 .await
                 .unwrap()
         );
+    }
+
+    #[tokio::test]
+    async fn thread_metadata_counters_are_idempotent_scoped_and_clamped() {
+        let pool = connect(":memory:").await.unwrap();
+        let community = ensure_configured_community(&pool, "threads.local")
+            .await
+            .unwrap()
+            .id;
+        let foreign = ensure_configured_community(&pool, "foreign.local")
+            .await
+            .unwrap()
+            .id;
+        let channel = Uuid::new_v4();
+        sqlx::query("INSERT INTO channels (id,community_id,name,channel_type,visibility,created_by) VALUES (?1,?2,'threads','stream','private',?3)")
+            .bind(channel.to_string()).bind(community.as_uuid().to_string()).bind(vec![1_u8; 32]).execute(&pool).await.unwrap();
+        let root = vec![2_u8; 32];
+        let reply = vec![3_u8; 32];
+        let at = chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap();
+
+        insert_thread_metadata(
+            &pool,
+            community,
+            &reply,
+            at,
+            channel,
+            Some(&root),
+            Some(at),
+            Some(&root),
+            Some(at),
+            1,
+            false,
+        )
+        .await
+        .unwrap();
+        // Duplicate ingestion must not double-count.
+        insert_thread_metadata(
+            &pool,
+            community,
+            &reply,
+            at,
+            channel,
+            Some(&root),
+            Some(at),
+            Some(&root),
+            Some(at),
+            1,
+            false,
+        )
+        .await
+        .unwrap();
+
+        let root_meta = get_thread_metadata_by_event(&pool, community, &root)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!((root_meta.reply_count, root_meta.descendant_count), (1, 1));
+        assert!(get_thread_metadata_by_event(&pool, foreign, &root)
+            .await
+            .unwrap()
+            .is_none());
+        let summary = get_thread_summary(&pool, community, &root)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!((summary.reply_count, summary.descendant_count), (1, 1));
+
+        decrement_reply_count(&pool, community, &root, Some(&root))
+            .await
+            .unwrap();
+        decrement_reply_count(&pool, community, &root, Some(&root))
+            .await
+            .unwrap();
+        let summary = get_thread_summary(&pool, community, &root)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!((summary.reply_count, summary.descendant_count), (0, 0));
     }
 
     #[tokio::test]
