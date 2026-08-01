@@ -109,6 +109,8 @@ CREATE TABLE IF NOT EXISTS events (
     channel_id TEXT,
     received_at INTEGER NOT NULL,
     event_json TEXT NOT NULL,
+    not_before INTEGER,
+    delivered_at INTEGER,
     PRIMARY KEY (community_id, id),
     FOREIGN KEY (community_id) REFERENCES communities(id) ON DELETE CASCADE
 );
@@ -359,7 +361,51 @@ pub(crate) async fn migrate(pool: &SqlitePool) -> Result<()> {
         tx.commit().await?;
         version = 11;
     }
-    if version != 11 {
+    if version < 12 {
+        let mut tx = pool.begin().await?;
+        ensure_column_on(
+            &mut tx,
+            "events",
+            "not_before",
+            "ALTER TABLE events ADD COLUMN not_before INTEGER",
+        )
+        .await?;
+        ensure_column_on(
+            &mut tx,
+            "events",
+            "delivered_at",
+            "ALTER TABLE events ADD COLUMN delivered_at INTEGER",
+        )
+        .await?;
+        let reminder_rows = sqlx::query(
+            "SELECT community_id, id, event_json FROM events WHERE kind = ?1 AND not_before IS NULL",
+        )
+        .bind(buzz_core::kind::KIND_EVENT_REMINDER as i32)
+        .fetch_all(&mut *tx)
+        .await?;
+        for row in reminder_rows {
+            let event: nostr::Event = serde_json::from_str(row.try_get("event_json")?)?;
+            if let Some(not_before) = crate::event::extract_not_before(&event) {
+                sqlx::query(
+                    "UPDATE events SET not_before = ?1 WHERE community_id = ?2 AND id = ?3",
+                )
+                .bind(not_before)
+                .bind(row.try_get::<String, _>("community_id")?)
+                .bind(row.try_get::<Vec<u8>, _>("id")?)
+                .execute(&mut *tx)
+                .await?;
+            }
+        }
+        sqlx::query("CREATE INDEX IF NOT EXISTS idx_events_due_reminders ON events (not_before, community_id, pubkey, created_at DESC, id) WHERE kind = 30300 AND delivered_at IS NULL")
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("UPDATE schema_version SET version = 12 WHERE singleton = 1")
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        version = 12;
+    }
+    if version != 12 {
         return Err(crate::DbError::InvalidData(format!(
             "unsupported SQLite schema version {version}"
         )));
@@ -463,11 +509,12 @@ pub(crate) async fn insert_event(
         return Err(crate::DbError::EphemeralEventRejected(event.kind.as_u16()));
     }
     let received_at = chrono::Utc::now();
-    let inserted = sqlx::query("INSERT INTO events (community_id, id, pubkey, created_at, kind, tags_json, content, sig, channel_id, received_at, event_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11) ON CONFLICT DO NOTHING")
+    let not_before = crate::event::extract_not_before(event);
+    let inserted = sqlx::query("INSERT INTO events (community_id, id, pubkey, created_at, kind, tags_json, content, sig, channel_id, received_at, event_json, not_before) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12) ON CONFLICT DO NOTHING")
         .bind(community.as_uuid().to_string()).bind(event.id.as_bytes().as_slice()).bind(event.pubkey.to_bytes().as_slice())
         .bind(event.created_at.as_secs() as i64).bind(event.kind.as_u16() as i32).bind(serde_json::to_string(&event.tags)?)
         .bind(&event.content).bind(event.sig.serialize().as_slice()).bind(channel_id.map(|id| id.to_string()))
-        .bind(received_at.timestamp()).bind(serde_json::to_string(event)?).execute(pool).await?.rows_affected() == 1;
+        .bind(received_at.timestamp()).bind(serde_json::to_string(event)?).bind(not_before).execute(pool).await?.rows_affected() == 1;
     Ok((
         buzz_core::StoredEvent::with_received_at(event.clone(), received_at, channel_id, true),
         inserted,
@@ -716,11 +763,12 @@ pub(crate) async fn insert_event_with_thread_metadata(
     }
     let received_at = chrono::Utc::now();
     let mut tx = pool.begin().await?;
-    let inserted = sqlx::query("INSERT INTO events (community_id,id,pubkey,created_at,kind,tags_json,content,sig,channel_id,received_at,event_json) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11) ON CONFLICT DO NOTHING")
+    let not_before = crate::event::extract_not_before(event);
+    let inserted = sqlx::query("INSERT INTO events (community_id,id,pubkey,created_at,kind,tags_json,content,sig,channel_id,received_at,event_json,not_before) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12) ON CONFLICT DO NOTHING")
         .bind(community.as_uuid().to_string()).bind(event.id.as_bytes().as_slice()).bind(event.pubkey.to_bytes().as_slice())
         .bind(event.created_at.as_secs() as i64).bind(event.kind.as_u16() as i32).bind(serde_json::to_string(&event.tags)?)
         .bind(&event.content).bind(event.sig.serialize().as_slice()).bind(channel_id.map(|id| id.to_string()))
-        .bind(received_at.timestamp()).bind(serde_json::to_string(event)?).execute(&mut *tx).await?.rows_affected() != 0;
+        .bind(received_at.timestamp()).bind(serde_json::to_string(event)?).bind(not_before).execute(&mut *tx).await?.rows_affected() != 0;
     if inserted {
         if let Some(meta) = &thread_meta {
             insert_thread_metadata_tx(&mut tx, community, meta).await?;
@@ -809,11 +857,12 @@ pub(crate) async fn replace_event(
             .await?;
     }
     let received_at = chrono::Utc::now();
-    sqlx::query("INSERT INTO events (community_id, id, pubkey, created_at, kind, tags_json, content, sig, channel_id, received_at, event_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)")
+    let not_before = crate::event::extract_not_before(event);
+    sqlx::query("INSERT INTO events (community_id, id, pubkey, created_at, kind, tags_json, content, sig, channel_id, received_at, event_json, not_before) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)")
         .bind(community.as_uuid().to_string()).bind(event.id.as_bytes().as_slice()).bind(event.pubkey.to_bytes().as_slice())
         .bind(event.created_at.as_secs() as i64).bind(event.kind.as_u16() as i32).bind(serde_json::to_string(&event.tags)?)
         .bind(&event.content).bind(event.sig.serialize().as_slice()).bind(channel_id.map(|id| id.to_string()))
-        .bind(received_at.timestamp()).bind(serde_json::to_string(event)?).execute(&mut *tx).await?;
+        .bind(received_at.timestamp()).bind(serde_json::to_string(event)?).bind(not_before).execute(&mut *tx).await?;
     tx.commit().await?;
     Ok((
         buzz_core::StoredEvent::with_received_at(event.clone(), received_at, channel_id, true),
@@ -1229,6 +1278,125 @@ pub(crate) async fn query_feed_activity(
     query.since = since;
     query.limit = Some(limit.min(crate::feed::FEED_MAX_LIMIT));
     query_events(pool, &query).await
+}
+
+pub(crate) async fn query_due_reminders(
+    pool: &SqlitePool,
+    now_secs: i64,
+    batch_limit: i64,
+) -> Result<Vec<crate::event::DueReminder>> {
+    if batch_limit <= 0 {
+        return Ok(Vec::new());
+    }
+    let rows = sqlx::query(
+        r#"
+        SELECT e.community_id, c.host, e.id, e.pubkey, e.created_at, e.kind,
+               e.tags_json, e.content, e.sig, e.channel_id, e.event_json
+        FROM events e
+        JOIN communities c ON c.id = e.community_id
+        WHERE e.kind = ?1
+          AND e.not_before IS NOT NULL
+          AND e.not_before <= ?2
+          AND e.delivered_at IS NULL
+          AND c.archived_at IS NULL
+        ORDER BY e.community_id, e.pubkey, e.created_at DESC, e.id ASC
+        "#,
+    )
+    .bind(buzz_core::kind::KIND_EVENT_REMINDER as i32)
+    .bind(now_secs)
+    .fetch_all(pool)
+    .await?;
+    let mut candidates = Vec::with_capacity(rows.len());
+    for row in rows {
+        let community: String = row.try_get("community_id")?;
+        let pubkey: Vec<u8> = row.try_get("pubkey")?;
+        let created_at: i64 = row.try_get("created_at")?;
+        let id: Vec<u8> = row.try_get("id")?;
+        let event: nostr::Event = serde_json::from_str(row.try_get("event_json")?)?;
+        candidates.push((
+            community,
+            pubkey,
+            crate::event::extract_d_tag(&event)
+                .unwrap_or_default()
+                .to_owned(),
+            created_at,
+            id,
+            row,
+        ));
+    }
+    candidates.sort_by(|a, b| {
+        a.0.cmp(&b.0)
+            .then_with(|| a.1.cmp(&b.1))
+            .then_with(|| a.2.cmp(&b.2))
+            .then_with(|| b.3.cmp(&a.3))
+            .then_with(|| a.4.cmp(&b.4))
+    });
+    let mut seen_addresses = std::collections::HashSet::new();
+    let mut results = Vec::new();
+    for (community, pubkey, d_tag, created_at, id, row) in candidates {
+        if !seen_addresses.insert((community.clone(), pubkey.clone(), d_tag)) {
+            continue;
+        }
+        let channel_id: Option<String> = row.try_get("channel_id")?;
+        results.push(crate::event::DueReminder {
+            community_id: CommunityId::from_uuid(
+                Uuid::parse_str(&community)
+                    .map_err(|e| crate::DbError::InvalidData(e.to_string()))?,
+            ),
+            host: row.try_get("host")?,
+            id,
+            pubkey,
+            created_at: chrono::DateTime::from_timestamp(created_at, 0)
+                .ok_or(crate::DbError::InvalidTimestamp(created_at))?,
+            kind: row.try_get("kind")?,
+            tags: serde_json::from_str(row.try_get("tags_json")?)?,
+            content: row.try_get("content")?,
+            sig: row.try_get("sig")?,
+            channel_id: channel_id
+                .map(|id| {
+                    Uuid::parse_str(&id).map_err(|e| crate::DbError::InvalidData(e.to_string()))
+                })
+                .transpose()?,
+        });
+        if results.len() >= batch_limit as usize {
+            break;
+        }
+    }
+    Ok(results)
+}
+
+pub(crate) async fn claim_due_reminder_with_stamp(
+    pool: &SqlitePool,
+    community: CommunityId,
+    event_id: &[u8],
+    event_created_at: chrono::DateTime<chrono::Utc>,
+    delivery_stamp: i64,
+) -> Result<bool> {
+    Ok(sqlx::query("UPDATE events SET delivered_at = ?1 WHERE community_id = ?2 AND created_at = ?3 AND id = ?4 AND delivered_at IS NULL")
+        .bind(delivery_stamp)
+        .bind(community.as_uuid().to_string())
+        .bind(event_created_at.timestamp())
+        .bind(event_id)
+        .execute(pool)
+        .await?
+        .rows_affected() == 1)
+}
+
+pub(crate) async fn release_due_reminder(
+    pool: &SqlitePool,
+    community: CommunityId,
+    event_id: &[u8],
+    event_created_at: chrono::DateTime<chrono::Utc>,
+    delivery_stamp: i64,
+) -> Result<bool> {
+    Ok(sqlx::query("UPDATE events SET delivered_at = NULL WHERE community_id = ?1 AND created_at = ?2 AND id = ?3 AND delivered_at = ?4")
+        .bind(community.as_uuid().to_string())
+        .bind(event_created_at.timestamp())
+        .bind(event_id)
+        .bind(delivery_stamp)
+        .execute(pool)
+        .await?
+        .rows_affected() == 1)
 }
 
 pub(crate) async fn insert_reaction_event(
@@ -4044,6 +4212,29 @@ mod tests {
             .execute(&pool)
             .await
             .unwrap();
+        let legacy_reminder = EventBuilder::new(
+            Kind::Custom(buzz_core::kind::KIND_EVENT_REMINDER as u16),
+            "legacy reminder",
+        )
+        .tags([
+            Tag::parse(["d", "legacy"]).unwrap(),
+            Tag::parse(["not_before", "1234"]).unwrap(),
+        ])
+        .custom_created_at(Timestamp::from(99_u64))
+        .sign_with_keys(&Keys::generate())
+        .unwrap();
+        sqlx::query("INSERT INTO events (community_id,id,pubkey,created_at,kind,tags_json,content,sig,received_at,event_json) VALUES (?1,?2,?3,99,?4,?5,?6,?7,99,?8)")
+            .bind(legacy_community.to_string())
+            .bind(legacy_reminder.id.as_bytes().as_slice())
+            .bind(legacy_reminder.pubkey.to_bytes().as_slice())
+            .bind(legacy_reminder.kind.as_u16() as i32)
+            .bind(serde_json::to_string(&legacy_reminder.tags).unwrap())
+            .bind(&legacy_reminder.content)
+            .bind(legacy_reminder.sig.serialize().as_slice())
+            .bind(serde_json::to_string(&legacy_reminder).unwrap())
+            .execute(&pool)
+            .await
+            .unwrap();
         sqlx::query("INSERT INTO events (community_id,id,pubkey,created_at,kind,tags_json,content,sig,received_at,event_json) VALUES (?1,?2,?3,100,9,'[]','legacy searchable orchard',?4,100,'{}')")
             .bind(legacy_community.to_string()).bind(vec![1_u8; 32]).bind(vec![2_u8; 32]).bind(vec![3_u8; 64]).execute(&pool).await.unwrap();
         pool.close().await;
@@ -4054,11 +4245,13 @@ mod tests {
                 .fetch_one(&upgraded)
                 .await
                 .unwrap(),
-            11
+            12
         );
         for (table, column) in [
             ("channels", "participant_hash"),
             ("channel_members", "hidden_at"),
+            ("events", "not_before"),
+            ("events", "delivered_at"),
         ] {
             let pragma = format!("PRAGMA table_info({table})");
             assert!(sqlx::query(sqlx::AssertSqlSafe(pragma))
@@ -4068,6 +4261,14 @@ mod tests {
                 .iter()
                 .any(|row| row.get::<String, _>("name") == column));
         }
+        assert_eq!(
+            sqlx::query_scalar::<_, Option<i64>>("SELECT not_before FROM events WHERE id = ?1")
+                .bind(legacy_reminder.id.as_bytes().as_slice())
+                .fetch_one(&upgraded)
+                .await
+                .unwrap(),
+            Some(1234)
+        );
         assert_eq!(
             sqlx::query_scalar::<_, i64>(
                 "SELECT count(*) FROM events_fts WHERE events_fts MATCH 'orchard'"
@@ -4181,7 +4382,7 @@ mod tests {
                 .fetch_one(&upgraded)
                 .await
                 .unwrap(),
-            11
+            12
         );
         assert_eq!(
             sqlx::query_scalar::<_, i64>(
@@ -4286,6 +4487,78 @@ mod tests {
         );
         upgraded.close().await;
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn due_reminders_are_latest_per_tenant_address_and_claims_compare_and_clear() {
+        let pool = connect("sqlite::memory:").await.unwrap();
+        let a = ensure_configured_community(&pool, "reminders-a.example")
+            .await
+            .unwrap()
+            .id;
+        let b = ensure_configured_community(&pool, "reminders-b.example")
+            .await
+            .unwrap()
+            .id;
+        let keys = Keys::generate();
+        let reminder = |created_at: u64, d_tag: &str, not_before: i64, content: &str| {
+            EventBuilder::new(
+                Kind::Custom(buzz_core::kind::KIND_EVENT_REMINDER as u16),
+                content,
+            )
+            .tags([
+                Tag::parse(["d", d_tag]).unwrap(),
+                Tag::parse(["not_before", &not_before.to_string()]).unwrap(),
+            ])
+            .custom_created_at(Timestamp::from(created_at))
+            .sign_with_keys(&keys)
+            .unwrap()
+        };
+        let old = reminder(100, "same", 50, "old");
+        let latest = reminder(101, "same", 50, "latest");
+        let future = reminder(102, "future", 500, "future");
+        for (community, event) in [(a, &old), (a, &latest), (a, &future), (b, &latest)] {
+            insert_event(&pool, community, event, None).await.unwrap();
+        }
+
+        let due = query_due_reminders(&pool, 100, 100).await.unwrap();
+        assert_eq!(due.len(), 2);
+        assert!(due.iter().all(|row| row.id == latest.id.as_bytes()));
+        assert_eq!(due.iter().filter(|row| row.community_id == a).count(), 1);
+        assert_eq!(due.iter().filter(|row| row.community_id == b).count(), 1);
+        assert!(due.iter().all(|row| row.content == "latest"));
+
+        let created_at = chrono::DateTime::from_timestamp(101, 0).unwrap();
+        assert!(
+            claim_due_reminder_with_stamp(&pool, a, latest.id.as_bytes(), created_at, 7)
+                .await
+                .unwrap()
+        );
+        assert!(
+            !claim_due_reminder_with_stamp(&pool, a, latest.id.as_bytes(), created_at, 8)
+                .await
+                .unwrap()
+        );
+        assert!(
+            claim_due_reminder_with_stamp(&pool, b, latest.id.as_bytes(), created_at, 8)
+                .await
+                .unwrap()
+        );
+        assert!(
+            !release_due_reminder(&pool, a, latest.id.as_bytes(), created_at, 8)
+                .await
+                .unwrap()
+        );
+        assert!(
+            release_due_reminder(&pool, a, latest.id.as_bytes(), created_at, 7)
+                .await
+                .unwrap()
+        );
+        assert!(
+            claim_due_reminder_with_stamp(&pool, a, latest.id.as_bytes(), created_at, 9)
+                .await
+                .unwrap()
+        );
     }
 
     #[tokio::test]
