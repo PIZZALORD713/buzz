@@ -1,5 +1,3 @@
-mod local_mode;
-
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -141,10 +139,6 @@ async fn main() -> anyhow::Result<()> {
     }
 
     info!("Starting buzz-relay");
-
-    if let Some(config) = local_mode::Config::from_env()? {
-        return local_mode::run(config).await;
-    }
 
     let config = Config::from_env().map_err(|e| {
         error!("Invalid configuration: {e}");
