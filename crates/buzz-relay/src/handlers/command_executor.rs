@@ -119,11 +119,35 @@ async fn persist_command_event(
     channel_id_override: Option<Uuid>,
 ) -> Result<PersistResult, IngestError> {
     let channel_id = channel_id_override.or_else(|| extract_channel_id(event));
+    let d_tag = buzz_db::event::extract_d_tag(event);
+    if let Some(ref d_tag) = d_tag {
+        if d_tag.len() > buzz_db::event::D_TAG_MAX_LEN {
+            return Err(IngestError::Rejected(format!(
+                "invalid: d tag too long ({} bytes, max {})",
+                d_tag.len(),
+                buzz_db::event::D_TAG_MAX_LEN,
+            )));
+        }
+    }
 
     if state.config.profile.is_single_node() {
-        return Err(IngestError::Rejected(
-            "unsupported_feature: this command is unavailable in the single-node profile".into(),
-        ));
+        let result = if let Some(d_tag) = d_tag.as_deref() {
+            state
+                .db
+                .replace_parameterized_event(tenant.community(), event, d_tag, channel_id)
+                .await
+        } else {
+            state
+                .db
+                .insert_event(tenant.community(), event, channel_id)
+                .await
+        }
+        .map_err(|e| IngestError::Internal(format!("error: persist SQLite command: {e}")))?;
+        return Ok(if result.1 {
+            PersistResult::Inserted(CommandTransaction::Sqlite)
+        } else {
+            PersistResult::Duplicate
+        });
     }
 
     let mut tx = state
@@ -146,16 +170,7 @@ async fn persist_command_event(
     let received_at = chrono::Utc::now();
 
     // Extract d_tag for parameterized replaceable kinds (NIP-33).
-    let d_tag = buzz_db::event::extract_d_tag(event);
     if let Some(ref d_tag) = d_tag {
-        if d_tag.len() > buzz_db::event::D_TAG_MAX_LEN {
-            return Err(IngestError::Rejected(format!(
-                "invalid: d tag too long ({} bytes, max {})",
-                d_tag.len(),
-                buzz_db::event::D_TAG_MAX_LEN,
-            )));
-        }
-
         // Command kinds normally use plain insert semantics, but workflow
         // definitions are NIP-33 events. Serialize writers for the same
         // coordinate and reject stale writes before executing the domain

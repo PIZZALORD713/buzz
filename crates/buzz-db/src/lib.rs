@@ -4818,15 +4818,28 @@ impl Db {
     }
 
     /// Ensures monthly partitions exist for the next N months.
+    ///
+    /// SQLite stores events in an unpartitioned local table, so this is an
+    /// intentional single-node no-op.
     pub async fn ensure_future_partitions(&self, months_ahead: u32) -> Result<()> {
-        partition::ensure_future_partitions(self.pg_pool()?, months_ahead).await
+        match &self.backend {
+            DbBackend::SQLite(_) => Ok(()),
+            DbBackend::Postgres => {
+                partition::ensure_future_partitions(self.pg_pool()?, months_ahead).await
+            }
+        }
     }
 
     /// Backfill `d_tag` for existing NIP-33 events (kind 30000–39999) that have `d_tag IS NULL`.
     ///
     /// Idempotent — safe to call on every startup. No-ops when all rows are already populated.
-    /// Runs a single UPDATE touching only NIP-33 rows with NULL d_tag.
+    /// Runs a single UPDATE touching only NIP-33 rows with NULL d_tag. SQLite
+    /// derives d-tags from the persisted event JSON and has no denormalized
+    /// `d_tag` column, so its profile deliberately returns zero.
     pub async fn backfill_d_tags(&self) -> Result<u64> {
+        if matches!(&self.backend, DbBackend::SQLite(_)) {
+            return Ok(0);
+        }
         let result = sqlx::query(
             "UPDATE events \
              SET d_tag = COALESCE( \
