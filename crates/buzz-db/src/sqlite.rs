@@ -1925,6 +1925,146 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn repairs_old_v3_fts_privacy_and_dm_uniqueness_on_upgrade() {
+        let path =
+            std::env::temp_dir().join(format!("buzz-db-v3-upgrade-{}.sqlite", Uuid::new_v4()));
+        let pool = connect(path.to_str().unwrap()).await.unwrap();
+        let community = ensure_configured_community(&pool, "v3-upgrade.example")
+            .await
+            .unwrap()
+            .id;
+
+        for (id, kind, content) in [
+            (vec![1_u8; 32], 9_i64, "public orchard"),
+            (vec![2_u8; 32], 1_i64, "private orchard"),
+        ] {
+            sqlx::query("INSERT INTO events (community_id,id,pubkey,created_at,kind,tags_json,content,sig,received_at,event_json) VALUES (?1,?2,?3,100,?4,'[]',?5,?6,100,'{}')")
+                .bind(community.as_uuid().to_string())
+                .bind(id)
+                .bind(vec![3_u8; 32])
+                .bind(kind)
+                .bind(content)
+                .bind(vec![4_u8; 64])
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+
+        // Recreate the objects emitted by the original v3 migration, including its
+        // broad denylist policy and direct events content table.
+        for statement in [
+            "DROP TRIGGER events_fts_insert",
+            "DROP TRIGGER events_fts_delete",
+            "DROP TRIGGER events_fts_update",
+            "DROP TABLE events_fts",
+            "DROP VIEW searchable_events",
+            "DROP INDEX idx_channels_dm_hash",
+            "CREATE VIRTUAL TABLE events_fts USING fts5(content, content='events', content_rowid='rowid', tokenize='unicode61')",
+            "INSERT INTO events_fts(events_fts) VALUES ('rebuild')",
+            "CREATE TRIGGER events_fts_insert AFTER INSERT ON events WHEN new.kind NOT IN (1059, 30300, 30350, 30622, 44100, 44101, 44200) BEGIN INSERT INTO events_fts(rowid, content) VALUES (new.rowid, new.content); END",
+            "CREATE TRIGGER events_fts_delete AFTER DELETE ON events WHEN old.kind NOT IN (1059, 30300, 30350, 30622, 44100, 44101, 44200) BEGIN INSERT INTO events_fts(events_fts, rowid, content) VALUES ('delete', old.rowid, old.content); END",
+            "CREATE TRIGGER events_fts_update AFTER UPDATE OF content, kind ON events BEGIN INSERT INTO events_fts(events_fts, rowid, content) SELECT 'delete', old.rowid, old.content WHERE old.kind NOT IN (1059, 30300, 30350, 30622, 44100, 44101, 44200); INSERT INTO events_fts(rowid, content) SELECT new.rowid, new.content WHERE new.kind NOT IN (1059, 30300, 30350, 30622, 44100, 44101, 44200); END",
+            "UPDATE schema_version SET version = 3 WHERE singleton = 1",
+        ] {
+            sqlx::query(statement).execute(&pool).await.unwrap();
+        }
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT count(*) FROM events_fts WHERE events_fts MATCH 'private'"
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            1
+        );
+        pool.close().await;
+
+        let upgraded = connect(path.to_str().unwrap()).await.unwrap();
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT version FROM schema_version WHERE singleton = 1")
+                .fetch_one(&upgraded)
+                .await
+                .unwrap(),
+            5
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT count(*) FROM events_fts WHERE events_fts MATCH 'public'"
+            )
+            .fetch_one(&upgraded)
+            .await
+            .unwrap(),
+            1
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT count(*) FROM events_fts WHERE events_fts MATCH 'private'"
+            )
+            .fetch_one(&upgraded)
+            .await
+            .unwrap(),
+            0
+        );
+
+        let content_table_sql: String = sqlx::query_scalar(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'events_fts'",
+        )
+        .fetch_one(&upgraded)
+        .await
+        .unwrap();
+        assert!(content_table_sql.contains("content='searchable_events'"));
+        for trigger in [
+            "events_fts_insert",
+            "events_fts_delete",
+            "events_fts_update",
+        ] {
+            let sql: String = sqlx::query_scalar(
+                "SELECT sql FROM sqlite_master WHERE type = 'trigger' AND name = ?1",
+            )
+            .bind(trigger)
+            .fetch_one(&upgraded)
+            .await
+            .unwrap();
+            assert!(sql.contains("kind IN (0, 9, 40002, 45001, 45003)"));
+            assert!(!sql.contains("kind NOT IN"));
+        }
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM sqlite_master WHERE type = 'index' AND name = 'idx_channels_dm_hash'")
+                .fetch_one(&upgraded)
+                .await
+                .unwrap(),
+            1
+        );
+
+        for (id, kind, content) in [
+            (vec![5_u8; 32], 45001_i64, "allowed trigger token"),
+            (vec![6_u8; 32], 1_i64, "excluded trigger token"),
+        ] {
+            sqlx::query("INSERT INTO events (community_id,id,pubkey,created_at,kind,tags_json,content,sig,received_at,event_json) VALUES (?1,?2,?3,101,?4,'[]',?5,?6,101,'{}')")
+                .bind(community.as_uuid().to_string())
+                .bind(id)
+                .bind(vec![7_u8; 32])
+                .bind(kind)
+                .bind(content)
+                .bind(vec![8_u8; 64])
+                .execute(&upgraded)
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT count(*) FROM events_fts WHERE events_fts MATCH 'trigger'"
+            )
+            .fetch_one(&upgraded)
+            .await
+            .unwrap(),
+            1
+        );
+        upgraded.close().await;
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
     async fn dm_create_list_hide_and_scope_match_contract() {
         let pool = connect("sqlite::memory:").await.unwrap();
         let a = ensure_configured_community(&pool, "dm-a.example")
