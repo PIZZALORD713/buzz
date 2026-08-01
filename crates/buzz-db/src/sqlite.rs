@@ -479,6 +479,52 @@ pub(crate) async fn is_community_active(
     Ok(count != 0)
 }
 
+pub(crate) async fn lookup_community_icon(
+    pool: &SqlitePool,
+    community: CommunityId,
+) -> Result<Option<String>> {
+    Ok(
+        sqlx::query_scalar::<_, Option<String>>("SELECT icon FROM communities WHERE id = ?1")
+            .bind(community.as_uuid().to_string())
+            .fetch_optional(pool)
+            .await?
+            .flatten()
+            .filter(|icon| !icon.is_empty()),
+    )
+}
+
+pub(crate) async fn set_community_icon(
+    pool: &SqlitePool,
+    community: CommunityId,
+    icon: Option<&str>,
+) -> Result<()> {
+    sqlx::query("UPDATE communities SET icon = ?2 WHERE id = ?1")
+        .bind(community.as_uuid().to_string())
+        .bind(icon)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+pub(crate) async fn community_of_channel(
+    pool: &SqlitePool,
+    channel_id: Uuid,
+) -> Result<Option<CommunityId>> {
+    let community: Option<String> = sqlx::query_scalar(
+        "SELECT community_id FROM channels WHERE id = ?1 AND deleted_at IS NULL",
+    )
+    .bind(channel_id.to_string())
+    .fetch_optional(pool)
+    .await?;
+    community
+        .map(|id| {
+            Uuid::parse_str(&id)
+                .map(CommunityId::from_uuid)
+                .map_err(|e| crate::DbError::InvalidData(e.to_string()))
+        })
+        .transpose()
+}
+
 pub(crate) async fn ensure_configured_community(
     pool: &SqlitePool,
     normalized_host: &str,
@@ -4580,6 +4626,54 @@ mod tests {
         );
         upgraded.close().await;
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn community_icon_and_channel_owner_helpers_match_lifecycle_contracts() {
+        let pool = connect("sqlite::memory:").await.unwrap();
+        let community = ensure_configured_community(&pool, "community-helpers.example")
+            .await
+            .unwrap()
+            .id;
+        assert_eq!(lookup_community_icon(&pool, community).await.unwrap(), None);
+        set_community_icon(&pool, community, Some("https://example.test/icon.png"))
+            .await
+            .unwrap();
+        assert_eq!(
+            lookup_community_icon(&pool, community)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("https://example.test/icon.png")
+        );
+        set_community_icon(&pool, community, Some(""))
+            .await
+            .unwrap();
+        assert_eq!(lookup_community_icon(&pool, community).await.unwrap(), None);
+        set_community_icon(&pool, community, None).await.unwrap();
+
+        let channel = Uuid::new_v4();
+        sqlx::query("INSERT INTO channels (id,community_id,name,channel_type,visibility,created_by) VALUES (?1,?2,'helper','public','public',?3)")
+            .bind(channel.to_string())
+            .bind(community.as_uuid().to_string())
+            .bind(vec![1_u8; 32])
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            community_of_channel(&pool, channel).await.unwrap(),
+            Some(community)
+        );
+        sqlx::query("UPDATE channels SET deleted_at = unixepoch() WHERE id = ?1")
+            .bind(channel.to_string())
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert_eq!(community_of_channel(&pool, channel).await.unwrap(), None);
+        assert_eq!(
+            community_of_channel(&pool, Uuid::new_v4()).await.unwrap(),
+            None
+        );
     }
 
     #[tokio::test]

@@ -1437,6 +1437,9 @@ impl Db {
     /// Set by relay admins/owners via the kind:9033 command; the value is
     /// validated and size-capped at that write path.
     pub async fn get_community_icon(&self, community_id: CommunityId) -> Result<Option<String>> {
+        if let DbBackend::SQLite(pool) = &self.backend {
+            return sqlite::lookup_community_icon(pool, community_id).await;
+        }
         let row = sqlx::query(
             r#"
             SELECT icon
@@ -1461,6 +1464,9 @@ impl Db {
         community_id: CommunityId,
         icon: Option<&str>,
     ) -> Result<()> {
+        if let DbBackend::SQLite(pool) = &self.backend {
+            return sqlite::set_community_icon(pool, community_id, icon).await;
+        }
         sqlx::query(
             r#"
             UPDATE communities
@@ -1666,6 +1672,9 @@ impl Db {
     /// Internal relay producers use this to derive tenant context from the row
     /// they are acting on, rather than falling back to an implicit default.
     pub async fn community_of_channel(&self, channel_id: Uuid) -> Result<Option<CommunityId>> {
+        if let DbBackend::SQLite(pool) = &self.backend {
+            return sqlite::community_of_channel(pool, channel_id).await;
+        }
         let row = sqlx::query(
             r#"
             SELECT community_id
