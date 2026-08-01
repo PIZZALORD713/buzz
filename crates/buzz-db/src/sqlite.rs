@@ -3384,27 +3384,26 @@ pub(crate) async fn get_member_counts_bulk(
 pub(crate) async fn reap_expired_ephemeral_channels(
     pool: &SqlitePool,
 ) -> Result<Vec<crate::channel::ReapedEphemeralChannel>> {
-    let rows=sqlx::query("SELECT ch.community_id,c.host,ch.id FROM channels ch JOIN communities c ON c.id=ch.community_id WHERE ch.ttl_seconds IS NOT NULL AND ch.ttl_deadline<unixepoch() AND ch.archived_at IS NULL AND ch.deleted_at IS NULL AND c.archived_at IS NULL").fetch_all(pool).await?;
-    let mut out = Vec::new();
-    for r in rows {
-        let cid: String = r.try_get("community_id")?;
-        let id: String = r.try_get("id")?;
-        sqlx::query(
-            "UPDATE channels SET archived_at=unixepoch() WHERE id=? AND archived_at IS NULL",
-        )
-        .bind(&id)
-        .execute(pool)
-        .await?;
-        out.push(crate::channel::ReapedEphemeralChannel {
-            community_id: CommunityId::from_uuid(
-                Uuid::parse_str(&cid).map_err(|e| crate::DbError::InvalidData(e.to_string()))?,
-            ),
-            host: r.try_get("host")?,
-            channel_id: Uuid::parse_str(&id)
-                .map_err(|e| crate::DbError::InvalidData(e.to_string()))?,
-        });
-    }
-    Ok(out)
+    let rows = sqlx::query(
+        "UPDATE channels SET archived_at=unixepoch() WHERE ttl_seconds IS NOT NULL AND ttl_deadline<unixepoch() AND archived_at IS NULL AND deleted_at IS NULL AND EXISTS (SELECT 1 FROM communities c WHERE c.id=channels.community_id AND c.archived_at IS NULL) RETURNING community_id,id,(SELECT host FROM communities c WHERE c.id=channels.community_id) AS host",
+    )
+    .fetch_all(pool)
+    .await?;
+    rows.into_iter()
+        .map(|row| {
+            let community_id: String = row.try_get("community_id")?;
+            let channel_id: String = row.try_get("id")?;
+            Ok(crate::channel::ReapedEphemeralChannel {
+                community_id: CommunityId::from_uuid(
+                    Uuid::parse_str(&community_id)
+                        .map_err(|e| crate::DbError::InvalidData(e.to_string()))?,
+                ),
+                host: row.try_get("host")?,
+                channel_id: Uuid::parse_str(&channel_id)
+                    .map_err(|e| crate::DbError::InvalidData(e.to_string()))?,
+            })
+        })
+        .collect()
 }
 
 fn timestamp(value: i64) -> Result<chrono::DateTime<chrono::Utc>> {
@@ -4890,6 +4889,195 @@ mod tests {
             .await
             .unwrap();
         assert!(get_workflow_run(&pool, community, run_id).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn channel_lifecycle_bulk_canvas_and_reaper_match_contracts() {
+        use crate::channel::{ChannelType, ChannelUpdate, ChannelVisibility, MemberRole};
+
+        let pool = connect(":memory:").await.unwrap();
+        let community = ensure_configured_community(&pool, "channels.local")
+            .await
+            .unwrap()
+            .id;
+        let foreign = ensure_configured_community(&pool, "channels-foreign.local")
+            .await
+            .unwrap()
+            .id;
+        let owner = vec![61_u8; 32];
+        let member = vec![62_u8; 32];
+        ensure_user(&pool, community, &owner).await.unwrap();
+        ensure_user(&pool, community, &member).await.unwrap();
+        ensure_user(&pool, foreign, &owner).await.unwrap();
+
+        let channel = create_channel(
+            &pool,
+            community,
+            "  Field Operations  ",
+            ChannelType::Stream,
+            ChannelVisibility::Private,
+            Some("initial"),
+            &owner,
+            Some(60),
+        )
+        .await
+        .unwrap();
+        assert_eq!(channel.name, "Field Operations");
+        assert_eq!(
+            get_member_count(&pool, community, channel.id)
+                .await
+                .unwrap(),
+            1
+        );
+        assert!(get_channel(&pool, foreign, channel.id).await.is_err());
+
+        set_canvas(&pool, community, channel.id, Some("# Plan"))
+            .await
+            .unwrap();
+        assert_eq!(
+            get_canvas(&pool, community, channel.id).await.unwrap(),
+            Some("# Plan".into())
+        );
+        assert_eq!(get_canvas(&pool, foreign, channel.id).await.unwrap(), None);
+
+        add_member(
+            &pool,
+            community,
+            channel.id,
+            &member,
+            MemberRole::Member,
+            Some(&owner),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            membership_pairs(
+                &pool,
+                community,
+                &[channel.id],
+                &[owner.clone(), member.clone()]
+            )
+            .await
+            .unwrap()
+            .len(),
+            2
+        );
+        assert_eq!(
+            get_members_bulk(&pool, community, &[channel.id])
+                .await
+                .unwrap()
+                .len(),
+            2
+        );
+        assert_eq!(
+            get_member_counts_bulk(&pool, community, &[channel.id])
+                .await
+                .unwrap()
+                .get(&channel.id),
+            Some(&2)
+        );
+        assert_eq!(
+            get_users_bulk(&pool, community, &[owner.clone(), member.clone()])
+                .await
+                .unwrap()
+                .len(),
+            2
+        );
+        assert_eq!(
+            get_accessible_channels(&pool, community, &member, None, Some(true))
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            list_channels(&pool, community, Some("private"))
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(list_channels(&pool, foreign, None)
+            .await
+            .unwrap()
+            .is_empty());
+
+        let updated = update_channel(
+            &pool,
+            community,
+            channel.id,
+            ChannelUpdate {
+                name: Some("Renamed Channel".into()),
+                description: Some("updated".into()),
+                visibility: Some("open".into()),
+                ttl_seconds: Some(None),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(updated.name, "Renamed Channel");
+        assert_eq!(updated.description.as_deref(), Some("updated"));
+        assert_eq!(updated.visibility, "open");
+        assert_eq!(updated.ttl_seconds, None);
+        assert_eq!(updated.ttl_deadline, None);
+
+        archive_channel(&pool, community, channel.id).await.unwrap();
+        assert!(archive_channel(&pool, community, channel.id).await.is_err());
+        unarchive_channel(&pool, community, channel.id)
+            .await
+            .unwrap();
+        assert!(unarchive_channel(&pool, community, channel.id)
+            .await
+            .is_err());
+        remove_member(&pool, community, channel.id, &member, &owner)
+            .await
+            .unwrap();
+        assert_eq!(
+            get_member_count(&pool, community, channel.id)
+                .await
+                .unwrap(),
+            1
+        );
+
+        let expiring = create_channel(
+            &pool,
+            community,
+            "temporary",
+            ChannelType::Stream,
+            ChannelVisibility::Open,
+            None,
+            &owner,
+            Some(1),
+        )
+        .await
+        .unwrap();
+        sqlx::query("UPDATE channels SET ttl_deadline=0 WHERE community_id=?1 AND id=?2")
+            .bind(community.as_uuid().to_string())
+            .bind(expiring.id.to_string())
+            .execute(&pool)
+            .await
+            .unwrap();
+        let reaped = reap_expired_ephemeral_channels(&pool).await.unwrap();
+        assert_eq!(reaped.len(), 1);
+        assert_eq!(reaped[0].community_id, community);
+        assert_eq!(reaped[0].host, "channels.local");
+        assert_eq!(reaped[0].channel_id, expiring.id);
+        assert!(reap_expired_ephemeral_channels(&pool)
+            .await
+            .unwrap()
+            .is_empty());
+
+        assert!(soft_delete_channel(&pool, community, channel.id)
+            .await
+            .unwrap());
+        assert!(!soft_delete_channel(&pool, community, channel.id)
+            .await
+            .unwrap());
+        assert!(list_channels(&pool, community, None)
+            .await
+            .unwrap()
+            .iter()
+            .all(|row| row.id != channel.id));
     }
 
     #[tokio::test]
