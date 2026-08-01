@@ -1289,7 +1289,7 @@ async fn run_single_node(config: Config, tracer_init: telemetry::TracerInit) -> 
     });
 
     info!(database = %db_path, media = %media_root, community = %community,
-        "single-node profile ready; search, Git, push, workflows, reapers, usage and replica tasks disabled");
+        "single-node profile ready; SQLite FTS5 and local workflows enabled; Git, push, reapers, usage and replica tasks disabled");
     let router = build_router(Arc::clone(&state));
     let health_router = build_health_router(Arc::clone(&state));
     serve(router, health_router, Arc::clone(&state)).await?;
