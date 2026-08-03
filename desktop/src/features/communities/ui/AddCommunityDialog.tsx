@@ -11,6 +11,7 @@ import { CommunityCreationChoice } from "@/features/communities/ui/CommunityCrea
 import { HostedCommunityCreateFlow } from "@/features/communities/ui/HostedCommunityCreateFlow";
 import { useCommunityOnboarding } from "@/features/onboarding/communityOnboarding";
 import { InviteRedeemForm } from "@/features/onboarding/ui/InviteRedeemForm";
+import { useFeatureEnabled } from "@/shared/features";
 import {
   Dialog,
   DialogContent,
@@ -39,6 +40,7 @@ export function AddCommunityDialog({
   onOpenChange,
 }: AddCommunityDialogProps) {
   const communityOnboarding = useCommunityOnboarding();
+  const localCommunitiesEnabled = useFeatureEnabled("localCommunities");
   const { communities } = useCommunities();
   const hasLocalCommunity = communities.some((community) => community.local);
   const [mode, setMode] = React.useState<AddCommunityMode>("choose");
@@ -225,6 +227,7 @@ export function AddCommunityDialog({
               hasLocalCommunity={hasLocalCommunity}
               onChooseHosted={() => setMode("create-hosted")}
               onChooseLocal={startLocalCommunity}
+              showLocalOption={localCommunitiesEnabled}
               variant="dialog"
             />
           ) : (

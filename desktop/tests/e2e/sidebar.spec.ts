@@ -1,6 +1,7 @@
 import { expect, test, type Page } from "@playwright/test";
 
 import { installMockBridge } from "../helpers/bridge";
+import { FEATURE_OVERRIDES_STORAGE_KEY } from "../helpers/features";
 import { openSettings } from "../helpers/settings";
 
 const SIDEBAR_WIDTH_STORAGE_KEY = "buzz-sidebar-width";
@@ -39,6 +40,18 @@ async function openAddCommunityDialog(page: Page) {
   await page.getByRole("menuitem", { name: "Add a community" }).click();
 }
 
+async function setLocalCommunitiesFeature(page: Page, enabled: boolean) {
+  await page.addInitScript(
+    ({ key, enabled }) => {
+      window.localStorage.setItem(
+        key,
+        JSON.stringify({ localCommunities: enabled }),
+      );
+    },
+    { key: FEATURE_OVERRIDES_STORAGE_KEY, enabled },
+  );
+}
+
 // Regression guard for the "Leave channel" lockup: with two bundled copies of
 // @radix-ui/react-dismissable-layer, opening a modal AlertDialog from a modal
 // Radix ContextMenu left `pointer-events: none` stuck on <body> after the
@@ -73,6 +86,33 @@ async function dragSidebarRail(page: Page, deltaX: number) {
   await page.mouse.move(startX + deltaX, startY, { steps: 8 });
   await page.mouse.up();
 }
+
+test("add community hides the local choice by default", async ({ page }) => {
+  await installMockBridge(page, {}, { seedPreviewFeatures: false });
+  await setLocalCommunitiesFeature(page, false);
+  await page.goto("/");
+
+  await openAddCommunityDialog(page);
+  await page.getByTestId("add-community-create").click();
+
+  await expect(page.getByTestId("community-create-hosted")).toBeVisible();
+  await expect(page.getByTestId("community-choice-local")).toHaveCount(0);
+});
+
+test("add community shows the local choice when its preview is enabled", async ({
+  page,
+}) => {
+  await setLocalCommunitiesFeature(page, true);
+  await installMockBridge(page, {}, { seedPreviewFeatures: false });
+  await page.goto("/");
+
+  await openAddCommunityDialog(page);
+  await page.getByTestId("add-community-create").click();
+
+  await expect(page.getByTestId("community-choice-local")).toContainText(
+    "Keep it on this device",
+  );
+});
 
 test("add community starts with create and join choices", async ({ page }) => {
   await installMockBridge(page, {});
@@ -118,7 +158,12 @@ test("add community starts with create and join choices", async ({ page }) => {
 test("add community can start an on-this-device community", async ({
   page,
 }) => {
-  await installMockBridge(page, { applyCommunityDelayMs: 1_000 });
+  await setLocalCommunitiesFeature(page, true);
+  await installMockBridge(
+    page,
+    { applyCommunityDelayMs: 1_000 },
+    { seedPreviewFeatures: false },
+  );
   await page.goto("/");
 
   await openAddCommunityDialog(page);
@@ -174,10 +219,11 @@ test("create choice offers to open an existing on-this-device community", async 
     );
     window.localStorage.setItem("buzz-active-community-id", "hosted");
   });
+  await setLocalCommunitiesFeature(page, true);
   await installMockBridge(
     page,
     { applyCommunityDelayMs: 1_000 },
-    { skipCommunitySeed: true },
+    { seedPreviewFeatures: false, skipCommunitySeed: true },
   );
   await page.goto("/");
 

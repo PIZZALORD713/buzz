@@ -19,6 +19,7 @@ import {
   OnboardingSlideTransition,
 } from "@/features/onboarding/ui/OnboardingSlideTransition";
 import { useIdentityQuery } from "@/shared/api/hooks";
+import { useFeatureEnabled } from "@/shared/features";
 import { writeTextToClipboard } from "@/shared/lib/clipboard";
 import { pubkeyToNpub } from "@/shared/lib/nostrUtils";
 import { useSystemColorScheme } from "@/shared/theme/useSystemColorScheme";
@@ -58,6 +59,7 @@ export function WelcomeSetup({
   const [isHostedSignInOpen, setIsHostedSignInOpen] = React.useState(false);
   const [copiedNpub, setCopiedNpub] = React.useState(false);
   const communityOnboarding = useCommunityOnboarding();
+  const localCommunitiesEnabled = useFeatureEnabled("localCommunities");
   const identityQuery = useIdentityQuery();
   const systemColorScheme = useSystemColorScheme();
   const npub = identityQuery.data?.pubkey
@@ -213,6 +215,7 @@ export function WelcomeSetup({
                 <CommunityCreationChoice
                   onChooseHosted={() => setIsHostedSignInOpen(true)}
                   onChooseLocal={startLocalCommunity}
+                  showLocalOption={localCommunitiesEnabled}
                   variant="onboarding"
                 />
               </div>

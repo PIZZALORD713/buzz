@@ -3,6 +3,7 @@ import { expect, test, type Page } from "@playwright/test";
 import { nsecEncode } from "nostr-tools/nip19";
 
 import { installMockBridge, TEST_IDENTITIES } from "../helpers/bridge";
+import { FEATURE_OVERRIDES_STORAGE_KEY } from "../helpers/features";
 import { installFakeCamera } from "../helpers/fakeCamera";
 import {
   E2E_IDENTITY_OVERRIDE_STORAGE_KEY,
@@ -79,6 +80,18 @@ const FIRST_RUN_ALICE = {
   ...TEST_IDENTITIES.alice,
   username: "",
 };
+
+async function setLocalCommunitiesFeature(page: Page, enabled: boolean) {
+  await page.addInitScript(
+    ({ key, enabled }) => {
+      window.localStorage.setItem(
+        key,
+        JSON.stringify({ localCommunities: enabled }),
+      );
+    },
+    { key: FEATURE_OVERRIDES_STORAGE_KEY, enabled },
+  );
+}
 
 async function seedOnboardingCompletion(page: Page, pubkey: string) {
   await page.addInitScript(
@@ -826,6 +839,53 @@ test("non-local default auto-connects when the release flag is enabled", async (
       activeMatchesCommunity: true,
       relayUrl: "wss://default.example.com",
     });
+});
+
+test("first-community hides the local choice by default", async ({ page }) => {
+  await seedActiveIdentity(page, BLANK_TYLER_IDENTITY);
+  await page.addInitScript((pubkey) => {
+    window.localStorage.setItem(
+      `buzz-machine-onboarding-complete.v2:${pubkey}`,
+      "true",
+    );
+  }, BLANK_TYLER_IDENTITY.pubkey);
+  await installMockBridge(page, undefined, {
+    relayWsUrl: "ws://localhost:3000",
+    seedPreviewFeatures: false,
+    skipOnboardingSeed: true,
+    skipCommunitySeed: true,
+  });
+  await setLocalCommunitiesFeature(page, false);
+  await page.goto("/");
+
+  await page.getByTestId("community-choice-create").click();
+  await expect(page.getByTestId("community-create-hosted")).toBeVisible();
+  await expect(page.getByTestId("community-choice-local")).toHaveCount(0);
+});
+
+test("first-community shows the local choice when its preview is enabled", async ({
+  page,
+}) => {
+  await seedActiveIdentity(page, BLANK_TYLER_IDENTITY);
+  await setLocalCommunitiesFeature(page, true);
+  await page.addInitScript((pubkey) => {
+    window.localStorage.setItem(
+      `buzz-machine-onboarding-complete.v2:${pubkey}`,
+      "true",
+    );
+  }, BLANK_TYLER_IDENTITY.pubkey);
+  await installMockBridge(page, undefined, {
+    relayWsUrl: "ws://localhost:3000",
+    seedPreviewFeatures: false,
+    skipOnboardingSeed: true,
+    skipCommunitySeed: true,
+  });
+  await page.goto("/");
+
+  await page.getByTestId("community-choice-create").click();
+  await expect(page.getByTestId("community-choice-local")).toContainText(
+    "Keep it on this device",
+  );
 });
 
 test("first-community choices route join, create, owner, and member intents", async ({

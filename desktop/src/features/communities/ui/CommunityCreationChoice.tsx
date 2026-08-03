@@ -16,6 +16,7 @@ type CommunityCreationChoiceProps = {
   hasLocalCommunity?: boolean;
   onChooseHosted: () => void;
   onChooseLocal: () => void;
+  showLocalOption: boolean;
   variant: "onboarding" | "dialog";
 };
 
@@ -23,6 +24,7 @@ export function CommunityCreationChoice({
   hasLocalCommunity = false,
   onChooseHosted,
   onChooseLocal,
+  showLocalOption,
   variant,
 }: CommunityCreationChoiceProps) {
   const localLabel = hasLocalCommunity
@@ -44,18 +46,20 @@ export function CommunityCreationChoice({
             </span>
           </button>
         </Card>
-        <Card asChild className={ONBOARDING_OPTION_CLASS} variant="textured">
-          <button
-            data-testid="community-choice-local"
-            onClick={onChooseLocal}
-            type="button"
-          >
-            <span className="block text-sm font-medium">{localLabel}</span>
-            <span className="mt-1 block text-xs leading-5 text-foreground/70">
-              {LOCAL_DESCRIPTION}
-            </span>
-          </button>
-        </Card>
+        {showLocalOption ? (
+          <Card asChild className={ONBOARDING_OPTION_CLASS} variant="textured">
+            <button
+              data-testid="community-choice-local"
+              onClick={onChooseLocal}
+              type="button"
+            >
+              <span className="block text-sm font-medium">{localLabel}</span>
+              <span className="mt-1 block text-xs leading-5 text-foreground/70">
+                {LOCAL_DESCRIPTION}
+              </span>
+            </button>
+          </Card>
+        ) : null}
       </div>
     );
   }
@@ -81,25 +85,27 @@ export function CommunityCreationChoice({
         </span>
         <ChevronRight className="h-4 w-4 shrink-0 text-muted-foreground/60" />
       </button>
-      <button
-        className={DIALOG_OPTION_CLASS}
-        data-testid="community-choice-local"
-        onClick={onChooseLocal}
-        type="button"
-      >
-        <span className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-primary/10 text-primary">
-          <Laptop className="h-4 w-4" />
-        </span>
-        <span className="min-w-0 flex-1">
-          <span className="block text-sm font-medium text-foreground">
-            {localLabel}
+      {showLocalOption ? (
+        <button
+          className={DIALOG_OPTION_CLASS}
+          data-testid="community-choice-local"
+          onClick={onChooseLocal}
+          type="button"
+        >
+          <span className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-primary/10 text-primary">
+            <Laptop className="h-4 w-4" />
           </span>
-          <span className="mt-0.5 block text-xs leading-5 text-muted-foreground">
-            {LOCAL_DESCRIPTION}
+          <span className="min-w-0 flex-1">
+            <span className="block text-sm font-medium text-foreground">
+              {localLabel}
+            </span>
+            <span className="mt-0.5 block text-xs leading-5 text-muted-foreground">
+              {LOCAL_DESCRIPTION}
+            </span>
           </span>
-        </span>
-        <ChevronRight className="h-4 w-4 shrink-0 text-muted-foreground/60" />
-      </button>
+          <ChevronRight className="h-4 w-4 shrink-0 text-muted-foreground/60" />
+        </button>
+      ) : null}
     </div>
   );
 }
