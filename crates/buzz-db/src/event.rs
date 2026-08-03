@@ -185,12 +185,7 @@ pub(crate) fn event_query_parity_vectors(
             ],
             3,
         ),
-        (
-            "kind",
-            kinds,
-            vec![fixture.third_id.clone(), fixture.first_id.clone()],
-            2,
-        ),
+        ("kind", kinds, vec![fixture.third_id.clone()], 1),
         (
             "author",
             author,
@@ -837,8 +832,18 @@ pub(crate) async fn count_events_on(conn: &mut sqlx::PgConnection, q: &EventQuer
             .push_bind(s);
     }
     if let Some(u) = q.until {
-        qb.push(format!(" AND {col_prefix}created_at <= "))
-            .push_bind(u);
+        if let Some(ref bid) = q.before_id {
+            qb.push(format!(" AND ({col_prefix}created_at < "));
+            qb.push_bind(u);
+            qb.push(format!(" OR ({col_prefix}created_at = "));
+            qb.push_bind(u);
+            qb.push(format!(" AND {col_prefix}id > "));
+            qb.push_bind(bid.clone());
+            qb.push("))");
+        } else {
+            qb.push(format!(" AND {col_prefix}created_at <= "))
+                .push_bind(u);
+        }
     }
 
     if let Some(ref d) = q.d_tag {
@@ -1982,7 +1987,7 @@ mod tests {
         let first_keys = Keys::generate();
         let second_keys = Keys::generate();
         let p_tag_hex = hex::encode(second_keys.public_key().to_bytes());
-        let first = EventBuilder::new(Kind::Custom(1), "first")
+        let first = EventBuilder::new(Kind::Custom(30_023), "first")
             .tags([
                 Tag::parse(["d", "alpha"]).unwrap(),
                 Tag::parse(["p", &p_tag_hex.to_ascii_uppercase()]).unwrap(),
@@ -1999,6 +2004,9 @@ mod tests {
             .sign_with_keys(&first_keys)
             .unwrap();
         insert_event(&pool, community, &first, None).await.unwrap();
+        crate::insert_mentions(&pool, community, &first, None)
+            .await
+            .unwrap();
         insert_event(&pool, community, &second, Some(channel_id))
             .await
             .unwrap();

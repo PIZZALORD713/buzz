@@ -4594,7 +4594,7 @@ mod tests {
         let first_keys = Keys::generate();
         let second_keys = Keys::generate();
         let p_tag_hex = hex::encode(second_keys.public_key().to_bytes());
-        let first = EventBuilder::new(Kind::Custom(1), "first")
+        let first = EventBuilder::new(Kind::Custom(30_023), "first")
             .tags([
                 Tag::parse(["d", "alpha"]).unwrap(),
                 Tag::parse(["p", &p_tag_hex.to_ascii_uppercase()]).unwrap(),
