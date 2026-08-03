@@ -98,7 +98,8 @@ async fn reject_legacy_nip_rs_cardinality_ambiguity(pool: &PgPool) -> Result<()>
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::BTreeSet;
+    use sqlx::Row as _;
+    use std::collections::{BTreeMap, BTreeSet};
 
     const TEST_DB_URL: &str = "postgres://buzz:buzz_dev@localhost:5432/buzz";
 
@@ -1062,6 +1063,172 @@ mod tests {
             has_channels_community_id_immutability_guard(sql),
             "migrations define channels.community_id but no BEFORE UPDATE trigger/function guard that rejects OLD.community_id <> NEW.community_id was found"
         );
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+    enum SchemaDifference {
+        PostgresOnlyTable(&'static str),
+        SqliteOnlyTable(&'static str),
+        PostgresOnlyColumn(&'static str, &'static str),
+        SqliteOnlyColumn(&'static str, &'static str),
+    }
+
+    // This is the sole inventory of intentional catalog divergence. Each entry needs a reason;
+    // differences not listed here and entries that no longer exist both fail the ratchet.
+    const ALLOWED_SCHEMA_DIFFERENCES: &[(SchemaDifference, &str)] = &[
+        (SchemaDifference::PostgresOnlyTable("_operator_global_tables"), "Postgres migration-lint metadata has no local runtime role."),
+        (SchemaDifference::PostgresOnlyTable("audit_log"), "Central relay audit retention is outside the single-node profile."),
+        (SchemaDifference::PostgresOnlyTable("delivery_log"), "Central relay delivery accounting is outside the single-node profile."),
+        (SchemaDifference::PostgresOnlyTable("event_mentions"), "SQLite derives mentions from event JSON instead of a join table."),
+        (SchemaDifference::PostgresOnlyTable("parameterized_event_watermarks"), "Server-side parameterized-event retention is outside local mode."),
+        (SchemaDifference::PostgresOnlyTable("push_gateway_challenges"), "Push gateway authority is a hosted-service concern."),
+        (SchemaDifference::PostgresOnlyTable("push_gateway_delegations"), "Push gateway authority is a hosted-service concern."),
+        (SchemaDifference::PostgresOnlyTable("push_gateway_delivery_auth_replays"), "Push gateway replay defense is a hosted-service concern."),
+        (SchemaDifference::PostgresOnlyTable("push_gateway_delivery_request_replays"), "Push gateway replay defense is a hosted-service concern."),
+        (SchemaDifference::PostgresOnlyTable("push_gateway_endpoint_quotas"), "Push gateway quotas are a hosted-service concern."),
+        (SchemaDifference::PostgresOnlyTable("push_gateway_installations"), "Push gateway installations are a hosted-service concern."),
+        (SchemaDifference::PostgresOnlyTable("push_leases"), "Distributed push-worker leasing is outside local mode."),
+        (SchemaDifference::PostgresOnlyTable("push_match_queue"), "Distributed push matching is outside local mode."),
+        (SchemaDifference::PostgresOnlyTable("push_wake_outbox"), "Distributed push delivery is outside local mode."),
+        (SchemaDifference::PostgresOnlyTable("rate_limit_violations"), "Hosted relay abuse telemetry is outside local mode."),
+        (SchemaDifference::PostgresOnlyTable("replica_heartbeat"), "Local mode has no read replica to fence."),
+        (SchemaDifference::PostgresOnlyTable("subscriptions"), "Local subscriptions are connection-local rather than persisted."),
+        (SchemaDifference::SqliteOnlyTable("moderation_restrictions"), "Local mode uses a compact restriction table instead of the hosted moderation pipeline."),
+        (SchemaDifference::PostgresOnlyColumn("channel_members", "community_id"), "SQLite scopes membership through channels and omits the redundant tenant key."),
+        (SchemaDifference::PostgresOnlyColumn("channel_members", "removed_by"), "Removal actor provenance is not persisted locally."),
+        (SchemaDifference::PostgresOnlyColumn("communities", "signing_key"), "Desktop signing material is managed outside SQLite."),
+        (SchemaDifference::PostgresOnlyColumn("events", "d_tag"), "SQLite currently derives d tags from event JSON."),
+        (SchemaDifference::PostgresOnlyColumn("events", "deleted_at"), "SQLite physically deletes events instead of retaining server tombstones."),
+        (SchemaDifference::PostgresOnlyColumn("events", "search_tsv"), "SQLite uses FTS5 instead of a generated tsvector."),
+        (SchemaDifference::PostgresOnlyColumn("events", "tags"), "SQLite stores equivalent serialized tags in tags_json."),
+        (SchemaDifference::SqliteOnlyColumn("events", "event_json"), "SQLite retains serialized events for local reads."),
+        (SchemaDifference::SqliteOnlyColumn("events", "tags_json"), "SQLite stores tags as JSON text because it has no JSONB."),
+        (SchemaDifference::PostgresOnlyColumn("reactions", "created_at"), "SQLite uses the source event timestamp and does not duplicate creation time."),
+        (SchemaDifference::PostgresOnlyColumn("relay_invites", "created_at"), "Local invite lifecycle omits creation-time audit metadata."),
+        (SchemaDifference::PostgresOnlyColumn("relay_invites", "role"), "Local invites grant the profile's fixed member role."),
+        (SchemaDifference::PostgresOnlyColumn("users", "agent_type"), "SQLite uses the compact is_agent flag."),
+        (SchemaDifference::PostgresOnlyColumn("users", "capabilities"), "Hosted agent capability metadata is not used locally."),
+        (SchemaDifference::PostgresOnlyColumn("users", "deactivated_at"), "Account deactivation is unsupported locally."),
+        (SchemaDifference::PostgresOnlyColumn("users", "metadata_event_id"), "Metadata-event provenance is not persisted locally."),
+        (SchemaDifference::PostgresOnlyColumn("users", "okta_user_id"), "Enterprise identity linkage is hosted-only."),
+        (SchemaDifference::PostgresOnlyColumn("users", "updated_at"), "Local user profiles omit server audit timestamps."),
+        (SchemaDifference::SqliteOnlyColumn("users", "is_agent"), "SQLite uses a compact agent flag instead of agent_type."),
+    ];
+
+    async fn postgres_schema(pool: &PgPool) -> BTreeMap<String, BTreeSet<String>> {
+        let rows = sqlx::query("SELECT c.relname table_name, a.attname column_name FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace JOIN pg_catalog.pg_attribute a ON a.attrelid=c.oid WHERE n.nspname='public' AND c.relkind IN ('r','p') AND c.relname <> '_sqlx_migrations' AND a.attnum>0 AND NOT a.attisdropped AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_inherits i WHERE i.inhrelid=c.oid) ORDER BY c.relname,a.attnum")
+            .fetch_all(pool).await.expect("introspect Postgres catalog");
+        let mut schema = BTreeMap::<String, BTreeSet<String>>::new();
+        for row in rows {
+            schema
+                .entry(row.get("table_name"))
+                .or_default()
+                .insert(row.get("column_name"));
+        }
+        schema
+    }
+
+    async fn sqlite_schema() -> BTreeMap<String, BTreeSet<String>> {
+        let pool = crate::sqlite::connect("sqlite::memory:")
+            .await
+            .expect("migrate in-memory SQLite");
+        let tables = sqlx::query_scalar::<_, String>("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' AND name <> 'schema_version' AND name NOT GLOB 'events_fts*' ORDER BY name")
+            .fetch_all(&pool).await.expect("introspect SQLite tables");
+        let mut schema = BTreeMap::new();
+        for table in tables {
+            let columns = sqlx::query(sqlx::AssertSqlSafe(format!("PRAGMA table_info({table})")))
+                .fetch_all(&pool)
+                .await
+                .expect("introspect SQLite columns")
+                .into_iter()
+                .map(|row| row.get::<String, _>("name"))
+                .collect();
+            schema.insert(table, columns);
+        }
+        schema
+    }
+
+    fn schema_differences(
+        postgres: &BTreeMap<String, BTreeSet<String>>,
+        sqlite: &BTreeMap<String, BTreeSet<String>>,
+    ) -> BTreeSet<SchemaDifference> {
+        let mut differences = BTreeSet::new();
+        for table in postgres.keys() {
+            let table: &'static str = Box::leak(table.clone().into_boxed_str());
+            if !sqlite.contains_key(table) {
+                differences.insert(SchemaDifference::PostgresOnlyTable(table));
+            }
+        }
+        for table in sqlite.keys() {
+            let table: &'static str = Box::leak(table.clone().into_boxed_str());
+            if !postgres.contains_key(table) {
+                differences.insert(SchemaDifference::SqliteOnlyTable(table));
+            }
+        }
+        for table in postgres.keys().filter(|table| sqlite.contains_key(*table)) {
+            for column in postgres[table].difference(&sqlite[table]) {
+                differences.insert(SchemaDifference::PostgresOnlyColumn(
+                    Box::leak(table.clone().into_boxed_str()),
+                    Box::leak(column.clone().into_boxed_str()),
+                ));
+            }
+            for column in sqlite[table].difference(&postgres[table]) {
+                differences.insert(SchemaDifference::SqliteOnlyColumn(
+                    Box::leak(table.clone().into_boxed_str()),
+                    Box::leak(column.clone().into_boxed_str()),
+                ));
+            }
+        }
+        differences
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn postgres_and_sqlite_schema_inventories_match_allowlist() {
+        let admin = connect_test_pool().await;
+        let database_name = format!("schema_parity_{}", uuid::Uuid::new_v4().simple());
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "CREATE DATABASE {database_name}"
+        )))
+        .execute(&admin)
+        .await
+        .expect("create schema parity scratch database");
+        let database_url = std::env::var("BUZZ_TEST_DATABASE_URL")
+            .or_else(|_| std::env::var("DATABASE_URL"))
+            .unwrap_or_else(|_| TEST_DB_URL.to_owned());
+        let slash = database_url.rfind('/').expect("database URL has path");
+        let pool = PgPool::connect(&format!("{}/{database_name}", &database_url[..slash]))
+            .await
+            .expect("connect schema parity scratch database");
+        run_migrations(&pool).await.expect("migrate Postgres");
+        let actual = schema_differences(&postgres_schema(&pool).await, &sqlite_schema().await);
+        let allowed = ALLOWED_SCHEMA_DIFFERENCES
+            .iter()
+            .map(|(difference, reason)| {
+                assert!(
+                    !reason.trim().is_empty(),
+                    "schema allowlist reasons are required"
+                );
+                difference.clone()
+            })
+            .collect::<BTreeSet<_>>();
+        let undeclared = actual.difference(&allowed).collect::<Vec<_>>();
+        let stale = allowed.difference(&actual).collect::<Vec<_>>();
+        let result = if undeclared.is_empty() && stale.is_empty() {
+            Ok(())
+        } else {
+            Err(format!("Postgres/SQLite schema divergence must exactly match ALLOWED_SCHEMA_DIFFERENCES.\nUndeclared: {undeclared:#?}\nStale allowlist entries: {stale:#?}"))
+        };
+        pool.close().await;
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "DROP DATABASE IF EXISTS {database_name} WITH (FORCE)"
+        )))
+        .execute(&admin)
+        .await
+        .expect("drop schema parity scratch database");
+        if let Err(message) = result {
+            panic!("{message}");
+        }
     }
 
     async fn connect_test_pool() -> PgPool {
