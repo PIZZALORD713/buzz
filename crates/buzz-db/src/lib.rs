@@ -1481,6 +1481,27 @@ impl Db {
         Ok(())
     }
 
+    /// Rebind the durable loopback community to this single-node process's
+    /// current ephemeral authority while preserving its stable UUID and data.
+    /// SQLite-only: production deployments never rewrite tenant host mappings.
+    pub async fn rebind_single_node_community_host(
+        &self,
+        normalized_host: &str,
+        owner_pubkey: &str,
+    ) -> Result<Option<CommunityRecord>> {
+        if matches!(&self.backend, DbBackend::SQLite(_)) {
+            return sqlite::rebind_single_node_community_host(
+                self.sqlite_pool()?,
+                normalized_host,
+                owner_pubkey,
+            )
+            .await;
+        }
+        Err(DbError::UnsupportedBackend(
+            "single-node community rebind requires SQLite",
+        ))
+    }
+
     /// Ensure a configured community host exists and return its row.
     ///
     /// This is the startup/config seeding path for N=1 deployments. Migrations

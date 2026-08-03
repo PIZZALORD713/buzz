@@ -53,6 +53,7 @@ impl LocalRelayConfig {
             ("BUZZ_LOCAL_DB", sqlite_url(&db_path)),
             ("BUZZ_LOCAL_MEDIA_DIR", media_dir.display().to_string()),
             ("BUZZ_REQUIRE_RELAY_MEMBERSHIP", "true".to_string()),
+            ("BUZZ_ALLOW_NIP_OA_AUTH", "true".to_string()),
             ("RELAY_OWNER_PUBKEY", self.owner_pubkey.clone()),
             ("BUZZ_RELAY_PRIVATE_KEY", self.relay_private_key.clone()),
         ]
@@ -394,6 +395,7 @@ mod tests {
             env.get("BUZZ_REQUIRE_RELAY_MEMBERSHIP"),
             Some(&"true".to_string())
         );
+        assert_eq!(env.get("BUZZ_ALLOW_NIP_OA_AUTH"), Some(&"true".to_string()));
         assert_eq!(env.get("RELAY_OWNER_PUBKEY"), Some(&"owner".to_string()));
         assert_eq!(
             env.get("BUZZ_RELAY_PRIVATE_KEY"),

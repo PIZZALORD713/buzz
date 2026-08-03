@@ -525,6 +525,85 @@ pub(crate) async fn community_of_channel(
         .transpose()
 }
 
+pub(crate) async fn rebind_single_node_community_host(
+    pool: &SqlitePool,
+    normalized_host: &str,
+    owner_pubkey: &str,
+) -> Result<Option<CommunityRecord>> {
+    let mut tx = pool.begin().await?;
+
+    // Defect-era databases may contain several loopback communities, one per
+    // ephemeral port. Prefer a community owned by this desktop identity, then
+    // the one carrying the most events. This preserves the most useful UUID and
+    // its channels/messages while making the current Host header resolvable.
+    let row = sqlx::query(
+        r#"SELECT c.id, c.host
+           FROM communities c
+           LEFT JOIN relay_members rm
+             ON rm.community_id = c.id
+            AND lower(rm.pubkey) = lower(?1)
+            AND rm.role = 'owner'
+           LEFT JOIN events e ON e.community_id = c.id
+           WHERE c.archived_at IS NULL
+             AND c.host LIKE '127.0.0.1:%'
+           GROUP BY c.id, c.host, c.created_at
+           ORDER BY (rm.pubkey IS NOT NULL) DESC, count(e.id) DESC, c.created_at ASC, c.id ASC
+           LIMIT 1"#,
+    )
+    .bind(owner_pubkey)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let Some(row) = row else {
+        tx.commit().await?;
+        return Ok(None);
+    };
+    let record = community_record(row)?;
+    if record.host.eq_ignore_ascii_case(normalized_host) {
+        tx.commit().await?;
+        return Ok(Some(record));
+    }
+
+    // The OS may reuse a port that belongs to another stale defect-era row.
+    // Swap that collision to the selected row's old authority transactionally,
+    // using a temporary unique host to satisfy the case-insensitive constraint.
+    if let Some(collision_id) = sqlx::query_scalar::<_, String>(
+        "SELECT id FROM communities WHERE host = ?1 COLLATE NOCASE AND id <> ?2",
+    )
+    .bind(normalized_host)
+    .bind(record.id.as_uuid().to_string())
+    .fetch_optional(&mut *tx)
+    .await?
+    {
+        let temporary_host = format!("rebind-{}.invalid", Uuid::new_v4());
+        sqlx::query("UPDATE communities SET host = ?2 WHERE id = ?1")
+            .bind(&collision_id)
+            .bind(&temporary_host)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("UPDATE communities SET host = ?2 WHERE id = ?1")
+            .bind(record.id.as_uuid().to_string())
+            .bind(normalized_host)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("UPDATE communities SET host = ?2 WHERE id = ?1")
+            .bind(collision_id)
+            .bind(&record.host)
+            .execute(&mut *tx)
+            .await?;
+    } else {
+        sqlx::query("UPDATE communities SET host = ?2 WHERE id = ?1")
+            .bind(record.id.as_uuid().to_string())
+            .bind(normalized_host)
+            .execute(&mut *tx)
+            .await?;
+    }
+    tx.commit().await?;
+    Ok(Some(CommunityRecord {
+        id: record.id,
+        host: normalized_host.to_string(),
+    }))
+}
+
 pub(crate) async fn ensure_configured_community(
     pool: &SqlitePool,
     normalized_host: &str,
@@ -4339,6 +4418,110 @@ fn community_record(row: sqlx::sqlite::SqliteRow) -> Result<CommunityRecord> {
 mod tests {
     use super::*;
     use nostr::{EventBuilder, Keys, Kind, Tag, Timestamp};
+
+    #[tokio::test]
+    async fn rebind_single_node_community_preserves_best_owner_uuid() {
+        let pool = connect("sqlite::memory:").await.unwrap();
+        let owner = "ab".repeat(32);
+        let older = ensure_configured_community(&pool, "127.0.0.1:41001")
+            .await
+            .unwrap();
+        let best = ensure_configured_community(&pool, "127.0.0.1:41002")
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO relay_members (community_id, pubkey, role) VALUES (?1, ?2, 'owner')",
+        )
+        .bind(best.id.as_uuid().to_string())
+        .bind(&owner)
+        .execute(&pool)
+        .await
+        .unwrap();
+        for id in [vec![1_u8; 32], vec![2_u8; 32]] {
+            sqlx::query("INSERT INTO events (community_id,id,pubkey,created_at,kind,tags_json,content,sig,received_at,event_json) VALUES (?1,?2,?3,1,9,'[]','marker',?4,1,'{}')")
+                .bind(best.id.as_uuid().to_string())
+                .bind(id)
+                .bind(vec![3_u8; 32])
+                .bind(vec![4_u8; 64])
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+
+        let rebound = rebind_single_node_community_host(&pool, "127.0.0.1:41999", &owner)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(rebound.id, best.id);
+        assert_eq!(rebound.host, "127.0.0.1:41999");
+        assert!(lookup_community_by_host(&pool, "127.0.0.1:41002")
+            .await
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            lookup_community_by_host(&pool, "127.0.0.1:41001")
+                .await
+                .unwrap()
+                .unwrap()
+                .id,
+            older.id
+        );
+    }
+
+    #[tokio::test]
+    async fn rebind_single_node_community_is_idempotent_for_current_host() {
+        let pool = connect("sqlite::memory:").await.unwrap();
+        let current = ensure_configured_community(&pool, "127.0.0.1:42000")
+            .await
+            .unwrap();
+        let rebound = rebind_single_node_community_host(&pool, "127.0.0.1:42000", &"cd".repeat(32))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(rebound.id, current.id);
+    }
+
+    #[tokio::test]
+    async fn rebind_single_node_community_swaps_stale_port_collision() {
+        let pool = connect("sqlite::memory:").await.unwrap();
+        let owner = "ef".repeat(32);
+        let selected = ensure_configured_community(&pool, "127.0.0.1:43001")
+            .await
+            .unwrap();
+        let stale = ensure_configured_community(&pool, "127.0.0.1:43002")
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO relay_members (community_id, pubkey, role) VALUES (?1, ?2, 'owner')",
+        )
+        .bind(selected.id.as_uuid().to_string())
+        .bind(&owner)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let rebound = rebind_single_node_community_host(&pool, "127.0.0.1:43002", &owner)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(rebound.id, selected.id);
+        assert_eq!(
+            lookup_community_by_host(&pool, "127.0.0.1:43002")
+                .await
+                .unwrap()
+                .unwrap()
+                .id,
+            selected.id
+        );
+        assert_eq!(
+            lookup_community_by_host(&pool, "127.0.0.1:43001")
+                .await
+                .unwrap()
+                .unwrap()
+                .id,
+            stale.id
+        );
+    }
 
     #[tokio::test]
     async fn upgrades_phase_1_core_schema_before_dm_use() {

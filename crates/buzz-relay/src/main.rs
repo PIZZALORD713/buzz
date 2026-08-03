@@ -1232,7 +1232,14 @@ async fn run_single_node(config: Config, tracer_init: telemetry::TracerInit) -> 
             "Cannot derive community host from BUZZ_RELAY_URL"
         ));
     }
-    let community = db.ensure_configured_community(&host).await?.id;
+    let community = if let Some(owner) = config.relay_owner_pubkey.as_deref() {
+        match db.rebind_single_node_community_host(&host, owner).await? {
+            Some(record) => record.id,
+            None => db.ensure_configured_community(&host).await?.id,
+        }
+    } else {
+        db.ensure_configured_community(&host).await?.id
+    };
     if let Some(owner) = config.relay_owner_pubkey.as_deref() {
         db.bootstrap_owner(community, owner).await?;
     }

@@ -145,7 +145,8 @@ pub async fn apply_workspace(
             None => None,
         };
 
-        if crate::local_relay::is_local_relay_url(&relay_url) {
+        let is_local_workspace = crate::local_relay::is_local_relay_url(&relay_url);
+        if is_local_workspace {
             // Only the UI-created local sentinel can launch the bundled relay.
             // An arbitrary loopback URL remains a normal remote community.
             let keys = parsed_keys.clone().unwrap_or(state.signing_keys()?);
@@ -228,6 +229,12 @@ pub async fn apply_workspace(
         }
 
         try_regenerate_nest(&app);
+        if is_local_workspace {
+            let changed = crate::commands::agents::backfill_missing_agent_auth_tags(&app, &state)?;
+            if changed > 0 {
+                eprintln!("buzz-desktop: backfilled NIP-OA auth tags for {changed} local agent(s)");
+            }
+        }
 
         Ok::<(), String>(())
     })
