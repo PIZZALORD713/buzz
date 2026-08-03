@@ -103,9 +103,103 @@ test("add community starts with create and join choices", async ({ page }) => {
   await expect(
     page.getByRole("heading", { name: "Create a new community" }),
   ).toBeVisible();
+  await expect(page.getByTestId("community-create-hosted")).toContainText(
+    "Host it online",
+  );
+  await expect(page.getByTestId("community-choice-local")).toContainText(
+    "Keep it on this device",
+  );
+  await page.getByTestId("community-create-hosted").click();
   await page.getByRole("button", { name: "Continue to Builderlab" }).click();
   await page.getByRole("button", { name: "Connect and continue" }).click();
   await expect(page.getByLabel("Community address")).toBeVisible();
+});
+
+test("add community can start an on-this-device community", async ({
+  page,
+}) => {
+  await installMockBridge(page, { applyCommunityDelayMs: 1_000 });
+  await page.goto("/");
+
+  await openAddCommunityDialog(page);
+  await page.getByTestId("add-community-create").click();
+  await page.getByTestId("community-choice-local").click();
+
+  await expect
+    .poll(() =>
+      page.evaluate((key) => {
+        const raw = window.localStorage.getItem(key);
+        if (!raw) return null;
+        const transaction = JSON.parse(raw) as {
+          source?: string;
+          communityName?: string;
+          relayUrl?: string;
+        };
+        return {
+          source: transaction.source,
+          communityName: transaction.communityName,
+          relayUrl: transaction.relayUrl,
+        };
+      }, COMMUNITY_ONBOARDING_STORAGE_KEY),
+    )
+    .toEqual({
+      source: "add-community",
+      communityName: "On this device",
+      relayUrl: "buzz-local://on-this-device",
+    });
+});
+
+test("create choice offers to open an existing on-this-device community", async ({
+  page,
+}) => {
+  await page.addInitScript(() => {
+    const communities = [
+      {
+        id: "hosted",
+        name: "Hosted",
+        relayUrl: "wss://hosted.example.com",
+        addedAt: "2026-01-01T00:00:00.000Z",
+      },
+      {
+        id: "local",
+        name: "On this device",
+        relayUrl: "buzz-local://on-this-device",
+        local: true,
+        addedAt: "2026-01-02T00:00:00.000Z",
+      },
+    ];
+    window.localStorage.setItem(
+      "buzz-communities",
+      JSON.stringify(communities),
+    );
+    window.localStorage.setItem("buzz-active-community-id", "hosted");
+  });
+  await installMockBridge(
+    page,
+    { applyCommunityDelayMs: 1_000 },
+    { skipCommunitySeed: true },
+  );
+  await page.goto("/");
+
+  await openAddCommunityDialog(page);
+  await page.getByTestId("add-community-create").click();
+  await expect(page.getByTestId("community-choice-local")).toContainText(
+    "Open your on-this-device community",
+  );
+  await page.getByTestId("community-choice-local").click();
+  await expect
+    .poll(() =>
+      page.evaluate(() => localStorage.getItem("buzz-active-community-id")),
+    )
+    .toBe("local");
+  await expect
+    .poll(() =>
+      page.evaluate(() => {
+        const raw = localStorage.getItem("buzz-communities");
+        return raw ? JSON.parse(raw).length : 0;
+      }),
+    )
+    .toBe(2);
 });
 
 test("automatically shows community join requirements near the community URL", async ({
