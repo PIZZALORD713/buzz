@@ -141,6 +141,37 @@ pub(crate) struct EventQueryParityFixture {
 
 /// Shared EventQuery conformance vectors. Both database backends execute this
 /// identical filter/cursor/order/count contract against their own fixtures.
+///
+/// This exhaustive pattern is intentional: adding an `EventQuery` field fails
+/// compilation here until its parity-vector treatment is added or consciously
+/// acknowledged.
+#[cfg(test)]
+#[allow(dead_code)]
+fn event_query_parity_vectors_cover_all_fields(
+    EventQuery {
+        community_id: _,
+        channel_id: _,
+        kinds: _,
+        pubkey: _,
+        since: _,
+        until: _,
+        limit: _,
+        offset: _,
+        p_tag_hex: _,
+        d_tag: _,
+        d_tags: _,
+        before_id: _,
+        global_only: _,
+        authors: _,
+        ids: _,
+        e_tags: _,
+        channel_ids: _,
+        max_limit: _,
+        shared_gated_reader: _,
+    }: EventQuery,
+) {
+}
+
 #[cfg(test)]
 pub(crate) fn event_query_parity_vectors(
     community_id: CommunityId,
