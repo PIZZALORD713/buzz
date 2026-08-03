@@ -3255,6 +3255,23 @@ impl Db {
         }
     }
 
+    /// Atomically persist a SQLite DM-hide command and its visibility mutation.
+    /// `None` means either PostgreSQL or a command event already processed.
+    pub async fn hide_dm_sqlite_command(
+        &self,
+        community_id: CommunityId,
+        channel_id: Uuid,
+        pubkey: &[u8],
+        event: &nostr::Event,
+    ) -> Result<Option<()>> {
+        match &self.backend {
+            DbBackend::SQLite(pool) => {
+                sqlite::hide_dm_command(pool, community_id, channel_id, pubkey, event).await
+            }
+            DbBackend::Postgres => Ok(None),
+        }
+    }
+
     /// Hide a DM channel for a specific user.
     ///
     /// The DM is not deleted — it can be restored by opening a new DM with
@@ -4533,6 +4550,41 @@ impl Db {
         }
     }
 
+    /// Atomically persist a SQLite workflow-definition command and its upsert.
+    /// `None` means either PostgreSQL or a stale/duplicate command event.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn upsert_workflow_sqlite_command(
+        &self,
+        community_id: CommunityId,
+        id: Uuid,
+        channel_id: Option<Uuid>,
+        owner_pubkey: &[u8],
+        name: &str,
+        definition_json: &str,
+        definition_hash: &[u8],
+        event: &nostr::Event,
+        d_tag: &str,
+    ) -> Result<Option<()>> {
+        match &self.backend {
+            DbBackend::SQLite(pool) => {
+                sqlite::upsert_workflow_command(
+                    pool,
+                    community_id,
+                    id,
+                    channel_id,
+                    owner_pubkey,
+                    name,
+                    definition_json,
+                    definition_hash,
+                    event,
+                    d_tag,
+                )
+                .await
+            }
+            DbBackend::Postgres => Ok(None),
+        }
+    }
+
     /// Insert or update a workflow using its NIP-33 `d`-tag UUID.
     #[allow(clippy::too_many_arguments)]
     pub async fn upsert_workflow(
@@ -4885,6 +4937,34 @@ impl Db {
         }
     }
 
+    /// Atomically persist a SQLite workflow-trigger command and create its run.
+    /// `None` means either PostgreSQL or a command event already processed.
+    pub async fn create_workflow_run_sqlite_command(
+        &self,
+        community_id: CommunityId,
+        workflow_id: Uuid,
+        trigger_event_id: &[u8],
+        trigger_context: Option<&serde_json::Value>,
+        channel_id: Option<Uuid>,
+        event: &nostr::Event,
+    ) -> Result<Option<Uuid>> {
+        match &self.backend {
+            DbBackend::SQLite(pool) => {
+                sqlite::create_workflow_run_command(
+                    pool,
+                    community_id,
+                    workflow_id,
+                    trigger_event_id,
+                    trigger_context,
+                    channel_id,
+                    event,
+                )
+                .await
+            }
+            DbBackend::Postgres => Ok(None),
+        }
+    }
+
     /// Create a new workflow run.
     pub async fn create_workflow_run(
         &self,
@@ -5069,6 +5149,34 @@ impl Db {
                 )
                 .await
             }
+        }
+    }
+
+    /// Atomically persist a SQLite approval command and update its approval.
+    /// `None` means either PostgreSQL or a command event already processed.
+    pub async fn update_approval_sqlite_command(
+        &self,
+        community_id: CommunityId,
+        token_hash: &[u8],
+        status: workflow::ApprovalStatus,
+        approver_pubkey: Option<&[u8]>,
+        note: Option<&str>,
+        event: &nostr::Event,
+    ) -> Result<Option<bool>> {
+        match &self.backend {
+            DbBackend::SQLite(pool) => {
+                sqlite::update_approval_command(
+                    pool,
+                    community_id,
+                    token_hash,
+                    status,
+                    approver_pubkey,
+                    note,
+                    event,
+                )
+                .await
+            }
+            DbBackend::Postgres => Ok(None),
         }
     }
 

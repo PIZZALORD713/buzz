@@ -645,6 +645,70 @@ pub(crate) async fn soft_delete_discovery_events(
         .rows_affected())
 }
 
+async fn insert_command_event_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    community: CommunityId,
+    event: &nostr::Event,
+    channel_id: Option<Uuid>,
+) -> Result<bool> {
+    let received_at = chrono::Utc::now();
+    let not_before = crate::event::extract_not_before(event);
+    Ok(sqlx::query("INSERT INTO events (community_id, id, pubkey, created_at, kind, tags_json, content, sig, channel_id, received_at, event_json, not_before) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12) ON CONFLICT DO NOTHING")
+        .bind(community.as_uuid().to_string())
+        .bind(event.id.as_bytes().as_slice())
+        .bind(event.pubkey.to_bytes().as_slice())
+        .bind(event.created_at.as_secs() as i64)
+        .bind(event.kind.as_u16() as i32)
+        .bind(serde_json::to_string(&event.tags)?)
+        .bind(&event.content)
+        .bind(event.sig.serialize().as_slice())
+        .bind(channel_id.map(|id| id.to_string()))
+        .bind(received_at.timestamp())
+        .bind(serde_json::to_string(event)?)
+        .bind(not_before)
+        .execute(&mut **tx)
+        .await?
+        .rows_affected() == 1)
+}
+
+async fn replace_command_event_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    community: CommunityId,
+    event: &nostr::Event,
+    channel_id: Option<Uuid>,
+    d_tag: &str,
+) -> Result<bool> {
+    let rows = sqlx::query(
+        "SELECT id, event_json FROM events WHERE community_id = ?1 AND kind = ?2 AND pubkey = ?3",
+    )
+    .bind(community.as_uuid().to_string())
+    .bind(event.kind.as_u16() as i32)
+    .bind(event.pubkey.to_bytes().as_slice())
+    .fetch_all(&mut **tx)
+    .await?;
+    let mut replaced_ids = Vec::new();
+    for row in rows {
+        let existing: nostr::Event = serde_json::from_str(row.try_get("event_json")?)?;
+        if crate::event::extract_d_tag(&existing).as_deref() != Some(d_tag) {
+            continue;
+        }
+        if event.created_at < existing.created_at
+            || (event.created_at == existing.created_at && event.id >= existing.id)
+        {
+            return Ok(false);
+        }
+        replaced_ids.push(row.try_get::<Vec<u8>, _>("id")?);
+    }
+    for id in replaced_ids {
+        sqlx::query("DELETE FROM events WHERE community_id = ?1 AND id = ?2")
+            .bind(community.as_uuid().to_string())
+            .bind(id)
+            .execute(&mut **tx)
+            .await?;
+    }
+    insert_command_event_tx(tx, community, event, channel_id).await
+}
+
 pub(crate) async fn insert_event(
     pool: &SqlitePool,
     community: CommunityId,
@@ -1186,10 +1250,14 @@ pub(crate) async fn query_events(
         }) {
             continue;
         }
-        if q.p_tag_hex
-            .as_ref()
-            .is_some_and(|p| !has_tag("p", &p.to_ascii_lowercase()))
-        {
+        if q.p_tag_hex.as_ref().is_some_and(|p| {
+            !tags.iter().any(|tag| {
+                tag.first().is_some_and(|name| name == "p")
+                    && tag
+                        .get(1)
+                        .is_some_and(|value| value.eq_ignore_ascii_case(p))
+            })
+        }) {
             continue;
         }
         if q.e_tags
@@ -1912,6 +1980,32 @@ pub(crate) async fn hide_dm(
     Ok(())
 }
 
+pub(crate) async fn hide_dm_command(
+    pool: &SqlitePool,
+    community: CommunityId,
+    channel_id: Uuid,
+    pubkey: &[u8],
+    event: &nostr::Event,
+) -> Result<Option<()>> {
+    let mut tx = pool.begin().await?;
+    if !insert_command_event_tx(&mut tx, community, event, None).await? {
+        return Ok(None);
+    }
+    let result = sqlx::query("UPDATE channel_members SET hidden_at = unixepoch() WHERE channel_id = ?1 AND pubkey = ?2 AND removed_at IS NULL AND EXISTS (SELECT 1 FROM channels c WHERE c.id = channel_members.channel_id AND c.community_id = ?3)")
+        .bind(channel_id.to_string())
+        .bind(pubkey)
+        .bind(community.as_uuid().to_string())
+        .execute(&mut *tx)
+        .await?;
+    if result.rows_affected() == 0 {
+        return Err(crate::DbError::NotFound(format!(
+            "no active membership for channel {channel_id}"
+        )));
+    }
+    tx.commit().await?;
+    Ok(Some(()))
+}
+
 pub(crate) async fn unhide_dm(
     pool: &SqlitePool,
     community: CommunityId,
@@ -2248,6 +2342,35 @@ pub(crate) async fn upsert_workflow(
     }
     Ok(())
 }
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn upsert_workflow_command(
+    pool: &SqlitePool,
+    c: CommunityId,
+    id: Uuid,
+    ch: Option<Uuid>,
+    owner: &[u8],
+    name: &str,
+    def: &str,
+    hash: &[u8],
+    event: &nostr::Event,
+    d_tag: &str,
+) -> Result<Option<()>> {
+    let mut tx = pool.begin().await?;
+    if !replace_command_event_tx(&mut tx, c, event, ch, d_tag).await? {
+        return Ok(None);
+    }
+    let n = sqlx::query("INSERT INTO workflows(community_id,id,name,owner_pubkey,channel_id,definition,definition_hash) VALUES(?1,?2,?3,?4,?5,?6,?7) ON CONFLICT(community_id,id) DO UPDATE SET name=excluded.name,definition=excluded.definition,definition_hash=excluded.definition_hash,updated_at=unixepoch() WHERE workflows.owner_pubkey=excluded.owner_pubkey AND workflows.channel_id IS excluded.channel_id")
+        .bind(c.as_uuid().to_string()).bind(id.to_string()).bind(name).bind(owner)
+        .bind(ch.map(|v| v.to_string())).bind(def).bind(hash).execute(&mut *tx).await?.rows_affected();
+    if n == 0 {
+        return Err(crate::DbError::AccessDenied(format!(
+            "workflow {id} belongs to a different owner or channel"
+        )));
+    }
+    tx.commit().await?;
+    Ok(Some(()))
+}
+
 pub(crate) async fn get_workflow(
     pool: &SqlitePool,
     c: CommunityId,
@@ -2481,6 +2604,27 @@ pub(crate) async fn create_workflow_run(
     sqlx::query("INSERT INTO workflow_runs(community_id,id,workflow_id,trigger_event_id,trigger_context) VALUES(?1,?2,?3,?4,?5)").bind(c.as_uuid().to_string()).bind(id.to_string()).bind(w.to_string()).bind(event).bind(ctx.map(|v|v.to_string())).execute(pool).await?;
     Ok(id)
 }
+pub(crate) async fn create_workflow_run_command(
+    pool: &SqlitePool,
+    c: CommunityId,
+    w: Uuid,
+    trigger_event_id: &[u8],
+    ctx: Option<&serde_json::Value>,
+    channel_id: Option<Uuid>,
+    event: &nostr::Event,
+) -> Result<Option<Uuid>> {
+    let mut tx = pool.begin().await?;
+    if !insert_command_event_tx(&mut tx, c, event, channel_id).await? {
+        return Ok(None);
+    }
+    let id = Uuid::new_v4();
+    sqlx::query("INSERT INTO workflow_runs(community_id,id,workflow_id,trigger_event_id,trigger_context) VALUES(?1,?2,?3,?4,?5)")
+        .bind(c.as_uuid().to_string()).bind(id.to_string()).bind(w.to_string())
+        .bind(trigger_event_id).bind(ctx.map(|v| v.to_string())).execute(&mut *tx).await?;
+    tx.commit().await?;
+    Ok(Some(id))
+}
+
 pub(crate) async fn get_workflow_run(
     pool: &SqlitePool,
     c: CommunityId,
@@ -2613,6 +2757,29 @@ pub(crate) async fn update_approval_by_hash(
 ) -> Result<bool> {
     let st = status.to_string();
     Ok(sqlx::query("UPDATE workflow_approvals SET status=?1,approver_pubkey=?2,note=?3,granted_at=CASE WHEN ?1='granted' THEN unixepoch() ELSE granted_at END,denied_at=CASE WHEN ?1='denied' THEN unixepoch() ELSE denied_at END WHERE community_id=?4 AND token=?5 AND status='pending'").bind(st).bind(pk).bind(note).bind(c.as_uuid().to_string()).bind(hash).execute(pool).await?.rows_affected()>0)
+}
+
+pub(crate) async fn update_approval_command(
+    pool: &SqlitePool,
+    c: CommunityId,
+    hash: &[u8],
+    status: crate::workflow::ApprovalStatus,
+    pk: Option<&[u8]>,
+    note: Option<&str>,
+    event: &nostr::Event,
+) -> Result<Option<bool>> {
+    let mut tx = pool.begin().await?;
+    if !insert_command_event_tx(&mut tx, c, event, None).await? {
+        return Ok(None);
+    }
+    let st = status.to_string();
+    let updated = sqlx::query("UPDATE workflow_approvals SET status=?1,approver_pubkey=?2,note=?3,granted_at=CASE WHEN ?1='granted' THEN unixepoch() ELSE granted_at END,denied_at=CASE WHEN ?1='denied' THEN unixepoch() ELSE denied_at END WHERE community_id=?4 AND token=?5 AND status='pending'")
+        .bind(st).bind(pk).bind(note).bind(c.as_uuid().to_string()).bind(hash)
+        .execute(&mut *tx).await?.rows_affected() > 0;
+    if updated {
+        tx.commit().await?;
+    }
+    Ok(Some(updated))
 }
 
 pub(crate) async fn insert_product_feedback(
@@ -3176,13 +3343,7 @@ pub(crate) async fn open_dm(
     let hash = crate::dm::compute_participant_hash(&participants);
     let mut tx = pool.begin().await?;
     if let Some(event) = command_event {
-        let received_at = chrono::Utc::now();
-        let inserted = sqlx::query("INSERT INTO events (community_id, id, pubkey, created_at, kind, tags_json, content, sig, channel_id, received_at, event_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL, ?9, ?10) ON CONFLICT DO NOTHING")
-            .bind(community.as_uuid().to_string()).bind(event.id.as_bytes().as_slice()).bind(event.pubkey.to_bytes().as_slice())
-            .bind(event.created_at.as_secs() as i64).bind(event.kind.as_u16() as i32).bind(serde_json::to_string(&event.tags)?)
-            .bind(&event.content).bind(event.sig.serialize().as_slice()).bind(received_at.timestamp()).bind(serde_json::to_string(event)?)
-            .execute(&mut *tx).await?.rows_affected() != 0;
-        if !inserted {
+        if !insert_command_event_tx(&mut tx, community, event, None).await? {
             return Ok(None);
         }
     }
@@ -4418,6 +4579,69 @@ fn community_record(row: sqlx::sqlite::SqliteRow) -> Result<CommunityRecord> {
 mod tests {
     use super::*;
     use nostr::{EventBuilder, Keys, Kind, Tag, Timestamp};
+
+    #[tokio::test]
+    async fn event_query_parity_vectors_hold_for_sqlite() {
+        let pool = connect("sqlite::memory:").await.unwrap();
+        let community = ensure_configured_community(&pool, "parity.example")
+            .await
+            .unwrap()
+            .id;
+        let other = ensure_configured_community(&pool, "other-parity.example")
+            .await
+            .unwrap()
+            .id;
+        let first_keys = Keys::generate();
+        let second_keys = Keys::generate();
+        let p_tag_hex = hex::encode(second_keys.public_key().to_bytes());
+        let first = EventBuilder::new(Kind::Custom(1), "first")
+            .tags([
+                Tag::parse(["d", "alpha"]).unwrap(),
+                Tag::parse(["p", &p_tag_hex.to_ascii_uppercase()]).unwrap(),
+            ])
+            .custom_created_at(Timestamp::from(100_u64))
+            .sign_with_keys(&first_keys)
+            .unwrap();
+        let second = EventBuilder::new(Kind::Custom(2), "second")
+            .custom_created_at(Timestamp::from(101_u64))
+            .sign_with_keys(&second_keys)
+            .unwrap();
+        let third = EventBuilder::new(Kind::Custom(1), "third")
+            .custom_created_at(Timestamp::from(102_u64))
+            .sign_with_keys(&first_keys)
+            .unwrap();
+        let channel_id = Uuid::new_v4();
+        insert_event(&pool, community, &first, None).await.unwrap();
+        insert_event(&pool, community, &second, Some(channel_id))
+            .await
+            .unwrap();
+        insert_event(&pool, community, &third, None).await.unwrap();
+        insert_event(&pool, other, &third, None).await.unwrap();
+
+        let fixture = crate::event::EventQueryParityFixture {
+            first_id: first.id.as_bytes().to_vec(),
+            second_id: second.id.as_bytes().to_vec(),
+            third_id: third.id.as_bytes().to_vec(),
+            first_author: first.pubkey.to_bytes().to_vec(),
+            p_tag_hex,
+            channel_id,
+        };
+        for (name, query, expected_ids, expected_count) in
+            crate::event::event_query_parity_vectors(community, &fixture)
+        {
+            let events = query_events(&pool, &query).await.unwrap();
+            let ids: Vec<_> = events
+                .into_iter()
+                .map(|event| event.event.id.as_bytes().to_vec())
+                .collect();
+            assert_eq!(ids, expected_ids, "{name}");
+            assert_eq!(
+                count_events(&pool, &query).await.unwrap(),
+                expected_count,
+                "{name}"
+            );
+        }
+    }
 
     #[tokio::test]
     async fn rebind_single_node_community_preserves_best_owner_uuid() {
@@ -6548,5 +6772,290 @@ mod tests {
         assert_eq!(query_events(&reopened, &query).await.unwrap().len(), 1);
         reopened.close().await;
         std::fs::remove_file(path).unwrap();
+    }
+
+    fn command_event(keys: &Keys, kind: u16, content: &str, tags: Vec<Tag>) -> nostr::Event {
+        EventBuilder::new(Kind::Custom(kind), content)
+            .tags(tags)
+            .sign_with_keys(keys)
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn dm_command_failure_rolls_back_event_and_retry_applies_mutation() {
+        let pool = connect("sqlite::memory:").await.unwrap();
+        let community = ensure_configured_community(&pool, "dm-command.local")
+            .await
+            .unwrap()
+            .id;
+        let keys = Keys::generate();
+        let alice = keys.public_key().to_bytes().to_vec();
+        let bob = vec![2_u8; 32];
+        let participants = [alice.as_slice(), bob.as_slice()];
+        let (dm, _) = open_dm(&pool, community, &participants, &alice, None)
+            .await
+            .unwrap()
+            .unwrap();
+        let event = command_event(&keys, 41012, "", vec![]);
+
+        let missing = Uuid::new_v4();
+        assert!(hide_dm_command(&pool, community, missing, &alice, &event)
+            .await
+            .is_err());
+        assert!(get_event_by_id(&pool, community, event.id.as_bytes())
+            .await
+            .unwrap()
+            .is_none());
+
+        assert_eq!(
+            hide_dm_command(&pool, community, dm.id, &alice, &event)
+                .await
+                .unwrap(),
+            Some(())
+        );
+        assert!(get_event_by_id(&pool, community, event.id.as_bytes())
+            .await
+            .unwrap()
+            .is_some());
+        assert_eq!(
+            hide_dm_command(&pool, community, dm.id, &alice, &event)
+                .await
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            list_hidden_dms(&pool, community, &alice).await.unwrap(),
+            vec![dm.id]
+        );
+    }
+
+    #[tokio::test]
+    async fn workflow_command_failure_rolls_back_event_and_retry_creates_run() {
+        let pool = connect("sqlite::memory:").await.unwrap();
+        let community = ensure_configured_community(&pool, "workflow-command.local")
+            .await
+            .unwrap()
+            .id;
+        let keys = Keys::generate();
+        let owner = keys.public_key().to_bytes().to_vec();
+        ensure_user(&pool, community, &owner).await.unwrap();
+        let channel = Uuid::new_v4();
+        create_channel_with_id(
+            &pool,
+            community,
+            channel,
+            "commands",
+            crate::channel::ChannelType::Stream,
+            crate::channel::ChannelVisibility::Private,
+            None,
+            &owner,
+            None,
+        )
+        .await
+        .unwrap();
+        let workflow = Uuid::new_v4();
+        let def_event = command_event(
+            &keys,
+            30311,
+            "definition",
+            vec![Tag::custom(nostr::TagKind::d(), [workflow.to_string()])],
+        );
+        let definition = r#"{"name":"test","trigger":{"on":"manual"},"steps":[]}"#;
+        assert_eq!(
+            upsert_workflow_command(
+                &pool,
+                community,
+                workflow,
+                Some(channel),
+                &owner,
+                "test",
+                definition,
+                &[1; 32],
+                &def_event,
+                &workflow.to_string()
+            )
+            .await
+            .unwrap(),
+            Some(())
+        );
+        assert_eq!(
+            upsert_workflow_command(
+                &pool,
+                community,
+                workflow,
+                Some(channel),
+                &owner,
+                "test",
+                definition,
+                &[1; 32],
+                &def_event,
+                &workflow.to_string()
+            )
+            .await
+            .unwrap(),
+            None
+        );
+
+        let trigger = command_event(&keys, 30312, "", vec![]);
+        let missing_workflow = Uuid::new_v4();
+        assert!(create_workflow_run_command(
+            &pool,
+            community,
+            missing_workflow,
+            trigger.id.as_bytes(),
+            None,
+            Some(channel),
+            &trigger
+        )
+        .await
+        .is_err());
+        assert!(get_event_by_id(&pool, community, trigger.id.as_bytes())
+            .await
+            .unwrap()
+            .is_none());
+        let run = create_workflow_run_command(
+            &pool,
+            community,
+            workflow,
+            trigger.id.as_bytes(),
+            None,
+            Some(channel),
+            &trigger,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            get_workflow_run(&pool, community, run)
+                .await
+                .unwrap()
+                .workflow_id,
+            workflow
+        );
+        assert_eq!(
+            create_workflow_run_command(
+                &pool,
+                community,
+                workflow,
+                trigger.id.as_bytes(),
+                None,
+                Some(channel),
+                &trigger
+            )
+            .await
+            .unwrap(),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn approval_command_failure_rolls_back_event_and_retry_updates_status() {
+        let pool = connect("sqlite::memory:").await.unwrap();
+        let community = ensure_configured_community(&pool, "approval-command.local")
+            .await
+            .unwrap()
+            .id;
+        let keys = Keys::generate();
+        let owner = keys.public_key().to_bytes().to_vec();
+        ensure_user(&pool, community, &owner).await.unwrap();
+        let channel = Uuid::new_v4();
+        create_channel_with_id(
+            &pool,
+            community,
+            channel,
+            "commands",
+            crate::channel::ChannelType::Stream,
+            crate::channel::ChannelVisibility::Private,
+            None,
+            &owner,
+            None,
+        )
+        .await
+        .unwrap();
+        let workflow = create_workflow(
+            &pool,
+            community,
+            Some(channel),
+            &owner,
+            "test",
+            r#"{"trigger":{"on":"manual"}}"#,
+            &[1; 32],
+        )
+        .await
+        .unwrap();
+        let run = create_workflow_run(&pool, community, workflow, None, None)
+            .await
+            .unwrap();
+        create_approval(
+            &pool,
+            crate::workflow::CreateApprovalParams {
+                community_id: community,
+                workflow_id: workflow,
+                run_id: run,
+                step_id: "approve",
+                step_index: 0,
+                approver_spec: "any",
+                token: "secret",
+                expires_at: chrono::Utc::now() + chrono::Duration::hours(1),
+            },
+        )
+        .await
+        .unwrap();
+        let hash = Sha256::digest(b"secret").to_vec();
+        let event = command_event(&keys, 30313, "approved", vec![]);
+
+        assert_eq!(
+            update_approval_command(
+                &pool,
+                community,
+                &[9; 32],
+                crate::workflow::ApprovalStatus::Granted,
+                Some(&owner),
+                None,
+                &event
+            )
+            .await
+            .unwrap(),
+            Some(false)
+        );
+        assert!(get_event_by_id(&pool, community, event.id.as_bytes())
+            .await
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            update_approval_command(
+                &pool,
+                community,
+                &hash,
+                crate::workflow::ApprovalStatus::Granted,
+                Some(&owner),
+                Some("ok"),
+                &event
+            )
+            .await
+            .unwrap(),
+            Some(true)
+        );
+        assert_eq!(
+            get_approval_by_hash(&pool, community, &hash)
+                .await
+                .unwrap()
+                .status,
+            crate::workflow::ApprovalStatus::Granted
+        );
+        assert_eq!(
+            update_approval_command(
+                &pool,
+                community,
+                &hash,
+                crate::workflow::ApprovalStatus::Granted,
+                Some(&owner),
+                None,
+                &event
+            )
+            .await
+            .unwrap(),
+            None
+        );
     }
 }

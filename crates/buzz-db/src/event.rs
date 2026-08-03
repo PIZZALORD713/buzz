@@ -128,6 +128,100 @@ impl EventQuery {
     }
 }
 
+#[cfg(test)]
+#[derive(Clone)]
+pub(crate) struct EventQueryParityFixture {
+    pub first_id: Vec<u8>,
+    pub second_id: Vec<u8>,
+    pub third_id: Vec<u8>,
+    pub first_author: Vec<u8>,
+    pub p_tag_hex: String,
+    pub channel_id: Uuid,
+}
+
+/// Shared EventQuery conformance vectors. Both database backends execute this
+/// identical filter/cursor/order/count contract against their own fixtures.
+#[cfg(test)]
+pub(crate) fn event_query_parity_vectors(
+    community_id: CommunityId,
+    fixture: &EventQueryParityFixture,
+) -> Vec<(&'static str, EventQuery, Vec<Vec<u8>>, i64)> {
+    let mut kinds = EventQuery::for_community(community_id);
+    kinds.kinds = Some(vec![1]);
+
+    let mut author = EventQuery::for_community(community_id);
+    author.authors = Some(vec![fixture.first_author.clone()]);
+
+    let mut ids = EventQuery::for_community(community_id);
+    ids.ids = Some(vec![fixture.second_id.clone()]);
+
+    let mut d_tag = EventQuery::for_community(community_id);
+    d_tag.d_tags = Some(vec!["alpha".to_string(), "missing".to_string()]);
+
+    let mut p_tag = EventQuery::for_community(community_id);
+    p_tag.p_tag_hex = Some(fixture.p_tag_hex.to_ascii_uppercase());
+
+    let mut channel = EventQuery::for_community(community_id);
+    channel.channel_id = Some(fixture.channel_id);
+
+    let mut global = EventQuery::for_community(community_id);
+    global.global_only = true;
+
+    let mut cursor = EventQuery::for_community(community_id);
+    cursor.until = Some(DateTime::from_timestamp(102, 0).expect("valid timestamp"));
+    cursor.before_id = Some(fixture.third_id.clone());
+
+    let mut limited = EventQuery::for_community(community_id);
+    limited.limit = Some(2);
+
+    vec![
+        (
+            "community order",
+            EventQuery::for_community(community_id),
+            vec![
+                fixture.third_id.clone(),
+                fixture.second_id.clone(),
+                fixture.first_id.clone(),
+            ],
+            3,
+        ),
+        (
+            "kind",
+            kinds,
+            vec![fixture.third_id.clone(), fixture.first_id.clone()],
+            2,
+        ),
+        (
+            "author",
+            author,
+            vec![fixture.third_id.clone(), fixture.first_id.clone()],
+            2,
+        ),
+        ("id", ids, vec![fixture.second_id.clone()], 1),
+        ("d-tag", d_tag, vec![fixture.first_id.clone()], 1),
+        ("p-tag", p_tag, vec![fixture.first_id.clone()], 1),
+        ("channel", channel, vec![fixture.second_id.clone()], 1),
+        (
+            "global",
+            global,
+            vec![fixture.third_id.clone(), fixture.first_id.clone()],
+            2,
+        ),
+        (
+            "cursor",
+            cursor,
+            vec![fixture.second_id.clone(), fixture.first_id.clone()],
+            2,
+        ),
+        (
+            "limit",
+            limited,
+            vec![fixture.third_id.clone(), fixture.second_id.clone()],
+            3,
+        ),
+    ]
+}
+
 /// Result of atomically inserting a kind:7 reaction event and its reaction row.
 #[derive(Debug)]
 pub enum ReactionEventInsertOutcome {
@@ -1539,7 +1633,7 @@ pub async fn release_due_reminder(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nostr::{EventBuilder, Keys, Kind, Tag};
+    use nostr::{EventBuilder, Keys, Kind, Tag, Timestamp};
 
     const TEST_DB_URL: &str = "postgres://buzz:buzz_dev@localhost:5432/buzz";
 
@@ -1876,6 +1970,64 @@ mod tests {
             .custom_created_at(nostr::Timestamp::from(created_at))
             .sign_with_keys(&Keys::generate())
             .expect("sign timestamped event")
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn event_query_parity_vectors_hold_for_postgres() {
+        let pool = setup_pool().await;
+        let community = CommunityId::from_uuid(make_test_community(&pool).await);
+        let other = CommunityId::from_uuid(make_test_community(&pool).await);
+        let channel_id = make_test_channel(&pool, *community.as_uuid(), None).await;
+        let first_keys = Keys::generate();
+        let second_keys = Keys::generate();
+        let p_tag_hex = hex::encode(second_keys.public_key().to_bytes());
+        let first = EventBuilder::new(Kind::Custom(1), "first")
+            .tags([
+                Tag::parse(["d", "alpha"]).unwrap(),
+                Tag::parse(["p", &p_tag_hex.to_ascii_uppercase()]).unwrap(),
+            ])
+            .custom_created_at(Timestamp::from(100_u64))
+            .sign_with_keys(&first_keys)
+            .unwrap();
+        let second = EventBuilder::new(Kind::Custom(2), "second")
+            .custom_created_at(Timestamp::from(101_u64))
+            .sign_with_keys(&second_keys)
+            .unwrap();
+        let third = EventBuilder::new(Kind::Custom(1), "third")
+            .custom_created_at(Timestamp::from(102_u64))
+            .sign_with_keys(&first_keys)
+            .unwrap();
+        insert_event(&pool, community, &first, None).await.unwrap();
+        insert_event(&pool, community, &second, Some(channel_id))
+            .await
+            .unwrap();
+        insert_event(&pool, community, &third, None).await.unwrap();
+        insert_event(&pool, other, &third, None).await.unwrap();
+
+        let fixture = EventQueryParityFixture {
+            first_id: first.id.as_bytes().to_vec(),
+            second_id: second.id.as_bytes().to_vec(),
+            third_id: third.id.as_bytes().to_vec(),
+            first_author: first.pubkey.to_bytes().to_vec(),
+            p_tag_hex,
+            channel_id,
+        };
+        for (name, query, expected_ids, expected_count) in
+            event_query_parity_vectors(community, &fixture)
+        {
+            let events = query_events(&pool, &query).await.unwrap();
+            let ids: Vec<_> = events
+                .into_iter()
+                .map(|event| event.event.id.as_bytes().to_vec())
+                .collect();
+            assert_eq!(ids, expected_ids, "{name}");
+            assert_eq!(
+                count_events(&pool, &query).await.unwrap(),
+                expected_count,
+                "{name}"
+            );
+        }
     }
 
     #[tokio::test]

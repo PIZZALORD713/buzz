@@ -1290,7 +1290,7 @@ async fn run_single_node(config: Config, tracer_init: telemetry::TracerInit) -> 
     let state_for_fanout = Arc::clone(&state);
     let mut events = state.pubsub.subscribe_local();
     tokio::spawn(async move {
-        while let Ok(event) = events.recv().await {
+        while let Some(event) = recv_single_node_fanout_event(&mut events).await {
             buzz_relay::handlers::event::fan_out_pubsub_event(&state_for_fanout, event).await;
         }
     });
@@ -1308,6 +1308,24 @@ async fn run_single_node(config: Config, tracer_init: telemetry::TracerInit) -> 
         let _ = tp.shutdown();
     }
     Ok(())
+}
+
+async fn recv_single_node_fanout_event<T: Clone>(
+    events: &mut tokio::sync::broadcast::Receiver<T>,
+) -> Option<T> {
+    loop {
+        match events.recv().await {
+            Ok(event) => return Some(event),
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                metrics::counter!("buzz_single_node_fanout_lag_total").increment(n);
+                tracing::warn!("Single-node fan-out lagged by {n} messages");
+            }
+            Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                tracing::error!("Single-node fan-out broadcast channel closed");
+                return None;
+            }
+        }
+    }
 }
 
 fn health_listener_ip(profile: RelayProfile) -> IpAddr {
@@ -2040,14 +2058,23 @@ mod tests {
 
     use super::{
         buzz_auto_migrate_enabled, dropped_in_memory_keys, health_listener_ip, idle_timeout_secs,
-        refresh_legacy_active_gauge_recency, run_periodic_until_cancelled, EmissionScope,
-        InMemoryMetricKey, RelayProfile,
+        recv_single_node_fanout_event, refresh_legacy_active_gauge_recency,
+        run_periodic_until_cancelled, EmissionScope, InMemoryMetricKey, RelayProfile,
     };
     use metrics::GaugeFn;
     use metrics_util::{
         debugging::DebugValue,
         registry::{GenerationalAtomicStorage, Registry},
     };
+
+    #[tokio::test]
+    async fn single_node_fanout_receives_after_broadcast_lag() {
+        let (sender, mut receiver) = tokio::sync::broadcast::channel(1);
+        sender.send(1_u8).expect("first event");
+        sender.send(2_u8).expect("second event causes lag");
+
+        assert_eq!(recv_single_node_fanout_event(&mut receiver).await, Some(2));
+    }
 
     #[tokio::test(start_paused = true)]
     async fn periodic_loop_exits_immediately_on_cancellation() {

@@ -90,6 +90,14 @@ enum CommandTransaction {
     Postgres(sqlx::Transaction<'static, sqlx::Postgres>),
 }
 
+fn duplicate_result(event: &Event) -> IngestResult {
+    IngestResult {
+        event_id: event.id.to_hex(),
+        accepted: true,
+        message: "duplicate: already processed".into(),
+    }
+}
+
 impl CommandTransaction {
     async fn commit(self) -> Result<(), sqlx::Error> {
         match self {
@@ -106,12 +114,9 @@ impl CommandTransaction {
 /// If the event is a duplicate (ON CONFLICT DO NOTHING), the transaction is
 /// rolled back and `PersistResult::Duplicate` is returned — no mutations needed.
 ///
-/// NOTE: Domain mutations (open_dm, upsert_workflow, etc.) execute on the
-/// connection pool, NOT inside this transaction. The pattern is idempotent but
-/// not strictly atomic: if a mutation succeeds but commit fails, the mutation
-/// persists without the event record. On retry, the event INSERT succeeds
-/// (no conflict), and the mutation re-executes — which is safe for idempotent
-/// operations (open_dm, hide_dm, update_approval, upsert_workflow).
+/// PostgreSQL keeps the command event transaction open while the domain mutation
+/// executes. SQLite handlers use focused helpers that perform both writes in one
+/// SQLite transaction; this generic path is retained only for PostgreSQL.
 async fn persist_command_event(
     state: &Arc<AppState>,
     tenant: &TenantContext,
@@ -550,27 +555,31 @@ async fn handle_dm_add_member(
         ));
     }
 
-    // Persist the command event — returns open transaction
-    let tx = match persist_command_event(state, tenant, event, None).await? {
-        PersistResult::Duplicate => {
-            return Ok(IngestResult {
-                event_id: event.id.to_hex(),
-                accepted: true,
-                message: "duplicate: already processed".into(),
-            });
-        }
-        PersistResult::Inserted(tx) => tx,
-    };
-
-    // 6. Execute: open_dm with expanded set (creates NEW DM — DM sets are immutable)
+    // 6. Execute: open_dm with expanded set (creates NEW DM — DM sets are immutable).
+    // SQLite couples the command event and mutation in one transaction.
     let all_refs: Vec<&[u8]> = all_bytes.iter().map(|b| b.as_slice()).collect();
-    let (new_channel, was_created) = state
+    let sqlite_result = state
         .db
-        .open_dm(tenant.community(), &all_refs, &self_bytes)
+        .open_dm_sqlite_command(tenant.community(), &all_refs, &self_bytes, event)
         .await
         .map_err(|e| IngestError::Internal(format!("error: db open_dm: {e}")))?;
-
-    // Commit: event + mutation succeeded atomically.
+    let (new_channel, was_created, tx) = if state.config.profile.is_single_node() {
+        let Some((channel, created)) = sqlite_result else {
+            return Ok(duplicate_result(event));
+        };
+        (channel, created, CommandTransaction::Sqlite)
+    } else {
+        let tx = match persist_command_event(state, tenant, event, None).await? {
+            PersistResult::Inserted(tx) => tx,
+            PersistResult::Duplicate => return Ok(duplicate_result(event)),
+        };
+        let (channel, created) = state
+            .db
+            .open_dm(tenant.community(), &all_refs, &self_bytes)
+            .await
+            .map_err(|e| IngestError::Internal(format!("error: db open_dm: {e}")))?;
+        (channel, created, tx)
+    };
     tx.commit()
         .await
         .map_err(|e| IngestError::Internal(format!("error: commit transaction: {e}")))?;
@@ -656,29 +665,30 @@ async fn handle_dm_hide(
         return Err(IngestError::Rejected("invalid: channel is not a DM".into()));
     }
 
-    // Persist the command event — returns open transaction
-    let tx = match persist_command_event(state, tenant, event, None).await? {
-        PersistResult::Duplicate => {
-            return Ok(IngestResult {
-                event_id: event.id.to_hex(),
-                accepted: true,
-                message: "duplicate: already processed".into(),
-            });
-        }
-        PersistResult::Inserted(tx) => tx,
-    };
-
-    // 4. Execute: hide_dm
-    state
+    // 4. Execute. SQLite couples the command event and visibility mutation.
+    let sqlite_result = state
         .db
-        .hide_dm(tenant.community(), channel_id, &self_bytes)
+        .hide_dm_sqlite_command(tenant.community(), channel_id, &self_bytes, event)
         .await
         .map_err(|e| IngestError::Internal(format!("error: db hide_dm: {e}")))?;
-
-    // Commit: event + mutation succeeded atomically.
-    tx.commit()
-        .await
-        .map_err(|e| IngestError::Internal(format!("error: commit transaction: {e}")))?;
+    if state.config.profile.is_single_node() {
+        if sqlite_result.is_none() {
+            return Ok(duplicate_result(event));
+        }
+    } else {
+        let tx = match persist_command_event(state, tenant, event, None).await? {
+            PersistResult::Inserted(tx) => tx,
+            PersistResult::Duplicate => return Ok(duplicate_result(event)),
+        };
+        state
+            .db
+            .hide_dm(tenant.community(), channel_id, &self_bytes)
+            .await
+            .map_err(|e| IngestError::Internal(format!("error: db hide_dm: {e}")))?;
+        tx.commit()
+            .await
+            .map_err(|e| IngestError::Internal(format!("error: commit transaction: {e}")))?;
+    }
 
     // 5. Side effect (post-commit, best-effort): refresh the caller's NIP-DV
     // visibility snapshot so clients can filter this DM out of the sidebar.
@@ -793,18 +803,6 @@ async fn handle_workflow_def(
         .map_err(|e| IngestError::Internal(format!("error: json serialize: {e}")))?;
     let hash = compute_definition_hash(&definition_json_final);
 
-    // Persist the command event — returns open transaction
-    let tx = match persist_command_event(state, tenant, event, None).await? {
-        PersistResult::Duplicate => {
-            return Ok(IngestResult {
-                event_id: event.id.to_hex(),
-                accepted: true,
-                message: "duplicate: already processed".into(),
-            });
-        }
-        PersistResult::Inserted(tx) => tx,
-    };
-
     // 4. Execute: upsert by the NIP-33 d-tag UUID. A retry updates the same
     // row instead of creating another enabled workflow that would fan out on
     // every matching event. The workflow's community is the request's
@@ -823,9 +821,9 @@ async fn handle_workflow_def(
         .await
         .map_err(|_| IngestError::Rejected("invalid: workflow channel not found".into()))?;
 
-    state
+    let sqlite_result = state
         .db
-        .upsert_workflow(
+        .upsert_workflow_sqlite_command(
             community_id,
             workflow_id,
             Some(channel_id),
@@ -833,6 +831,8 @@ async fn handle_workflow_def(
             &workflow_name,
             &definition_json_final,
             &hash,
+            event,
+            &workflow_id_str,
         )
         .await
         .map_err(|e| match e {
@@ -841,6 +841,36 @@ async fn handle_workflow_def(
             ),
             other => IngestError::Internal(format!("error: db upsert_workflow: {other}")),
         })?;
+    let tx = if state.config.profile.is_single_node() {
+        if sqlite_result.is_none() {
+            return Ok(duplicate_result(event));
+        }
+        CommandTransaction::Sqlite
+    } else {
+        let tx = match persist_command_event(state, tenant, event, None).await? {
+            PersistResult::Inserted(tx) => tx,
+            PersistResult::Duplicate => return Ok(duplicate_result(event)),
+        };
+        state
+            .db
+            .upsert_workflow(
+                community_id,
+                workflow_id,
+                Some(channel_id),
+                &self_bytes,
+                &workflow_name,
+                &definition_json_final,
+                &hash,
+            )
+            .await
+            .map_err(|e| match e {
+                DbError::AccessDenied(_) => IngestError::Rejected(
+                    "forbidden: workflow belongs to a different owner or channel".into(),
+                ),
+                other => IngestError::Internal(format!("error: db upsert_workflow: {other}")),
+            })?;
+        tx
+    };
 
     // Drop the trigger-path cache entry so the new/updated definition fires on
     // the next matching event instead of after the cache TTL.
@@ -933,17 +963,6 @@ async fn handle_workflow_trigger(
     // Persist the command event under the workflow channel even though the
     // trigger event itself only carries the workflow UUID. Storing channel
     // triggers as global events leaks workflow IDs to unrelated relay members.
-    let tx = match persist_command_event(state, tenant, event, workflow.channel_id).await? {
-        PersistResult::Duplicate => {
-            return Ok(IngestResult {
-                event_id: event.id.to_hex(),
-                accepted: true,
-                message: "duplicate: already processed".into(),
-            });
-        }
-        PersistResult::Inserted(tx) => tx,
-    };
-
     // 4. Execute: create workflow run
     let mut trigger_ctx = TriggerContext {
         channel_id: workflow
@@ -967,16 +986,40 @@ async fn handle_workflow_trigger(
     let trigger_ctx_json = serde_json::to_value(&trigger_ctx).ok();
 
     let event_id_bytes = event.id.as_bytes().to_vec();
-    let run_id = state
+    let sqlite_result = state
         .db
-        .create_workflow_run(
+        .create_workflow_run_sqlite_command(
             community_id,
             workflow_id,
-            Some(&event_id_bytes),
+            &event_id_bytes,
             trigger_ctx_json.as_ref(),
+            workflow.channel_id,
+            event,
         )
         .await
         .map_err(|e| IngestError::Internal(format!("error: db create_workflow_run: {e}")))?;
+    let (run_id, tx) = if state.config.profile.is_single_node() {
+        let Some(run_id) = sqlite_result else {
+            return Ok(duplicate_result(event));
+        };
+        (run_id, CommandTransaction::Sqlite)
+    } else {
+        let tx = match persist_command_event(state, tenant, event, workflow.channel_id).await? {
+            PersistResult::Inserted(tx) => tx,
+            PersistResult::Duplicate => return Ok(duplicate_result(event)),
+        };
+        let run_id = state
+            .db
+            .create_workflow_run(
+                community_id,
+                workflow_id,
+                Some(&event_id_bytes),
+                trigger_ctx_json.as_ref(),
+            )
+            .await
+            .map_err(|e| IngestError::Internal(format!("error: db create_workflow_run: {e}")))?;
+        (run_id, tx)
+    };
 
     // Commit: event + run creation succeeded atomically.
     tx.commit()
@@ -1113,18 +1156,6 @@ async fn handle_approval_grant(
     // 4. Validate caller is authorized approver
     check_approver_spec(&approval.approver_spec, &self_hex)?;
 
-    // Persist the command event — returns open transaction
-    let tx = match persist_command_event(state, tenant, event, None).await? {
-        PersistResult::Duplicate => {
-            return Ok(IngestResult {
-                event_id: event.id.to_hex(),
-                accepted: true,
-                message: "duplicate: already processed".into(),
-            });
-        }
-        PersistResult::Inserted(tx) => tx,
-    };
-
     // 5. Execute: update approval status to granted
     let note = if event.content.is_empty() {
         None
@@ -1132,17 +1163,41 @@ async fn handle_approval_grant(
         Some(event.content.as_str())
     };
 
-    let updated = state
+    let sqlite_result = state
         .db
-        .update_approval_by_stored_hash(
+        .update_approval_sqlite_command(
             tenant.community(),
             &token_hash,
             ApprovalStatus::Granted,
             Some(&self_bytes),
             note,
+            event,
         )
         .await
         .map_err(|e| IngestError::Internal(format!("error: db update_approval: {e}")))?;
+    let (updated, tx) = if state.config.profile.is_single_node() {
+        let Some(updated) = sqlite_result else {
+            return Ok(duplicate_result(event));
+        };
+        (updated, CommandTransaction::Sqlite)
+    } else {
+        let tx = match persist_command_event(state, tenant, event, None).await? {
+            PersistResult::Inserted(tx) => tx,
+            PersistResult::Duplicate => return Ok(duplicate_result(event)),
+        };
+        let updated = state
+            .db
+            .update_approval_by_stored_hash(
+                tenant.community(),
+                &token_hash,
+                ApprovalStatus::Granted,
+                Some(&self_bytes),
+                note,
+            )
+            .await
+            .map_err(|e| IngestError::Internal(format!("error: db update_approval: {e}")))?;
+        (updated, tx)
+    };
 
     if !updated {
         return Err(IngestError::Rejected(
@@ -1224,18 +1279,6 @@ async fn handle_approval_deny(
     // 4. Validate caller is authorized approver
     check_approver_spec(&approval.approver_spec, &self_hex)?;
 
-    // Persist the command event — returns open transaction
-    let tx = match persist_command_event(state, tenant, event, None).await? {
-        PersistResult::Duplicate => {
-            return Ok(IngestResult {
-                event_id: event.id.to_hex(),
-                accepted: true,
-                message: "duplicate: already processed".into(),
-            });
-        }
-        PersistResult::Inserted(tx) => tx,
-    };
-
     // 5. Execute: update approval status to denied
     let note = if event.content.is_empty() {
         None
@@ -1243,17 +1286,41 @@ async fn handle_approval_deny(
         Some(event.content.as_str())
     };
 
-    let updated = state
+    let sqlite_result = state
         .db
-        .update_approval_by_stored_hash(
+        .update_approval_sqlite_command(
             tenant.community(),
             &token_hash,
             ApprovalStatus::Denied,
             Some(&self_bytes),
             note,
+            event,
         )
         .await
         .map_err(|e| IngestError::Internal(format!("error: db update_approval: {e}")))?;
+    let (updated, tx) = if state.config.profile.is_single_node() {
+        let Some(updated) = sqlite_result else {
+            return Ok(duplicate_result(event));
+        };
+        (updated, CommandTransaction::Sqlite)
+    } else {
+        let tx = match persist_command_event(state, tenant, event, None).await? {
+            PersistResult::Inserted(tx) => tx,
+            PersistResult::Duplicate => return Ok(duplicate_result(event)),
+        };
+        let updated = state
+            .db
+            .update_approval_by_stored_hash(
+                tenant.community(),
+                &token_hash,
+                ApprovalStatus::Denied,
+                Some(&self_bytes),
+                note,
+            )
+            .await
+            .map_err(|e| IngestError::Internal(format!("error: db update_approval: {e}")))?;
+        (updated, tx)
+    };
 
     if !updated {
         return Err(IngestError::Rejected(

@@ -1,6 +1,6 @@
 //! S3/MinIO storage client.
 
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::pin::Pin;
 
 use buzz_core::tenant::{CommunityId, TenantContext};
@@ -12,6 +12,7 @@ use futures_util::StreamExt;
 use s3::creds::Credentials;
 use s3::{Bucket, Region};
 use serde::{Deserialize, Serialize};
+use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tokio_util::io::ReaderStream;
 
 /// A stream of byte chunks from S3, usable with `axum::body::Body::from_stream()`.
@@ -102,23 +103,62 @@ impl MediaStorage {
     }
 
     fn filesystem_path(storage: &FilesystemMediaStorage, key: &str) -> Result<PathBuf, MediaError> {
+        let key_path = Path::new(key);
         if key.is_empty()
-            || key.starts_with('/')
+            || key.contains('\\')
             || key
                 .split('/')
                 .any(|part| part.is_empty() || part == "." || part == "..")
+            || key_path
+                .components()
+                .any(|component| !matches!(component, Component::Normal(_)))
         {
             return Err(MediaError::StorageError(
                 "invalid media storage key".to_owned(),
             ));
         }
-        let filename = key.rsplit('/').next().expect("validated non-empty key");
+        let filename = key_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| MediaError::StorageError("invalid media storage key".to_owned()))?;
         let sha = filename.split('.').next().unwrap_or_default();
         if sha.len() >= 4 && sha.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-            Ok(storage.root.join(&sha[..2]).join(&sha[2..4]).join(key))
+            Ok(storage.root.join(&sha[..2]).join(&sha[2..4]).join(key_path))
         } else {
-            Ok(storage.root.join("_aux").join(key))
+            Ok(storage.root.join("_aux").join(key_path))
         }
+    }
+
+    async fn atomic_filesystem_write(path: &Path, bytes: &[u8]) -> Result<(), MediaError> {
+        let parent = path
+            .parent()
+            .ok_or_else(|| MediaError::StorageError("media path has no parent".to_owned()))?;
+        tokio::fs::create_dir_all(parent)
+            .await
+            .map_err(Self::fs_error)?;
+        let temp = tempfile::NamedTempFile::new_in(parent).map_err(Self::fs_error)?;
+        tokio::fs::write(temp.path(), bytes)
+            .await
+            .map_err(Self::fs_error)?;
+        temp.persist(path)
+            .map_err(|error| Self::fs_error(error.error))?;
+        Ok(())
+    }
+
+    async fn atomic_filesystem_copy(source: &Path, target: &Path) -> Result<(), MediaError> {
+        let parent = target
+            .parent()
+            .ok_or_else(|| MediaError::StorageError("media path has no parent".to_owned()))?;
+        tokio::fs::create_dir_all(parent)
+            .await
+            .map_err(Self::fs_error)?;
+        let temp = tempfile::NamedTempFile::new_in(parent).map_err(Self::fs_error)?;
+        tokio::fs::copy(source, temp.path())
+            .await
+            .map_err(Self::fs_error)?;
+        temp.persist(target)
+            .map_err(|error| Self::fs_error(error.error))?;
+        Ok(())
     }
 
     fn fs_error(error: std::io::Error) -> MediaError {
@@ -141,12 +181,7 @@ impl MediaStorage {
             }
             MediaBackend::Filesystem(storage) => {
                 let path = Self::filesystem_path(storage, key)?;
-                if let Some(parent) = path.parent() {
-                    tokio::fs::create_dir_all(parent)
-                        .await
-                        .map_err(Self::fs_error)?;
-                }
-                tokio::fs::write(path, bytes).await.map_err(Self::fs_error)
+                Self::atomic_filesystem_write(&path, bytes).await
             }
         }
     }
@@ -173,15 +208,7 @@ impl MediaStorage {
             }
             MediaBackend::Filesystem(storage) => {
                 let target = Self::filesystem_path(storage, key)?;
-                if let Some(parent) = target.parent() {
-                    tokio::fs::create_dir_all(parent)
-                        .await
-                        .map_err(Self::fs_error)?;
-                }
-                tokio::fs::copy(path, target)
-                    .await
-                    .map(|_| ())
-                    .map_err(Self::fs_error)
+                Self::atomic_filesystem_copy(path, &target).await
             }
         }
     }
@@ -213,17 +240,25 @@ impl MediaStorage {
                 }
             }
             MediaBackend::Filesystem(storage) => {
-                let bytes = tokio::fs::read(Self::filesystem_path(storage, key)?)
-                    .await
-                    .map_err(Self::fs_error)?;
-                let start = usize::try_from(start)
-                    .map_err(|_| MediaError::StorageError("range start overflow".to_owned()))?;
-                let end = usize::try_from(end)
-                    .map_err(|_| MediaError::StorageError("range end overflow".to_owned()))?;
-                if start > end || end >= bytes.len() {
+                let path = Self::filesystem_path(storage, key)?;
+                let mut file = tokio::fs::File::open(path).await.map_err(Self::fs_error)?;
+                let length = end
+                    .checked_sub(start)
+                    .and_then(|length| length.checked_add(1))
+                    .ok_or_else(|| MediaError::StorageError("invalid media range".to_owned()))?;
+                let size = file.metadata().await.map_err(Self::fs_error)?.len();
+                if start >= size || end >= size {
                     return Err(MediaError::StorageError("invalid media range".to_owned()));
                 }
-                Ok(bytes[start..=end].to_vec())
+                file.seek(std::io::SeekFrom::Start(start))
+                    .await
+                    .map_err(Self::fs_error)?;
+                let mut bytes = Vec::with_capacity(usize::try_from(length).unwrap_or(0));
+                file.take(length)
+                    .read_to_end(&mut bytes)
+                    .await
+                    .map_err(Self::fs_error)?;
+                Ok(bytes)
             }
         }
     }
@@ -552,6 +587,31 @@ mod tests {
             err.to_string().contains("must be configured together"),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn filesystem_keys_reject_traversal_and_windows_separators() {
+        let storage = MediaStorage::filesystem(tempfile::tempdir().unwrap().path());
+        let filesystem = match &storage.backend {
+            MediaBackend::Filesystem(storage) => storage,
+            MediaBackend::S3(_) => unreachable!(),
+        };
+        for key in [
+            "",
+            "/absolute",
+            "nested//key",
+            "nested/./key",
+            "nested/../key",
+            r"nested\\key",
+            r"..\\outside",
+            r"C:\\outside",
+            r"\\\\server\\share",
+        ] {
+            assert!(
+                MediaStorage::filesystem_path(filesystem, key).is_err(),
+                "{key}"
+            );
+        }
     }
 
     #[tokio::test]

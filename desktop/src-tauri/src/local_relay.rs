@@ -5,10 +5,11 @@
 //! supervises the bundled `buzz-relay` binary.
 
 use std::{
+    io::Read,
     net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
-    sync::Mutex,
+    sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 
@@ -17,6 +18,9 @@ use tauri::{AppHandle, Manager};
 
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(15);
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
+const STDERR_TAIL_BYTES: usize = 8 * 1024;
+
+type StderrTail = Arc<Mutex<Vec<u8>>>;
 
 pub(crate) struct LocalRelayRuntime {
     child: Child,
@@ -102,64 +106,41 @@ pub(crate) fn start(
     keys: &Keys,
     requested_port: Option<u16>,
 ) -> Result<LocalRelayRuntime, String> {
-    let relay_port = requested_port.unwrap_or(free_loopback_port()?);
     let owner_pubkey = keys.public_key().to_hex();
     let data_dir = local_data_dir(app, &owner_pubkey)?;
     let relay_keys = load_or_create_relay_keys(&data_dir)?;
-    let config = LocalRelayConfig {
-        relay_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), relay_port),
-        health_port: free_loopback_port()?,
-        metrics_port: free_loopback_port()?,
-        data_dir,
-        owner_pubkey,
-        // Relay-originated events must have a separate service identity. The
-        // human key authorizes membership only and is never passed to the child.
-        relay_private_key: relay_keys.secret_key().to_secret_hex(),
-    };
-    let url = config.url();
-    let media_dir = config.data_dir.join("media");
+    let media_dir = data_dir.join("media");
     std::fs::create_dir_all(&media_dir)
         .map_err(|e| format!("create local relay media dir: {e}"))?;
-
     let binary = relay_binary()?;
-    let mut command = Command::new(&binary);
-    command
-        .envs(config.environment())
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
-    let mut child = command
-        .spawn()
-        .map_err(|e| format!("start bundled buzz-relay at {}: {e}", binary.display()))?;
 
-    let info_url = format!("http://{}/info", config.relay_addr);
-    let deadline = Instant::now() + STARTUP_TIMEOUT;
-    while Instant::now() < deadline {
-        if child
-            .try_wait()
-            .map_err(|e| format!("inspect local relay: {e}"))?
-            .is_some()
-        {
-            return Err("bundled buzz-relay exited before becoming ready".to_string());
+    // The relay owns its TCP listeners, so the desktop cannot safely retain a
+    // reservation across `spawn`. Retry a complete, distinct three-port set
+    // when an automatically-selected port loses that race; explicit user ports
+    // fail with the child diagnostic instead of silently moving the endpoint.
+    let attempts = if requested_port.is_some() { 1 } else { 3 };
+    let mut last_error = None;
+    for _ in 0..attempts {
+        let (relay_port, health_port, metrics_port) =
+            allocate_distinct_loopback_ports(requested_port)?;
+        let config = LocalRelayConfig {
+            relay_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), relay_port),
+            health_port,
+            metrics_port,
+            data_dir: data_dir.clone(),
+            owner_pubkey: owner_pubkey.clone(),
+            relay_private_key: relay_keys.secret_key().to_secret_hex(),
+        };
+
+        match spawn_and_wait(&binary, config) {
+            Ok(runtime) => return Ok(runtime),
+            Err(error) if requested_port.is_none() && is_bind_conflict(&error) => {
+                last_error = Some(error);
+            }
+            Err(error) => return Err(error),
         }
-        if reqwest::blocking::Client::new()
-            .get(&info_url)
-            .header("Accept", "application/nostr+json")
-            .send()
-            .is_ok_and(|response| response.status().is_success())
-        {
-            return Ok(LocalRelayRuntime {
-                child,
-                url,
-                owner_pubkey: config.owner_pubkey,
-            });
-        }
-        std::thread::sleep(POLL_INTERVAL);
     }
-
-    let _ = child.kill();
-    let _ = child.wait();
-    Err("bundled buzz-relay did not become ready within 15 seconds".to_string())
+    Err(last_error.expect("at least one local relay startup attempt"))
 }
 
 pub(crate) fn ensure_started(
@@ -263,6 +244,106 @@ fn load_or_create_relay_keys(data_dir: &Path) -> Result<Keys, String> {
     Ok(keys)
 }
 
+fn is_bind_conflict(error: &str) -> bool {
+    error.contains("Address already in use") || error.contains("address already in use")
+}
+
+fn spawn_and_wait(binary: &Path, config: LocalRelayConfig) -> Result<LocalRelayRuntime, String> {
+    let url = config.url();
+    let info_url = format!("http://{}/info", config.relay_addr);
+    let stderr = Arc::new(Mutex::new(Vec::new()));
+    let mut command = Command::new(binary);
+    command
+        .envs(config.environment())
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    let mut child = command
+        .spawn()
+        .map_err(|e| format!("start bundled buzz-relay at {}: {e}", binary.display()))?;
+    let stderr_reader = capture_stderr(child.stderr.take(), stderr.clone());
+
+    let client = reqwest::blocking::Client::new();
+    let deadline = Instant::now() + STARTUP_TIMEOUT;
+    while Instant::now() < deadline {
+        if let Some(status) = child
+            .try_wait()
+            .map_err(|e| format!("inspect local relay: {e}"))?
+        {
+            let _ = stderr_reader.join();
+            return Err(format!(
+                "bundled buzz-relay exited before becoming ready ({status}){}",
+                stderr_context(&stderr)
+            ));
+        }
+        if client
+            .get(&info_url)
+            .header("Accept", "application/nostr+json")
+            .send()
+            .is_ok_and(|response| response.status().is_success())
+        {
+            return Ok(LocalRelayRuntime {
+                child,
+                url,
+                owner_pubkey: config.owner_pubkey,
+            });
+        }
+        std::thread::sleep(POLL_INTERVAL);
+    }
+
+    let _ = child.kill();
+    let _ = child.wait();
+    let _ = stderr_reader.join();
+    Err(format!(
+        "bundled buzz-relay did not become ready within 15 seconds{}",
+        stderr_context(&stderr)
+    ))
+}
+
+fn capture_stderr(
+    stderr: Option<std::process::ChildStderr>,
+    tail: StderrTail,
+) -> std::thread::JoinHandle<()> {
+    std::thread::spawn(move || {
+        if let Some(mut stderr) = stderr {
+            let mut buffer = [0; 1024];
+            while let Ok(read) = stderr.read(&mut buffer) {
+                if read == 0 {
+                    break;
+                }
+                let mut tail = tail.lock().expect("stderr tail mutex poisoned");
+                tail.extend_from_slice(&buffer[..read]);
+                if tail.len() > STDERR_TAIL_BYTES {
+                    let excess = tail.len() - STDERR_TAIL_BYTES;
+                    tail.drain(..excess);
+                }
+            }
+        }
+    })
+}
+
+fn stderr_context(stderr: &StderrTail) -> String {
+    let tail = stderr.lock().expect("stderr tail mutex poisoned");
+    let text = String::from_utf8_lossy(&tail).trim().to_string();
+    (!text.is_empty())
+        .then(|| format!("; stderr: {text}"))
+        .unwrap_or_default()
+}
+
+fn allocate_distinct_loopback_ports(
+    requested_port: Option<u16>,
+) -> Result<(u16, u16, u16), String> {
+    let relay_port = requested_port.unwrap_or(free_loopback_port()?);
+    let mut ports = vec![relay_port];
+    while ports.len() < 3 {
+        let port = free_loopback_port()?;
+        if !ports.contains(&port) {
+            ports.push(port);
+        }
+    }
+    Ok((ports[0], ports[1], ports[2]))
+}
+
 fn free_loopback_port() -> Result<u16, String> {
     let listener =
         TcpListener::bind("127.0.0.1:0").map_err(|e| format!("pick local relay port: {e}"))?;
@@ -296,15 +377,34 @@ fn relay_binary() -> Result<PathBuf, String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        is_local_relay_url, load_or_create_relay_keys, local_relay_url, sqlite_url,
-        LocalRelayConfig, LOCAL_RELAY_SENTINEL,
+        allocate_distinct_loopback_ports, is_local_relay_url, load_or_create_relay_keys,
+        local_relay_url, sqlite_url, stderr_context, LocalRelayConfig, StderrTail,
+        LOCAL_RELAY_SENTINEL,
     };
     use std::{
         collections::HashMap,
         net::{IpAddr, Ipv4Addr, SocketAddr},
         path::{Path, PathBuf},
         process::{Command, Stdio},
+        sync::{Arc, Mutex},
     };
+
+    #[test]
+    fn selected_ports_are_distinct_in_one_startup_attempt() {
+        let (relay, health, metrics) = allocate_distinct_loopback_ports(None).expect("ports");
+        assert_ne!(relay, health);
+        assert_ne!(relay, metrics);
+        assert_ne!(health, metrics);
+    }
+
+    #[test]
+    fn startup_error_includes_bounded_stderr_tail() {
+        let tail: StderrTail = Arc::new(Mutex::new(b"bind: address already in use\n".to_vec()));
+        assert_eq!(
+            stderr_context(&tail),
+            "; stderr: bind: address already in use"
+        );
+    }
 
     #[test]
     fn sqlite_url_is_absolute() {
