@@ -135,7 +135,9 @@ pub(crate) struct EventQueryParityFixture {
     pub second_id: Vec<u8>,
     pub third_id: Vec<u8>,
     pub first_author: Vec<u8>,
+    pub gated_reader: Vec<u8>,
     pub p_tag_hex: String,
+    pub e_tag_hex: String,
     pub channel_id: Uuid,
 }
 
@@ -178,7 +180,7 @@ pub(crate) fn event_query_parity_vectors(
     fixture: &EventQueryParityFixture,
 ) -> Vec<(&'static str, EventQuery, Vec<Vec<u8>>, i64)> {
     let mut kinds = EventQuery::for_community(community_id);
-    kinds.kinds = Some(vec![1]);
+    kinds.kinds = Some(vec![30_175]);
 
     let mut author = EventQuery::for_community(community_id);
     author.authors = Some(vec![fixture.first_author.clone()]);
@@ -201,6 +203,14 @@ pub(crate) fn event_query_parity_vectors(
     let mut cursor = EventQuery::for_community(community_id);
     cursor.until = Some(DateTime::from_timestamp(102, 0).expect("valid timestamp"));
     cursor.before_id = Some(fixture.third_id.clone());
+    cursor.kinds = Some(vec![2, 30_023]);
+    cursor.channel_ids = Some(vec![fixture.channel_id]);
+
+    let mut e_tag = EventQuery::for_community(community_id);
+    e_tag.e_tags = Some(vec![fixture.e_tag_hex.clone(), "missing".to_string()]);
+
+    let mut gated = EventQuery::for_community(community_id);
+    gated.shared_gated_reader = Some(fixture.gated_reader.clone());
 
     let mut limited = EventQuery::for_community(community_id);
     limited.limit = Some(2);
@@ -234,8 +244,15 @@ pub(crate) fn event_query_parity_vectors(
             2,
         ),
         (
-            "cursor",
+            "cursor composition",
             cursor,
+            vec![fixture.second_id.clone(), fixture.first_id.clone()],
+            2,
+        ),
+        ("e-tag", e_tag, vec![fixture.first_id.clone()], 1),
+        (
+            "gated-reader",
+            gated,
             vec![fixture.second_id.clone(), fixture.first_id.clone()],
             2,
         ),
@@ -452,244 +469,181 @@ pub async fn query_events(pool: &PgPool, q: &EventQuery) -> Result<Vec<StoredEve
 /// [`query_events`] on a specific session — the replica-routing path runs
 /// follow-up (aux) queries on the exact reader connection whose heartbeat
 /// observation proved coverage for the page they annotate.
+fn render_event_predicates(
+    qb: &mut QueryBuilder<Postgres>,
+    predicates: &[crate::query_plan::Predicate],
+    joined_mentions: bool,
+) {
+    use crate::query_plan::Predicate;
+
+    let prefix = if joined_mentions { "e." } else { "" };
+    for predicate in predicates {
+        match predicate {
+            Predicate::MatchNone => {
+                qb.push(" AND FALSE");
+            }
+            Predicate::Community(community) => {
+                qb.push(format!(" AND {prefix}community_id = "))
+                    .push_bind(community.as_uuid());
+                if joined_mentions {
+                    qb.push(" AND m.community_id = ")
+                        .push_bind(community.as_uuid());
+                }
+            }
+            Predicate::Channel(channel) => {
+                qb.push(format!(" AND {prefix}channel_id = "))
+                    .push_bind(*channel);
+            }
+            Predicate::GlobalOnly => {
+                qb.push(format!(" AND {prefix}channel_id IS NULL"));
+            }
+            Predicate::ChannelsOrGlobal(channels) => {
+                if channels.is_empty() {
+                    qb.push(format!(" AND {prefix}channel_id IS NULL"));
+                } else {
+                    qb.push(format!(
+                        " AND ({prefix}channel_id IS NULL OR {prefix}channel_id IN ("
+                    ));
+                    let mut values = qb.separated(", ");
+                    for channel in channels {
+                        values.push_bind(*channel);
+                    }
+                    qb.push("))");
+                }
+            }
+            Predicate::Kinds(kinds) => {
+                qb.push(format!(" AND {prefix}kind IN ("));
+                let mut values = qb.separated(", ");
+                for kind in kinds {
+                    values.push_bind(*kind);
+                }
+                qb.push(")");
+            }
+            Predicate::Author(author) => {
+                qb.push(format!(" AND {prefix}pubkey = "))
+                    .push_bind(author.clone());
+            }
+            Predicate::Authors(authors) => {
+                qb.push(format!(" AND {prefix}pubkey IN ("));
+                let mut values = qb.separated(", ");
+                for author in authors {
+                    values.push_bind(author.clone());
+                }
+                qb.push(")");
+            }
+            Predicate::Ids(ids) => {
+                qb.push(format!(" AND {prefix}id IN ("));
+                let mut values = qb.separated(", ");
+                for id in ids {
+                    values.push_bind(id.clone());
+                }
+                qb.push(")");
+            }
+            Predicate::HasPTag(pubkey) => {
+                qb.push(" AND m.pubkey_hex = ").push_bind(pubkey.clone());
+            }
+            Predicate::HasETag(event_ids) => {
+                qb.push(" AND (");
+                for (index, event_id) in event_ids.iter().enumerate() {
+                    if index > 0 {
+                        qb.push(" OR ");
+                    }
+                    qb.push(format!("{prefix}tags @> "))
+                        .push_bind(serde_json::json!([["e", event_id]]));
+                }
+                qb.push(")");
+            }
+            Predicate::HasDTag(value) => {
+                qb.push(format!(" AND {prefix}d_tag = "))
+                    .push_bind(value.clone());
+            }
+            Predicate::HasAnyDTag(values) => {
+                qb.push(format!(" AND {prefix}d_tag IN ("));
+                let mut separated = qb.separated(", ");
+                for value in values {
+                    separated.push_bind(value.clone());
+                }
+                qb.push(")");
+            }
+            Predicate::Since(since) => {
+                qb.push(format!(" AND {prefix}created_at >= "))
+                    .push_bind(*since);
+            }
+            Predicate::Until(until) => {
+                qb.push(format!(" AND {prefix}created_at <= "))
+                    .push_bind(*until);
+            }
+            Predicate::CursorBefore { until, id } => {
+                qb.push(format!(" AND ({prefix}created_at < "))
+                    .push_bind(*until)
+                    .push(format!(" OR ({prefix}created_at = "))
+                    .push_bind(*until)
+                    .push(format!(" AND {prefix}id > "))
+                    .push_bind(id.clone())
+                    .push("))");
+            }
+            Predicate::GatedReader(reader) => {
+                qb.push(format!(" AND ({prefix}kind NOT IN ("));
+                let mut kinds = qb.separated(", ");
+                for kind in SHARED_GATED_KINDS {
+                    kinds.push_bind(*kind as i32);
+                }
+                qb.push(format!(") OR {prefix}pubkey = "))
+                    .push_bind(reader.clone())
+                    .push(format!(" OR {prefix}tags @> "))
+                    .push_bind(serde_json::json!([["shared", "true"]]))
+                    .push(")");
+            }
+            Predicate::LiveOnly => {
+                qb.push(format!(" AND {prefix}deleted_at IS NULL"));
+            }
+        }
+    }
+}
+
+fn event_query_builder(
+    select: &'static str,
+    plan: &crate::query_plan::QueryPlan,
+) -> (QueryBuilder<Postgres>, bool) {
+    let joined_mentions = plan
+        .predicates
+        .iter()
+        .any(|predicate| matches!(predicate, crate::query_plan::Predicate::HasPTag(_)));
+    let mut qb = if joined_mentions {
+        QueryBuilder::new(format!("{select} FROM events e INNER JOIN event_mentions m ON e.community_id = m.community_id AND e.id = m.event_id WHERE TRUE"))
+    } else {
+        QueryBuilder::new(format!("{select} FROM events WHERE TRUE"))
+    };
+    render_event_predicates(&mut qb, &plan.predicates, joined_mentions);
+    (qb, joined_mentions)
+}
+
 pub(crate) async fn query_events_on(
     conn: &mut sqlx::PgConnection,
     q: &EventQuery,
 ) -> Result<Vec<StoredEvent>> {
-    // Composite cursor requires both halves.
-    if q.before_id.is_some() && q.until.is_none() {
-        return Err(DbError::InvalidData(
-            "before_id requires until to be set".to_string(),
-        ));
-    }
-
-    // global_only and channel_id are mutually exclusive.
-    if q.global_only && q.channel_id.is_some() {
-        return Err(DbError::InvalidData(
-            "global_only and channel_id are mutually exclusive".to_string(),
-        ));
-    }
-
-    // Empty list means "match nothing" — return empty immediately.
-    if q.kinds.as_deref().is_some_and(|k| k.is_empty()) {
-        return Ok(vec![]);
-    }
-    if q.authors.as_deref().is_some_and(|a| a.is_empty()) {
-        return Ok(vec![]);
-    }
-    if q.ids.as_deref().is_some_and(|i| i.is_empty()) {
-        return Ok(vec![]);
-    }
-    if q.e_tags.as_deref().is_some_and(|e| e.is_empty()) {
-        return Ok(vec![]);
-    }
-
-    let clamp = q.max_limit.unwrap_or(DEFAULT_MAX_PAGE_LIMIT);
-    let limit_val = q.limit.unwrap_or(100).min(clamp);
-    let offset_val = q.offset.unwrap_or(0);
-
-    let mut qb: QueryBuilder<sqlx::Postgres> = if let Some(ref p_hex) = q.p_tag_hex {
-        // Join against event_mentions for #p-filtered queries (indexed).
-        let mut b = QueryBuilder::new(
-            "SELECT e.id, e.pubkey, e.created_at, e.kind, e.tags, e.content, \
-             e.sig, e.received_at, e.channel_id \
-             FROM events e \
-             INNER JOIN event_mentions m \
-                ON e.community_id = m.community_id AND e.id = m.event_id \
-             WHERE e.community_id = ",
-        );
-        b.push_bind(q.community_id.as_uuid());
-        b.push(" AND m.community_id = ");
-        b.push_bind(q.community_id.as_uuid());
-        b.push(" AND e.deleted_at IS NULL AND m.pubkey_hex = ");
-        b.push_bind(p_hex.to_ascii_lowercase());
-        b
+    let plan = crate::query_plan::plan(q)?;
+    let select = if plan
+        .predicates
+        .iter()
+        .any(|predicate| matches!(predicate, crate::query_plan::Predicate::HasPTag(_)))
+    {
+        "SELECT e.id, e.pubkey, e.created_at, e.kind, e.tags, e.content, e.sig, e.received_at, e.channel_id"
     } else {
-        let mut b = QueryBuilder::new(
-            "SELECT id, pubkey, created_at, kind, tags, content, sig, received_at, channel_id \
-             FROM events WHERE community_id = ",
-        );
-        b.push_bind(q.community_id.as_uuid());
-        b.push(" AND deleted_at IS NULL");
-        b
+        "SELECT id, pubkey, created_at, kind, tags, content, sig, received_at, channel_id"
     };
-
-    // Use unqualified column names when no join, qualified when joined.
-    let col_prefix = if q.p_tag_hex.is_some() { "e." } else { "" };
-
-    if let Some(ch) = q.channel_id {
-        qb.push(format!(" AND {col_prefix}channel_id = "))
-            .push_bind(ch);
-    } else if q.global_only {
-        qb.push(format!(" AND {col_prefix}channel_id IS NULL"));
-    }
-
-    // Multi-channel IN pushdown: restrict to events in any of these channels
-    // OR global events (channel_id IS NULL). Used by NIP-45 COUNT to enforce
-    // channel access at the SQL level without fetching all rows.
-    //
-    // SECURITY: Some(empty vec) means "user has access to NO channels" —
-    // only global events (channel_id IS NULL) should be returned.
-    if let Some(ref ch_ids) = q.channel_ids {
-        if ch_ids.is_empty() {
-            // No channel access — only global (non-channel) events visible.
-            qb.push(format!(" AND {col_prefix}channel_id IS NULL"));
-        } else {
-            qb.push(format!(
-                " AND ({col_prefix}channel_id IS NULL OR {col_prefix}channel_id IN ("
-            ));
-            let mut sep = qb.separated(", ");
-            for ch in ch_ids {
-                sep.push_bind(*ch);
-            }
-            qb.push("))");
-        }
-    }
-
-    if let Some(ks) = q.kinds.as_deref().filter(|k| !k.is_empty()) {
-        qb.push(format!(" AND {col_prefix}kind IN ("));
-        let mut sep = qb.separated(", ");
-        for k in ks {
-            sep.push_bind(*k);
-        }
-        qb.push(")");
-    }
-
-    if let Some(ref pk) = q.pubkey {
-        qb.push(format!(" AND {col_prefix}pubkey = "))
-            .push_bind(pk.clone());
-    }
-
-    // Multi-author IN pushdown (mutually exclusive with single pubkey in practice).
-    if let Some(ref authors) = q.authors {
-        if !authors.is_empty() {
-            qb.push(format!(" AND {col_prefix}pubkey IN ("));
-            let mut sep = qb.separated(", ");
-            for a in authors {
-                sep.push_bind(a.clone());
-            }
-            qb.push(")");
-        }
-    }
-
-    // Multi-id IN pushdown.
-    if let Some(ref ids) = q.ids {
-        if !ids.is_empty() {
-            qb.push(format!(" AND {col_prefix}id IN ("));
-            let mut sep = qb.separated(", ");
-            for id in ids {
-                sep.push_bind(id.clone());
-            }
-            qb.push(")");
-        }
-    }
-
-    // e-tag pushdown via JSONB containment: tags @> '[["e","<hex>"]]'.
-    // Multiple e-tags use OR (any match). Served by idx_events_tags_gin
-    // (GIN, jsonb_path_ops — migrations/0004): the channel-window aux closure
-    // fans this out once per retained row, which made unindexed containment
-    // the dominant scroll-back cost (~1.7s/page on staging).
-    if let Some(ref e_tags) = q.e_tags {
-        if !e_tags.is_empty() {
-            qb.push(" AND (");
-            for (i, hex_id) in e_tags.iter().enumerate() {
-                if i > 0 {
-                    qb.push(" OR ");
-                }
-                // Build the JSONB literal: [["e","<hex>"]]
-                let containment = serde_json::json!([["e", hex_id]]);
-                qb.push(format!("{col_prefix}tags @> "));
-                qb.push_bind(containment);
-            }
-            qb.push(")");
-        }
-    }
-
-    if let Some(s) = q.since {
-        qb.push(format!(" AND {col_prefix}created_at >= "))
-            .push_bind(s);
-    }
-    if let Some(u) = q.until {
-        if let Some(ref bid) = q.before_id {
-            // Composite keyset cursor for stable pagination.
-            // With ORDER BY created_at DESC, id ASC, "next page" means:
-            //   created_at < cursor_ts OR (created_at = cursor_ts AND id > cursor_id)
-            qb.push(format!(" AND ({col_prefix}created_at < "));
-            qb.push_bind(u);
-            qb.push(format!(" OR ({col_prefix}created_at = "));
-            qb.push_bind(u);
-            qb.push(format!(" AND {col_prefix}id > "));
-            qb.push_bind(bid.clone());
-            qb.push("))");
-        } else {
-            qb.push(format!(" AND {col_prefix}created_at <= "))
-                .push_bind(u);
-        }
-    }
-
-    if let Some(ref d) = q.d_tag {
-        qb.push(format!(" AND {col_prefix}d_tag = "))
-            .push_bind(d.clone());
-    } else if let Some(ref ds) = q.d_tags {
-        if !ds.is_empty() {
-            qb.push(format!(" AND {col_prefix}d_tag IN ("));
-            let mut sep = qb.separated(", ");
-            for d in ds {
-                sep.push_bind(d.clone());
-            }
-            qb.push(")");
-        }
-    }
-
-    // Shared-gated visibility pushdown: exclude SHARED_GATED_KINDS events that
-    // are neither authored by the reader nor explicitly shared.  Applied BEFORE
-    // ORDER/LIMIT so that a page of newer private events does not push visible
-    // shared ones off the end of the result set (the catalog query pattern).
-    //
-    // Clause: AND (kind NOT IN (30175, 30178) OR pubkey = $reader
-    //              OR tags @> '[["shared","true"]]')
-    //
-    // The JSONB containment check is served by idx_events_tags_gin (migration
-    // 0004, jsonb_path_ops).  `tags @> '[["shared","true"]]'` matches any array
-    // that contains exactly the sub-array — a two-element `["shared","true"]`
-    // tag passes; a tag-absent event does not.  Because ingest requires exactly
-    // two elements for the shared tag (parts.len() == 2), no stored event can
-    // carry a three-element superset.
-    if let Some(ref reader_bytes) = q.shared_gated_reader {
-        let shared_containment = serde_json::json!([["shared", "true"]]);
-        qb.push(format!(" AND ({col_prefix}kind NOT IN ("));
-        let mut sep = qb.separated(", ");
-        for kind in SHARED_GATED_KINDS {
-            sep.push_bind(*kind as i32);
-        }
-        qb.push(format!(") OR {col_prefix}pubkey = "));
-        qb.push_bind(reader_bytes.clone());
-        qb.push(format!(" OR {col_prefix}tags @> "));
-        qb.push_bind(shared_containment);
-        qb.push(")");
-    }
-
-    // Composite ordering for deterministic pagination across ALL callers of
-    // query_events (WebSocket REQ, REST endpoints, canvas, notes, etc.).
-    // The `id ASC` tiebreaker ensures stable results when events share the
-    // same second.  No existing index covers this trailing column — Postgres
-    // sorts in memory, which is fine at current scale.  If query performance
-    // degrades, add a composite index like `(pubkey, kind, created_at DESC, id ASC)`.
+    let (mut qb, joined_mentions) = event_query_builder(select, &plan);
+    let prefix = if joined_mentions { "e." } else { "" };
     qb.push(format!(
-        " ORDER BY {col_prefix}created_at DESC, {col_prefix}id ASC LIMIT "
-    ));
-    qb.push_bind(limit_val);
-    qb.push(" OFFSET ").push_bind(offset_val);
-
+        " ORDER BY {prefix}created_at DESC, {prefix}id ASC LIMIT "
+    ))
+    .push_bind(plan.modifiers.limit)
+    .push(" OFFSET ")
+    .push_bind(plan.modifiers.offset);
     let rows = qb.build().fetch_all(&mut *conn).await?;
-
-    let mut out = Vec::with_capacity(rows.len());
-    for row in rows {
-        if let Some(ev) = row_to_stored_event(row)? {
-            out.push(ev);
-        }
-    }
-    Ok(out)
+    rows.into_iter()
+        .filter_map(|row| row_to_stored_event(row).transpose())
+        .collect()
 }
 
 pub(crate) fn row_to_stored_event(row: sqlx::postgres::PgRow) -> Result<Option<StoredEvent>> {
@@ -747,154 +701,10 @@ pub async fn count_events(pool: &PgPool, q: &EventQuery) -> Result<i64> {
 /// the count on the exact reader connection whose heartbeat observation
 /// proved its predicate.
 pub(crate) async fn count_events_on(conn: &mut sqlx::PgConnection, q: &EventQuery) -> Result<i64> {
-    // Empty list means "match nothing" — return 0 immediately.
-    if q.kinds.as_deref().is_some_and(|k| k.is_empty()) {
-        return Ok(0);
-    }
-    if q.authors.as_deref().is_some_and(|a| a.is_empty()) {
-        return Ok(0);
-    }
-    if q.ids.as_deref().is_some_and(|i| i.is_empty()) {
-        return Ok(0);
-    }
-    if q.e_tags.as_deref().is_some_and(|e| e.is_empty()) {
-        return Ok(0);
-    }
-
-    let mut qb: QueryBuilder<sqlx::Postgres> = if let Some(ref p_hex) = q.p_tag_hex {
-        let mut b = QueryBuilder::new(
-            "SELECT COUNT(*) as cnt FROM events e \
-             INNER JOIN event_mentions m \
-                ON e.community_id = m.community_id AND e.id = m.event_id \
-             WHERE e.community_id = ",
-        );
-        b.push_bind(q.community_id.as_uuid());
-        b.push(" AND m.community_id = ");
-        b.push_bind(q.community_id.as_uuid());
-        b.push(" AND e.deleted_at IS NULL AND m.pubkey_hex = ");
-        b.push_bind(p_hex.to_ascii_lowercase());
-        b
-    } else {
-        let mut b = QueryBuilder::new("SELECT COUNT(*) as cnt FROM events WHERE community_id = ");
-        b.push_bind(q.community_id.as_uuid());
-        b.push(" AND deleted_at IS NULL");
-        b
-    };
-
-    let col_prefix = if q.p_tag_hex.is_some() { "e." } else { "" };
-
-    if let Some(ch) = q.channel_id {
-        qb.push(format!(" AND {col_prefix}channel_id = "))
-            .push_bind(ch);
-    } else if q.global_only {
-        qb.push(format!(" AND {col_prefix}channel_id IS NULL"));
-    }
-
-    // Multi-channel IN pushdown for COUNT: restrict to accessible channels + global.
-    // SECURITY: Some(empty vec) = no channel access → global events only.
-    if let Some(ref ch_ids) = q.channel_ids {
-        if ch_ids.is_empty() {
-            qb.push(format!(" AND {col_prefix}channel_id IS NULL"));
-        } else {
-            qb.push(format!(
-                " AND ({col_prefix}channel_id IS NULL OR {col_prefix}channel_id IN ("
-            ));
-            let mut sep = qb.separated(", ");
-            for ch in ch_ids {
-                sep.push_bind(*ch);
-            }
-            qb.push("))");
-        }
-    }
-
-    if let Some(ks) = q.kinds.as_deref().filter(|k| !k.is_empty()) {
-        qb.push(format!(" AND {col_prefix}kind IN ("));
-        let mut sep = qb.separated(", ");
-        for k in ks {
-            sep.push_bind(*k);
-        }
-        qb.push(")");
-    }
-
-    if let Some(ref pk) = q.pubkey {
-        qb.push(format!(" AND {col_prefix}pubkey = "))
-            .push_bind(pk.clone());
-    }
-
-    if let Some(ref authors) = q.authors {
-        if !authors.is_empty() {
-            qb.push(format!(" AND {col_prefix}pubkey IN ("));
-            let mut sep = qb.separated(", ");
-            for a in authors {
-                sep.push_bind(a.clone());
-            }
-            qb.push(")");
-        }
-    }
-
-    if let Some(ref ids) = q.ids {
-        if !ids.is_empty() {
-            qb.push(format!(" AND {col_prefix}id IN ("));
-            let mut sep = qb.separated(", ");
-            for id in ids {
-                sep.push_bind(id.clone());
-            }
-            qb.push(")");
-        }
-    }
-
-    if let Some(ref e_tags) = q.e_tags {
-        if !e_tags.is_empty() {
-            qb.push(" AND (");
-            for (i, hex_id) in e_tags.iter().enumerate() {
-                if i > 0 {
-                    qb.push(" OR ");
-                }
-                let containment = serde_json::json!([["e", hex_id]]);
-                qb.push(format!("{col_prefix}tags @> "));
-                qb.push_bind(containment);
-            }
-            qb.push(")");
-        }
-    }
-
-    if let Some(s) = q.since {
-        qb.push(format!(" AND {col_prefix}created_at >= "))
-            .push_bind(s);
-    }
-    if let Some(u) = q.until {
-        if let Some(ref bid) = q.before_id {
-            qb.push(format!(" AND ({col_prefix}created_at < "));
-            qb.push_bind(u);
-            qb.push(format!(" OR ({col_prefix}created_at = "));
-            qb.push_bind(u);
-            qb.push(format!(" AND {col_prefix}id > "));
-            qb.push_bind(bid.clone());
-            qb.push("))");
-        } else {
-            qb.push(format!(" AND {col_prefix}created_at <= "))
-                .push_bind(u);
-        }
-    }
-
-    if let Some(ref d) = q.d_tag {
-        qb.push(format!(" AND {col_prefix}d_tag = "))
-            .push_bind(d.clone());
-    } else if let Some(ref ds) = q.d_tags {
-        if !ds.is_empty() {
-            qb.push(format!(" AND {col_prefix}d_tag IN ("));
-            let mut sep = qb.separated(", ");
-            for d in ds {
-                sep.push_bind(d.clone());
-            }
-            qb.push(")");
-        }
-    }
-
+    let plan = crate::query_plan::plan(q)?;
+    let (mut qb, _) = event_query_builder("SELECT COUNT(*) AS cnt", &plan);
     let row = qb.build().fetch_one(&mut *conn).await?;
-    let cnt: i64 = row.try_get("cnt")?;
-
-    Ok(cnt)
+    Ok(row.try_get("cnt")?)
 }
 
 /// Soft-delete an event by setting `deleted_at = NOW()`.
@@ -2018,10 +1828,12 @@ mod tests {
         let first_keys = Keys::generate();
         let second_keys = Keys::generate();
         let p_tag_hex = hex::encode(second_keys.public_key().to_bytes());
+        let e_tag_hex = "ab".repeat(32);
         let first = EventBuilder::new(Kind::Custom(30_023), "first")
             .tags([
                 Tag::parse(["d", "alpha"]).unwrap(),
                 Tag::parse(["p", &p_tag_hex.to_ascii_uppercase()]).unwrap(),
+                Tag::parse(["e", &e_tag_hex]).unwrap(),
             ])
             .custom_created_at(Timestamp::from(100_u64))
             .sign_with_keys(&first_keys)
@@ -2030,7 +1842,7 @@ mod tests {
             .custom_created_at(Timestamp::from(101_u64))
             .sign_with_keys(&second_keys)
             .unwrap();
-        let third = EventBuilder::new(Kind::Custom(1), "third")
+        let third = EventBuilder::new(Kind::Custom(30_175), "third")
             .custom_created_at(Timestamp::from(102_u64))
             .sign_with_keys(&first_keys)
             .unwrap();
@@ -2049,7 +1861,9 @@ mod tests {
             second_id: second.id.as_bytes().to_vec(),
             third_id: third.id.as_bytes().to_vec(),
             first_author: first.pubkey.to_bytes().to_vec(),
+            gated_reader: second.pubkey.to_bytes().to_vec(),
             p_tag_hex,
+            e_tag_hex,
             channel_id,
         };
         for (name, query, expected_ids, expected_count) in

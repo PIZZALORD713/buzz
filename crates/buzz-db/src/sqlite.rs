@@ -1165,144 +1165,147 @@ pub(crate) async fn get_events_by_ids(
         .collect()
 }
 
+fn render_sqlite_event_predicates(
+    qb: &mut sqlx::QueryBuilder<sqlx::Sqlite>,
+    predicates: &[crate::query_plan::Predicate],
+) {
+    use crate::query_plan::Predicate;
+
+    for predicate in predicates {
+        match predicate {
+            Predicate::MatchNone => {
+                qb.push(" AND FALSE");
+            }
+            Predicate::Community(community) => {
+                qb.push(" AND community_id = ")
+                    .push_bind(community.as_uuid().to_string());
+            }
+            Predicate::Channel(channel) => {
+                qb.push(" AND channel_id = ").push_bind(channel.to_string());
+            }
+            Predicate::GlobalOnly => {
+                qb.push(" AND channel_id IS NULL");
+            }
+            Predicate::ChannelsOrGlobal(channels) => {
+                if channels.is_empty() {
+                    qb.push(" AND channel_id IS NULL");
+                } else {
+                    qb.push(" AND (channel_id IS NULL OR channel_id IN (");
+                    let mut values = qb.separated(", ");
+                    for channel in channels {
+                        values.push_bind(channel.to_string());
+                    }
+                    qb.push("))");
+                }
+            }
+            Predicate::Kinds(kinds) => {
+                qb.push(" AND kind IN (");
+                let mut values = qb.separated(", ");
+                for kind in kinds {
+                    values.push_bind(*kind);
+                }
+                qb.push(")");
+            }
+            Predicate::Author(author) => {
+                qb.push(" AND pubkey = ").push_bind(author.clone());
+            }
+            Predicate::Authors(authors) => {
+                qb.push(" AND pubkey IN (");
+                let mut values = qb.separated(", ");
+                for author in authors {
+                    values.push_bind(author.clone());
+                }
+                qb.push(")");
+            }
+            Predicate::Ids(ids) => {
+                qb.push(" AND id IN (");
+                let mut values = qb.separated(", ");
+                for id in ids {
+                    values.push_bind(id.clone());
+                }
+                qb.push(")");
+            }
+            Predicate::HasPTag(pubkey) => {
+                qb.push(" AND EXISTS (SELECT 1 FROM json_each(tags_json) tag WHERE json_extract(tag.value, '$[0]') = 'p' AND LOWER(json_extract(tag.value, '$[1]')) = ")
+                    .push_bind(pubkey.clone()).push(")");
+            }
+            Predicate::HasETag(event_ids) => {
+                qb.push(" AND EXISTS (SELECT 1 FROM json_each(tags_json) tag WHERE json_extract(tag.value, '$[0]') = 'e' AND json_extract(tag.value, '$[1]') IN (");
+                let mut values = qb.separated(", ");
+                for id in event_ids {
+                    values.push_bind(id.clone());
+                }
+                qb.push("))");
+            }
+            Predicate::HasDTag(value) => {
+                qb.push(" AND (SELECT json_extract(tag.value, '$[1]') FROM json_each(tags_json) tag WHERE json_extract(tag.value, '$[0]') = 'd' ORDER BY tag.key LIMIT 1) = ")
+                    .push_bind(value.clone());
+            }
+            Predicate::HasAnyDTag(values) => {
+                qb.push(" AND (SELECT json_extract(tag.value, '$[1]') FROM json_each(tags_json) tag WHERE json_extract(tag.value, '$[0]') = 'd' ORDER BY tag.key LIMIT 1) IN (");
+                let mut separated = qb.separated(", ");
+                for value in values {
+                    separated.push_bind(value.clone());
+                }
+                qb.push(")");
+            }
+            Predicate::Since(since) => {
+                qb.push(" AND created_at >= ").push_bind(since.timestamp());
+            }
+            Predicate::Until(until) => {
+                qb.push(" AND created_at <= ").push_bind(until.timestamp());
+            }
+            Predicate::CursorBefore { until, id } => {
+                qb.push(" AND (created_at < ")
+                    .push_bind(until.timestamp())
+                    .push(" OR (created_at = ")
+                    .push_bind(until.timestamp())
+                    .push(" AND id > ")
+                    .push_bind(id.clone())
+                    .push("))");
+            }
+            Predicate::GatedReader(reader) => {
+                qb.push(" AND (kind NOT IN (");
+                let mut kinds = qb.separated(", ");
+                for kind in buzz_core::kind::SHARED_GATED_KINDS {
+                    kinds.push_bind(*kind as i32);
+                }
+                qb.push(") OR pubkey = ").push_bind(reader.clone())
+                    .push(" OR EXISTS (SELECT 1 FROM json_each(tags_json) tag WHERE json_extract(tag.value, '$[0]') = 'shared' AND json_extract(tag.value, '$[1]') = 'true'))");
+            }
+            Predicate::LiveOnly => {}
+        }
+    }
+}
+
 pub(crate) async fn query_events(
     pool: &SqlitePool,
     q: &crate::EventQuery,
 ) -> Result<Vec<buzz_core::StoredEvent>> {
-    if q.before_id.is_some() && q.until.is_none() {
-        return Err(crate::DbError::InvalidData(
-            "before_id requires until to be set".into(),
-        ));
-    }
-    if q.global_only && q.channel_id.is_some() {
-        return Err(crate::DbError::InvalidData(
-            "global_only and channel_id are mutually exclusive".into(),
-        ));
-    }
-    if q.kinds.as_ref().is_some_and(Vec::is_empty)
-        || q.authors.as_ref().is_some_and(Vec::is_empty)
-        || q.ids.as_ref().is_some_and(Vec::is_empty)
-        || q.e_tags.as_ref().is_some_and(Vec::is_empty)
-    {
-        return Ok(vec![]);
-    }
-    let rows = sqlx::query("SELECT event_json, received_at, channel_id FROM events WHERE community_id = ?1 ORDER BY created_at DESC, id ASC")
-        .bind(q.community_id.as_uuid().to_string()).fetch_all(pool).await?;
-    let mut events = Vec::new();
-    for row in rows {
-        let stored = stored_event(row)?;
-        let event = &stored.event;
-        let created = event.created_at.as_secs() as i64;
-        let id = event.id.as_bytes().as_slice();
-        let tags: Vec<Vec<String>> = event
-            .tags
-            .iter()
-            .map(|tag| tag.as_slice().to_vec())
-            .collect();
-        let has_tag = |name: &str, value: &str| {
-            tags.iter().any(|tag| {
-                tag.first().is_some_and(|v| v == name) && tag.get(1).is_some_and(|v| v == value)
-            })
-        };
-        if q.channel_id.is_some_and(|ch| stored.channel_id != Some(ch))
-            || (q.global_only && stored.channel_id.is_some())
-        {
-            continue;
-        }
-        if q.channel_ids
-            .as_ref()
-            .is_some_and(|ids| stored.channel_id.is_some_and(|id| !ids.contains(&id)))
-        {
-            continue;
-        }
-        if q.kinds
-            .as_ref()
-            .is_some_and(|ks| !ks.contains(&(event.kind.as_u16() as i32)))
-        {
-            continue;
-        }
-        if q.pubkey
-            .as_ref()
-            .is_some_and(|pk| pk.as_slice() != event.pubkey.to_bytes().as_slice())
-        {
-            continue;
-        }
-        if q.authors.as_ref().is_some_and(|authors| {
-            !authors
-                .iter()
-                .any(|pk| pk.as_slice() == event.pubkey.to_bytes().as_slice())
-        }) {
-            continue;
-        }
-        if q.ids
-            .as_ref()
-            .is_some_and(|ids| !ids.iter().any(|candidate| candidate.as_slice() == id))
-        {
-            continue;
-        }
-        if q.since.is_some_and(|since| created < since.timestamp())
-            || q.until.is_some_and(|until| created > until.timestamp())
-        {
-            continue;
-        }
-        if q.before_id.as_ref().is_some_and(|before| {
-            q.until.is_some_and(|until| created == until.timestamp()) && id <= before.as_slice()
-        }) {
-            continue;
-        }
-        if q.p_tag_hex.as_ref().is_some_and(|p| {
-            !tags.iter().any(|tag| {
-                tag.first().is_some_and(|name| name == "p")
-                    && tag
-                        .get(1)
-                        .is_some_and(|value| value.eq_ignore_ascii_case(p))
-            })
-        }) {
-            continue;
-        }
-        if q.e_tags
-            .as_ref()
-            .is_some_and(|values| !values.iter().any(|value| has_tag("e", value)))
-        {
-            continue;
-        }
-        let d_tag = tags
-            .iter()
-            .find(|tag| tag.first().is_some_and(|v| v == "d"))
-            .and_then(|tag| tag.get(1));
-        if q.d_tag.as_ref().is_some_and(|d| d_tag != Some(d)) {
-            continue;
-        }
-        if q.d_tags
-            .as_ref()
-            .is_some_and(|ds| !d_tag.is_some_and(|d| ds.contains(d)))
-        {
-            continue;
-        }
-        if q.shared_gated_reader.as_ref().is_some_and(|reader| {
-            buzz_core::kind::SHARED_GATED_KINDS.contains(&(event.kind.as_u16() as u32))
-                && reader.as_slice() != event.pubkey.to_bytes().as_slice()
-                && !has_tag("shared", "true")
-        }) {
-            continue;
-        }
-        events.push(stored);
-    }
-    let offset = q.offset.unwrap_or(0).max(0) as usize;
-    let limit = q
-        .limit
-        .unwrap_or(100)
-        .min(q.max_limit.unwrap_or(crate::DEFAULT_MAX_PAGE_LIMIT))
-        .max(0) as usize;
-    Ok(events.into_iter().skip(offset).take(limit).collect())
+    let plan = crate::query_plan::plan(q)?;
+    let mut qb = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
+        "SELECT event_json, received_at, channel_id FROM events WHERE TRUE",
+    );
+    render_sqlite_event_predicates(&mut qb, &plan.predicates);
+    qb.push(" ORDER BY created_at DESC, id ASC LIMIT ")
+        .push_bind(plan.modifiers.limit.max(0))
+        .push(" OFFSET ")
+        .push_bind(plan.modifiers.offset.max(0));
+    qb.build()
+        .fetch_all(pool)
+        .await?
+        .into_iter()
+        .map(stored_event)
+        .collect()
 }
 
 pub(crate) async fn count_events(pool: &SqlitePool, q: &crate::EventQuery) -> Result<i64> {
-    let mut unpaged = q.clone();
-    unpaged.offset = None;
-    unpaged.limit = Some(i64::MAX);
-    unpaged.max_limit = Some(i64::MAX);
-    Ok(query_events(pool, &unpaged).await?.len() as i64)
+    let plan = crate::query_plan::plan(q)?;
+    let mut qb =
+        sqlx::QueryBuilder::<sqlx::Sqlite>::new("SELECT COUNT(*) AS cnt FROM events WHERE TRUE");
+    render_sqlite_event_predicates(&mut qb, &plan.predicates);
+    let row = qb.build().fetch_one(pool).await?;
+    Ok(row.try_get("cnt")?)
 }
 
 pub(crate) async fn huddle_started_link_exists(
@@ -4594,10 +4597,12 @@ mod tests {
         let first_keys = Keys::generate();
         let second_keys = Keys::generate();
         let p_tag_hex = hex::encode(second_keys.public_key().to_bytes());
+        let e_tag_hex = "ab".repeat(32);
         let first = EventBuilder::new(Kind::Custom(30_023), "first")
             .tags([
                 Tag::parse(["d", "alpha"]).unwrap(),
                 Tag::parse(["p", &p_tag_hex.to_ascii_uppercase()]).unwrap(),
+                Tag::parse(["e", &e_tag_hex]).unwrap(),
             ])
             .custom_created_at(Timestamp::from(100_u64))
             .sign_with_keys(&first_keys)
@@ -4606,7 +4611,7 @@ mod tests {
             .custom_created_at(Timestamp::from(101_u64))
             .sign_with_keys(&second_keys)
             .unwrap();
-        let third = EventBuilder::new(Kind::Custom(1), "third")
+        let third = EventBuilder::new(Kind::Custom(30_175), "third")
             .custom_created_at(Timestamp::from(102_u64))
             .sign_with_keys(&first_keys)
             .unwrap();
@@ -4623,7 +4628,9 @@ mod tests {
             second_id: second.id.as_bytes().to_vec(),
             third_id: third.id.as_bytes().to_vec(),
             first_author: first.pubkey.to_bytes().to_vec(),
+            gated_reader: second.pubkey.to_bytes().to_vec(),
             p_tag_hex,
+            e_tag_hex,
             channel_id,
         };
         for (name, query, expected_ids, expected_count) in

@@ -37,6 +37,7 @@ pub mod partition;
 pub mod product_feedback;
 /// Community-scoped push lease and durable wake-outbox persistence.
 pub mod push;
+mod query_plan;
 /// Reaction persistence.
 pub mod reaction;
 /// Use-limited relay invite persistence (v2 opaque tokens).
