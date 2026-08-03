@@ -3208,7 +3208,6 @@ mod tests {
                 git_pointer_keys: Vec::new(),
                 media_sidecar_keys: Vec::new(),
                 media_upload_keys: Vec::new(),
-                retained_shared_cas_keys: Vec::new(),
                 unknown_keys: Vec::new(),
                 unsupported_version_keys: Vec::new(),
             },
