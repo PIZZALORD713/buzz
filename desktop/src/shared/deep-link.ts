@@ -162,14 +162,42 @@ export async function listenForDeepLinks(
   };
 }
 
+async function drainPendingNavigationDeepLinks(
+  onOpenChannel: (payload: ChannelDeepLinkPayload) => boolean,
+  onOpenMessage: (payload: MessageDeepLinkPayload) => boolean,
+) {
+  while (true) {
+    const pending = await invoke<PendingNavigationDeepLink | null>(
+      "take_pending_navigation_deep_link",
+    );
+    if (!pending) return;
+    const accepted =
+      pending.kind === "channel"
+        ? onOpenChannel({ channelId: pending.channelId })
+        : pending.messageId
+          ? onOpenMessage({
+              channelId: pending.channelId,
+              messageId: pending.messageId,
+              threadRootId: pending.threadRootId,
+            })
+          : false;
+    if (!accepted) return;
+    const acknowledged = await invoke<boolean>(
+      "acknowledge_pending_navigation_deep_link",
+      { id: pending.id },
+    );
+    if (!acknowledged) return;
+  }
+}
+
 /**
- * Register a listener for `deep-link-message` events. Must be called from
- * inside the router tree (e.g. AppShell) because the navigation callback
- * uses TanStack Router state.
+ * Register listeners for queued channel/message navigation emitted by Rust.
+ * A consumer must explicitly accept each item before it is acknowledged, so
+ * effect teardown leaves an in-flight queue head available for the next mount.
  */
 export async function listenForNavigationDeepLinks(
-  onOpenChannel: (payload: ChannelDeepLinkPayload) => void,
-  onOpenMessage: (payload: MessageDeepLinkPayload) => void,
+  onOpenChannel: (payload: ChannelDeepLinkPayload) => boolean,
+  onOpenMessage: (payload: MessageDeepLinkPayload) => boolean,
 ): Promise<UnlistenFn> {
   let drainRunning = false;
   let drainRequested = false;
@@ -181,26 +209,7 @@ export async function listenForNavigationDeepLinks(
       try {
         while (drainRequested) {
           drainRequested = false;
-          while (true) {
-            const pending = await invoke<PendingNavigationDeepLink | null>(
-              "take_pending_navigation_deep_link",
-            );
-            if (!pending) break;
-            if (pending.kind === "channel") {
-              onOpenChannel({ channelId: pending.channelId });
-            } else if (pending.messageId) {
-              onOpenMessage({
-                channelId: pending.channelId,
-                messageId: pending.messageId,
-                threadRootId: pending.threadRootId,
-              });
-            }
-            const acknowledged = await invoke<boolean>(
-              "acknowledge_pending_navigation_deep_link",
-              { id: pending.id },
-            );
-            if (!acknowledged) break;
-          }
+          await drainPendingNavigationDeepLinks(onOpenChannel, onOpenMessage);
         }
       } catch (error: unknown) {
         console.warn("Failed to drain pending navigation deep links", error);

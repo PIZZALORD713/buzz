@@ -26,15 +26,17 @@ export function useMessageDeepLinks(enabled = true) {
     let cancelled = false;
     const unlistenPromise = listenForNavigationDeepLinks(
       (payload) => {
-        if (cancelled) return;
+        if (cancelled) return false;
         void goChannel(payload.channelId);
+        return true;
       },
       (payload) => {
-        if (cancelled) return;
+        if (cancelled) return false;
         void goChannel(payload.channelId, {
           messageId: payload.messageId,
           threadRootId: payload.threadRootId,
         });
+        return true;
       },
     );
     return () => {
