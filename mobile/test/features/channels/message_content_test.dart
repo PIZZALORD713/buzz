@@ -603,6 +603,32 @@ void main() {
         );
       });
 
+      testWidgets('routes rendered Buzz channel links through callback', (
+        tester,
+      ) async {
+        const channelId = '580ca78b-9dae-46f3-8854-bd671853ba32';
+        const url = 'buzz://channel/$channelId';
+        String? tappedChannelId;
+
+        await tester.pumpWidget(
+          _testable(
+            MessageContent(
+              content: '[Open channel]($url)',
+              onChannelTap: (id) => tappedChannelId = id,
+            ),
+          ),
+        );
+
+        await tester.tap(find.text('Open channel'));
+        await tester.pump();
+
+        expect(tappedChannelId, channelId);
+        final container = ProviderScope.containerOf(
+          tester.element(find.byType(MessageContent)),
+        );
+        expect(container.read(pendingDeepLinkProvider), isNull);
+      });
+
       testWidgets('renders and routes autolinked Buzz channel links', (
         tester,
       ) async {

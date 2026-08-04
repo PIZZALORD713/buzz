@@ -299,8 +299,15 @@ class MessageContent extends HookConsumerWidget {
         followLinkColor: false,
         codeBuilder: (context, name, code, closed) =>
             _MessageCodeBlock(name: name, code: code),
-        linkBuilder: (context, linkText, url, linkStyle) =>
-            _buildLink(context, ref, linkText, url, linkStyle, style),
+        linkBuilder: (context, linkText, url, linkStyle) => _buildLink(
+          context,
+          ref,
+          linkText,
+          url,
+          linkStyle,
+          style,
+          resolvedChannelTap,
+        ),
         imageBuilder: (context, imageUrl) =>
             _buildMedia(context, imageUrl, imetaByUrl[imageUrl]),
         maxLines: maxLines,
@@ -365,6 +372,7 @@ class MessageContent extends HookConsumerWidget {
     String url,
     TextStyle linkStyle,
     TextStyle? fallbackStyle,
+    void Function(String channelId) resolvedChannelTap,
   ) {
     String text = '';
     linkText.visitChildren((span) {
@@ -381,12 +389,15 @@ class MessageContent extends HookConsumerWidget {
         final uri = Uri.tryParse(url);
         if (uri == null) return;
 
-        // `buzz://message` and `buzz://join` are app-owned links. Park the
-        // parsed target so the top-level dispatcher can route it once the
-        // authenticated/channel UI is ready; do not hand it to an OS browser,
-        // which is what made rendered mobile deep links inert.
+        // Rendered channel URLs must use the same callback as `#channel`
+        // references so detail-page callers can suppress self-navigation.
+        // Message and join links still need the top-level authenticated
+        // dispatcher.
         if (uri.scheme == 'buzz') {
-          if (parseBuzzDeepLink(uri) != null) {
+          final deepLink = parseBuzzDeepLink(uri);
+          if (deepLink case ChannelDeepLink(:final channelId)) {
+            resolvedChannelTap(channelId);
+          } else if (deepLink != null) {
             ref.read(pendingDeepLinkProvider.notifier).open(uri);
           }
           return;
