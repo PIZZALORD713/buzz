@@ -84,6 +84,9 @@ pub struct AdminReportsQuery {
 
 // ── Probe ─────────────────────────────────────────────────────────────────
 
+/// A boxed signing closure: given a URL, returns a `Nostr <token>` Authorization header.
+type SignFn = Box<dyn Fn(&str) -> Result<String, String> + Send + Sync>;
+
 /// Probe an admin origin to determine the authentication mode and whether the
 /// current app keypair is authorized.
 ///
@@ -105,7 +108,29 @@ pub async fn admin_probe(
 ) -> Result<AdminProbeResult, String> {
     use crate::relay::build_nip98_auth_header_for_keys;
 
-    let origin = origin::AdminOrigin::parse(&origin)?;
+    // Resolve signing keys before entering the inner probe. Recovery mode
+    // (locked/lost keyring) is surfaced here rather than inside the loop.
+    let sign: Option<SignFn> = match state.signing_keys() {
+        Ok(keys) => Some(Box::new(move |url: &str| {
+            build_nip98_auth_header_for_keys(&keys, &reqwest::Method::GET, url, &[])
+                .map_err(|e| format!("nip98 build failed: {e}"))
+        })),
+        Err(_) => None,
+    };
+
+    admin_probe_inner(&origin, sign).await
+}
+
+/// Inner probe implementation with injectable signing.
+///
+/// Accepts an optional signing closure so live-listener tests can drive the
+/// full state machine — including the Nostr challenge/response path — without
+/// requiring a real `AppState`. `None` simulates recovery mode (no key).
+async fn admin_probe_inner(
+    origin: &str,
+    sign: Option<impl Fn(&str) -> Result<String, String>>,
+) -> Result<AdminProbeResult, String> {
+    let origin = origin::AdminOrigin::parse(origin)?;
     let url = origin.route_url(
         &routes::AdminRoute::ReportsList,
         &routes::AdminQuery {
@@ -138,8 +163,9 @@ pub async fn admin_probe(
 
     // Step 3: success without auth → disabled mode (if body is a valid list).
     if resp.status().is_success() {
+        let content_type = response_content_type(&resp);
         let bytes = read_bounded(resp, SUCCESS_JSON_CAP).await?;
-        return if looks_like_admin_list(&bytes) {
+        return if looks_like_admin_list(&content_type, &bytes) {
             Ok(AdminProbeResult::Disabled)
         } else {
             Ok(AdminProbeResult::NotAdminApi)
@@ -157,13 +183,10 @@ pub async fn admin_probe(
 
         if www_auth.starts_with("nostr") {
             // NIP-98 mode: try signing.
-            let keys = match state.signing_keys() {
-                Ok(k) => k,
-                Err(_) => return Ok(AdminProbeResult::Nip98Denied),
+            let auth_header = match &sign {
+                Some(f) => f(&url)?,
+                None => return Ok(AdminProbeResult::Nip98Denied),
             };
-            let auth_header =
-                build_nip98_auth_header_for_keys(&keys, &reqwest::Method::GET, &url, &[])
-                    .map_err(|e| format!("nip98 build failed: {e}"))?;
             let auth_resp = match http_client
                 .get(&url)
                 .header(reqwest::header::AUTHORIZATION, &auth_header)
@@ -174,6 +197,11 @@ pub async fn admin_probe(
                 Err(_) => return Ok(AdminProbeResult::NetworkOrIntercepted),
             };
 
+            // Redirects on the authenticated retry are also interception.
+            if auth_resp.status().is_redirection() {
+                return Ok(AdminProbeResult::NetworkOrIntercepted);
+            }
+
             // Validate the Authorization header was accepted by checking for HTML.
             if is_probe_response_intercepted(&auth_resp) {
                 return Ok(AdminProbeResult::NetworkOrIntercepted);
@@ -181,8 +209,9 @@ pub async fn admin_probe(
 
             if auth_resp.status().is_success() {
                 // Validate the Nostr header shape was accepted (not just any 2xx).
+                let content_type = response_content_type(&auth_resp);
                 let bytes = read_bounded(auth_resp, SUCCESS_JSON_CAP).await?;
-                return if looks_like_admin_list(&bytes) {
+                return if looks_like_admin_list(&content_type, &bytes) {
                     Ok(AdminProbeResult::Nip98Authorized)
                 } else {
                     // Endpoint exists but didn't return the expected list shape.
@@ -248,14 +277,55 @@ async fn read_bounded(resp: reqwest::Response, cap: u64) -> Result<Vec<u8>, Stri
     Ok(bytes)
 }
 
-/// Returns true when `bytes` deserialises to a JSON array (the shape returned
-/// by the `/api/admin/v1/reports?limit=1` endpoint). Used to distinguish a
-/// real admin API from a non-admin endpoint or captive-portal JSON.
-fn looks_like_admin_list(bytes: &[u8]) -> bool {
-    matches!(
-        serde_json::from_slice::<serde_json::Value>(bytes),
-        Ok(serde_json::Value::Array(_))
-    )
+/// Returns true when `content_type` is JSON and `bytes` deserialises to a
+/// JSON array matching the `/api/admin/v1/reports` shape.
+///
+/// Rules:
+/// - Content-Type must start with `application/json` (case-insensitive).
+/// - Body must be a JSON array.
+/// - Non-empty arrays must have at least one element with an `id` field
+///   (the minimum field present on every `AdminReport` and `AdminFeedback`).
+///   An empty array is valid — a fresh relay with no reports returns `[]`.
+///
+/// This prevents unrelated endpoints that return JSON arrays (e.g. `[1, 2]`,
+/// `["unrelated"]`) from being misclassified as the admin API.
+fn looks_like_admin_list(content_type: &str, bytes: &[u8]) -> bool {
+    // Require JSON Content-Type.
+    if !content_type
+        .to_ascii_lowercase()
+        .starts_with("application/json")
+    {
+        return false;
+    }
+    // Body must be a JSON array.
+    let arr = match serde_json::from_slice::<serde_json::Value>(bytes) {
+        Ok(serde_json::Value::Array(a)) => a,
+        _ => return false,
+    };
+    // Empty array is valid (fresh relay with no reports).
+    if arr.is_empty() {
+        return true;
+    }
+    // Non-empty: at least one element must be an object with an `id` field,
+    // matching the AdminReport / AdminFeedback minimum wire contract.
+    arr.iter().any(|v| {
+        v.as_object()
+            .map(|obj| obj.contains_key("id"))
+            .unwrap_or(false)
+    })
+}
+
+/// Extract the normalised Content-Type base value (strips parameters).
+fn response_content_type(resp: &reqwest::Response) -> String {
+    resp.headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase()
 }
 
 // ── Five typed data commands ──────────────────────────────────────────────
@@ -439,10 +509,13 @@ pub fn get_admin_origin(
         Err(e) => {
             // Quarantine invalid content: remove the file so the settings card
             // shows a clear setup error rather than looping with a stale value.
-            let _ = std::fs::remove_file(&path);
-            return Err(format!(
-                "stored admin console origin is invalid (removed): {e}"
-            ));
+            let remove_result = std::fs::remove_file(&path);
+            return Err(match remove_result {
+                Ok(()) => format!("stored admin console origin is invalid (removed): {e}"),
+                Err(re) => format!(
+                    "stored admin console origin is invalid (quarantine failed — {re}): {e}"
+                ),
+            });
         }
     };
     // Reparse through AdminOrigin::parse() so the returned value is always
@@ -450,10 +523,13 @@ pub fn get_admin_origin(
     match origin::AdminOrigin::parse(&stored.origin) {
         Ok(o) => Ok(Some(o.as_str().to_string())),
         Err(e) => {
-            let _ = std::fs::remove_file(&path);
-            Err(format!(
-                "stored admin console origin is invalid (removed): {e}"
-            ))
+            let remove_result = std::fs::remove_file(&path);
+            Err(match remove_result {
+                Ok(()) => format!("stored admin console origin is invalid (removed): {e}"),
+                Err(re) => format!(
+                    "stored admin console origin is invalid (quarantine failed — {re}): {e}"
+                ),
+            })
         }
     }
 }
@@ -683,247 +759,5 @@ async fn read_admin_response(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::commands::admin::{origin::AdminOrigin, routes::AdminRoute};
-
-    // ── AdminOrigin × routes integration ─────────────────────────────────────
-
-    #[test]
-    fn reports_list_url_contains_api_prefix() {
-        let o = AdminOrigin::parse("https://admin.example.com").unwrap();
-        let url = o.route_url(&AdminRoute::ReportsList, &routes::AdminQuery::default());
-        assert!(
-            url.starts_with("https://admin.example.com/api/admin/v1/"),
-            "URL must include /api/admin/v1/ prefix: {url}"
-        );
-    }
-
-    #[test]
-    fn localhost_uses_http_prefix() {
-        let o = AdminOrigin::parse("http://localhost:3000").unwrap();
-        let url = o.route_url(&AdminRoute::FeedbackList, &routes::AdminQuery::default());
-        assert!(url.starts_with("http://localhost:3000/api/admin/v1/"));
-    }
-
-    // ── Attachment command validation (calls production validators) ───────────
-
-    #[test]
-    fn attachment_hash_valid_lowercase_hex_accepted() {
-        // Calls the real AttachmentHash::parse production validator.
-        let result = routes::AttachmentHash::parse(&"a".repeat(64));
-        assert!(result.is_ok(), "64 lowercase hex chars must be accepted");
-    }
-
-    #[test]
-    fn attachment_hash_uppercase_rejected_by_production_validator() {
-        let result = routes::AttachmentHash::parse(&"A".repeat(64));
-        assert!(
-            result.is_err(),
-            "uppercase hex must be rejected — relay returns 404 for uppercase hashes"
-        );
-    }
-
-    #[test]
-    fn attachment_hash_63_chars_rejected_by_production_validator() {
-        let result = routes::AttachmentHash::parse(&"a".repeat(63));
-        assert!(result.is_err(), "63 chars must be rejected");
-    }
-
-    #[test]
-    fn feedback_id_malformed_uuid_rejected_by_production_validator() {
-        let result = uuid::Uuid::parse_str("not-a-uuid");
-        assert!(result.is_err(), "non-UUID feedback id must be rejected");
-    }
-
-    #[test]
-    fn feedback_id_slash_injection_rejected() {
-        let result = uuid::Uuid::parse_str("../../../etc/passwd");
-        assert!(
-            result.is_err(),
-            "path traversal in feedback id must be rejected"
-        );
-    }
-
-    #[test]
-    fn feedback_id_query_injection_rejected() {
-        let result = uuid::Uuid::parse_str("00000000-0000-0000-0000-000000000001?x=y");
-        assert!(
-            result.is_err(),
-            "query injection in feedback id must be rejected"
-        );
-    }
-
-    // ── Content-Type matching (calls production logic) ────────────────────────
-
-    #[test]
-    fn content_type_matching_is_case_insensitive_and_strips_params() {
-        // finish_attachment_response normalises content_type with .to_ascii_lowercase()
-        // and splits on ';' to strip charset params.
-        let raw = "Image/PNG; charset=binary";
-        let normalised = raw.split(';').next().unwrap().trim().to_ascii_lowercase();
-        assert_eq!(normalised, "image/png");
-        assert_eq!(normalised, "image/png".trim().to_ascii_lowercase());
-    }
-
-    // ── looks_like_admin_list ─────────────────────────────────────────────────
-
-    #[test]
-    fn looks_like_admin_list_json_array() {
-        assert!(looks_like_admin_list(b"[]"));
-        assert!(looks_like_admin_list(b"[{\"id\":\"abc\"}]"));
-    }
-
-    #[test]
-    fn looks_like_admin_list_rejects_non_array() {
-        assert!(!looks_like_admin_list(b"{}"));
-        assert!(!looks_like_admin_list(b"\"string\""));
-        assert!(!looks_like_admin_list(b"null"));
-        assert!(!looks_like_admin_list(b"<html>captive portal</html>"));
-        assert!(!looks_like_admin_list(b"not json"));
-    }
-
-    // ── is_probe_response_intercepted (via live stub server) ─────────────────
-
-    /// Build a fake Response using a live TCP listener that serves the given
-    /// status + headers + body, then returns the parsed reqwest::Response.
-    async fn fake_response(status: u16, headers: &str, body: &str) -> reqwest::Response {
-        use client::ADMIN_CLIENT;
-        use std::io::{Read, Write};
-        client::init_admin_client();
-        let client = ADMIN_CLIENT.get().unwrap();
-
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap();
-        let body_bytes = body.as_bytes().to_vec();
-        let body_len = body_bytes.len();
-        let response = format!(
-            "HTTP/1.1 {status} OK\r\n\
-             Content-Length: {body_len}\r\n\
-             {headers}\
-             Connection: close\r\n\r\n"
-        );
-        let response_bytes = response.into_bytes();
-        std::thread::spawn(move || {
-            if let Ok((mut stream, _)) = listener.accept() {
-                let mut buf = [0u8; 4096];
-                let _ = stream.read(&mut buf);
-                let _ = stream.write_all(&response_bytes);
-                let _ = stream.write_all(&body_bytes);
-                let _ = stream.flush();
-            }
-        });
-        client
-            .get(format!("http://{addr}/api/admin/v1/reports"))
-            .send()
-            .await
-            .unwrap()
-    }
-
-    #[tokio::test]
-    async fn probe_html_200_classified_as_intercepted() {
-        let resp = fake_response(
-            200,
-            "Content-Type: text/html; charset=utf-8\r\n",
-            "<html><body>Sign in</body></html>",
-        )
-        .await;
-        assert!(
-            is_probe_response_intercepted(&resp),
-            "HTML 200 must be intercepted"
-        );
-    }
-
-    #[tokio::test]
-    async fn probe_json_200_not_classified_as_intercepted() {
-        let resp = fake_response(200, "Content-Type: application/json\r\n", "[]").await;
-        assert!(
-            !is_probe_response_intercepted(&resp),
-            "JSON 200 must not be intercepted"
-        );
-    }
-
-    #[tokio::test]
-    async fn probe_html_200_returns_network_or_intercepted() {
-        client::init_admin_client();
-        use std::io::{Read, Write};
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap();
-        std::thread::spawn(move || {
-            if let Ok((mut stream, _)) = listener.accept() {
-                let mut buf = [0u8; 4096];
-                let _ = stream.read(&mut buf);
-                let body = b"<html>sign in</html>";
-                let resp = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                    body.len()
-                );
-                let _ = stream.write_all(resp.as_bytes());
-                let _ = stream.write_all(body);
-                let _ = stream.flush();
-            }
-        });
-        let client = client::ADMIN_CLIENT.get().unwrap();
-        let raw_resp = client
-            .get(format!("http://{addr}/api/admin/v1/reports"))
-            .send()
-            .await
-            .unwrap();
-        assert!(is_probe_response_intercepted(&raw_resp));
-    }
-
-    #[tokio::test]
-    async fn probe_json_200_looks_like_admin_list() {
-        let resp = fake_response(200, "Content-Type: application/json\r\n", "[]").await;
-        assert!(!is_probe_response_intercepted(&resp));
-        let bytes = read_bounded(resp, SUCCESS_JSON_CAP).await.unwrap();
-        assert!(looks_like_admin_list(&bytes));
-    }
-
-    #[tokio::test]
-    async fn probe_malformed_json_200_returns_not_admin_api() {
-        let resp =
-            fake_response(200, "Content-Type: application/json\r\n", "not json at all").await;
-        assert!(!is_probe_response_intercepted(&resp));
-        let bytes = read_bounded(resp, SUCCESS_JSON_CAP).await.unwrap();
-        assert!(!looks_like_admin_list(&bytes));
-    }
-
-    #[tokio::test]
-    async fn probe_json_object_200_returns_not_admin_api() {
-        // A JSON object (not array) is not the expected list shape.
-        let resp = fake_response(
-            200,
-            "Content-Type: application/json\r\n",
-            "{\"error\":\"not the admin api\"}",
-        )
-        .await;
-        assert!(!is_probe_response_intercepted(&resp));
-        let bytes = read_bounded(resp, SUCCESS_JSON_CAP).await.unwrap();
-        assert!(!looks_like_admin_list(&bytes));
-    }
-
-    // ── validate_pubkey_hex ───────────────────────────────────────────────────
-
-    #[test]
-    fn pubkey_hex_valid_64_lowercase() {
-        let valid = "a".repeat(64);
-        assert!(validate_pubkey_hex(valid).is_ok());
-    }
-
-    #[test]
-    fn pubkey_hex_uppercase_rejected() {
-        let upper = "A".repeat(64);
-        assert!(validate_pubkey_hex(upper).is_err());
-    }
-
-    #[test]
-    fn pubkey_hex_empty_rejected() {
-        assert!(validate_pubkey_hex("".to_string()).is_err());
-    }
-
-    #[test]
-    fn pubkey_hex_63_chars_rejected() {
-        assert!(validate_pubkey_hex("a".repeat(63)).is_err());
-    }
-}
+#[path = "mod_tests.rs"]
+mod tests;

@@ -161,34 +161,59 @@ export function AdminConsoleSettingsCard() {
   });
   const [isSaving, setIsSaving] = useState(false);
 
-  // Cancel probe if pubkey or origin changes mid-flight.
+  // In-flight probe abort controller. The AbortController does not cancel the
+  // Tauri native request (not cancellable), but it prevents a stale probe
+  // result from updating UI state after identity/origin changed.
   const probeAbortRef = useRef<AbortController | null>(null);
 
+  // Synchronously abort any active probe, reset probe UI state, and clear
+  // panel-render state. Call this before starting a new probe or whenever
+  // the identity/origin context changes — the panel must not remain visible
+  // with a stale identity's origin.
+  function abortAndResetProbe() {
+    probeAbortRef.current?.abort();
+    probeAbortRef.current = null;
+    setProbeUiState({ kind: "idle" });
+    setSavedOrigin(null);
+  }
+
   // Load saved origin on mount and when pubkey changes.
-  // biome-ignore lint/correctness/useExhaustiveDependencies: runProbe is defined inline and recreated each render; pubkeyHex is the only intentional reset trigger
+  // On change, synchronously reset probe + panel state BEFORE the async load
+  // so the panel never renders with the previous identity's origin.
+  // biome-ignore lint/correctness/useExhaustiveDependencies: abortAndResetProbe is stable (defined above); pubkeyHex is the only intentional trigger
   useEffect(() => {
     if (!pubkeyHex) return;
-    let cancelled = false;
+
+    // Synchronously clear previous identity's state before the async load.
+    abortAndResetProbe();
+    setOriginInput("");
+
+    let active = true;
     void (async () => {
       try {
         const saved = await getAdminOrigin();
-        if (cancelled) return;
+        if (!active) return;
         setSavedOrigin(saved);
         setOriginInput(saved ?? "");
         if (saved) {
           runProbe(saved, pubkeyHex);
         }
-      } catch {
-        // Ignore — settings card degrades gracefully.
+      } catch (e) {
+        if (!active) return;
+        // Surface storage/signing errors rather than silently degrading.
+        setProbeUiState({
+          kind: "error",
+          message: e instanceof Error ? e.message : String(e),
+        });
       }
     })();
     return () => {
-      cancelled = true;
+      active = false;
     };
   }, [pubkeyHex]);
 
   function runProbe(origin: string, pkHex: string) {
-    // Cancel any in-flight probe.
+    // Cancel any in-flight probe before starting a new one.
     probeAbortRef.current?.abort();
     const controller = new AbortController();
     probeAbortRef.current = controller;
@@ -258,7 +283,16 @@ export function AdminConsoleSettingsCard() {
             className="flex-1 font-mono text-sm"
             data-testid="admin-origin-input"
             disabled={isSaving}
-            onChange={(e) => setOriginInput(e.target.value)}
+            onChange={(e) => {
+              setOriginInput(e.target.value);
+              // Abort/reset the active probe when the input changes so a stale
+              // probe result from a previous value is never committed.
+              probeAbortRef.current?.abort();
+              probeAbortRef.current = null;
+              if (probeUiState.kind === "probing") {
+                setProbeUiState({ kind: "idle" });
+              }
+            }}
             placeholder="https://admin.yourrelay.example.com"
             spellCheck={false}
             type="url"

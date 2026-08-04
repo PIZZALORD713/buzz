@@ -5,11 +5,12 @@
  * (product feedback with optional image attachments).
  *
  * All query/UI state is keyed by `(pubkey, origin)`. In-flight native requests
- * are fenced by a generation counter: each (pubkey, origin) pair gets a new
- * generation; results from prior generations are discarded on arrival.
+ * are fenced by an effect-local `active` flag that is set to `false` in the
+ * effect cleanup, ensuring stale results are discarded on arrival.
  *
- * Tauri invoke is not cancellable at the native layer, but generation checks
- * ensure stale results never update visible state or create unreachable blob URLs.
+ * Tauri invoke is not cancellable at the native layer, but the active-flag
+ * pattern ensures stale results never update visible state or create
+ * unreachable blob URLs.
  */
 
 import { useCallback, useEffect, useRef, useState } from "react";
@@ -41,11 +42,15 @@ type AsyncState<T> =
   | { status: "error"; message: string };
 
 /**
- * Generation-fenced async load hook.
+ * Async load hook with effect-local active-flag cancellation.
  *
- * `generation` increments whenever the caller wants to invalidate all
- * in-flight results (e.g. pubkey or origin changed). Results that arrive
- * after the generation changed are silently dropped.
+ * Each effect invocation sets `active = true` and flips it to `false` in the
+ * cleanup function. Completions check `active` before calling setState, so a
+ * result that arrives after the deps changed (or the component unmounted) is
+ * silently discarded.
+ *
+ * `load` is stored in a ref so it is not a dependency of the effect — callers
+ * create it inline and `deps` + `generation` are the explicit trigger list.
  */
 function useAsyncLoad<T>(
   load: () => Promise<T>,
@@ -53,34 +58,29 @@ function useAsyncLoad<T>(
   generation: number,
 ): AsyncState<T> {
   const [state, setState] = useState<AsyncState<T>>({ status: "idle" });
-  // Store load in a ref so the effect doesn't need it as a dependency —
-  // callers create it inline and deps + generation are the real trigger list.
   const loadRef = useRef(load);
   loadRef.current = load;
 
+  // biome-ignore lint/correctness/useExhaustiveDependencies: loadRef is a stable ref; deps and generation are the intentional trigger set
   useEffect(() => {
-    const gen = generation;
+    let active = true;
     setState({ status: "loading" });
     loadRef.current().then(
       (data) => {
-        setState((prev) => {
-          // Discard if the generation changed while we were in flight.
-          if (gen !== generation) return prev;
-          return { status: "ok", data };
-        });
+        if (!active) return;
+        setState({ status: "ok", data });
       },
       (e: unknown) => {
-        setState((prev) => {
-          if (gen !== generation) return prev;
-          return {
-            status: "error",
-            message: e instanceof Error ? e.message : String(e),
-          };
+        if (!active) return;
+        setState({
+          status: "error",
+          message: e instanceof Error ? e.message : String(e),
         });
       },
     );
-    // loadRef is stable and excluded from deps — the ref stores the latest `load`
-    // without making it a reactive value.
+    return () => {
+      active = false;
+    };
   }, [...deps, generation]);
 
   return state;
@@ -112,7 +112,7 @@ type AttachmentMeta = {
  *
  * Rejected: missing x/m/size, non-lowercase-hex x, non-positive size.
  */
-function parseImetaAttachments(tags: unknown): AttachmentMeta[] {
+export function parseImetaAttachments(tags: unknown): AttachmentMeta[] {
   if (!Array.isArray(tags)) return [];
   const result: AttachmentMeta[] = [];
   for (const tag of tags) {
@@ -347,13 +347,23 @@ function AttachmentViewer({
   const [error, setError] = useState<AdminAttachmentErrorCode | null>(null);
   const [loading, setLoading] = useState(false);
   const blobUrlRef = useRef<string | null>(null);
-  // Generation for this specific load invocation — incremented on each load().
+  // Per-load generation: incremented when a new load starts AND in cleanup so
+  // that unmount or panelGeneration change invalidates any in-flight load.
   const loadGenRef = useRef(0);
+  // Keep current origin/pubkey in refs so the callback can compare against
+  // the rendered-at-call-time values without capturing stale closure copies.
+  const originRef = useRef(origin);
+  const pubkeyRef = useRef(pubkey);
+  originRef.current = origin;
+  pubkeyRef.current = pubkey;
 
-  // Revoke blob URL on unmount or when panelGeneration changes.
-  // biome-ignore lint/correctness/useExhaustiveDependencies: panelGeneration is a prop (not a ref) — we intentionally re-register the cleanup each time the panel context changes
+  // On panelGeneration change (identity/origin switch) or unmount:
+  // invalidate any in-flight load and revoke the cached blob URL.
+  // biome-ignore lint/correctness/useExhaustiveDependencies: panelGeneration is a prop that drives cleanup re-registration; the cleanup body mutates refs, not reactive state
   useEffect(() => {
     return () => {
+      // Increment generation so any in-flight native callback sees a mismatch.
+      loadGenRef.current += 1;
       if (blobUrlRef.current) {
         URL.revokeObjectURL(blobUrlRef.current);
         blobUrlRef.current = null;
@@ -362,7 +372,7 @@ function AttachmentViewer({
   }, [panelGeneration]);
 
   const load = useCallback(async () => {
-    // Capture the generation at the moment this load starts.
+    // Capture snapshot of context at the moment this load starts.
     const thisGen = ++loadGenRef.current;
     const thisOrigin = origin;
     const thisPubkey = pubkey;
@@ -378,11 +388,12 @@ function AttachmentViewer({
         attachment.size,
       );
 
-      // Discard if a newer load started or the identity/origin changed.
+      // Discard if a newer load started, the component was unmounted/context
+      // changed (loadGenRef incremented in cleanup), or origin/pubkey differ.
       if (
         thisGen !== loadGenRef.current ||
-        thisOrigin !== origin ||
-        thisPubkey !== pubkey
+        thisOrigin !== originRef.current ||
+        thisPubkey !== pubkeyRef.current
       ) {
         URL.revokeObjectURL(url);
         return;
@@ -610,11 +621,12 @@ export function AdminConsolePanel({
   pubkey: string;
 }) {
   const [activeTab, setActiveTab] = useState<Tab>("reports");
-  // Increment whenever the (pubkey, origin) context changes to fence stale results.
+  // Increment whenever the (pubkey, origin) context changes to invalidate all
+  // in-flight useAsyncLoad effects via their effect-local `active` flags.
   const generationRef = useRef(0);
   const [generation, setGeneration] = useState(0);
 
-  // biome-ignore lint/correctness/useExhaustiveDependencies: pubkey and origin are props (reactive values) — the effect intentionally fires when either changes to increment the generation fence
+  // biome-ignore lint/correctness/useExhaustiveDependencies: pubkey and origin are reactive props — effect fires when either changes to bump the generation fence
   useEffect(() => {
     generationRef.current += 1;
     setGeneration(generationRef.current);
