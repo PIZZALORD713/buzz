@@ -241,13 +241,45 @@ class MessageContent extends HookConsumerWidget {
             ),
             (m) {
               final matched = m[0]!;
-              final url = matched.replaceFirst(RegExp(r'[.,!?:;]+$'), '');
-              final trailingPunctuation = matched.substring(url.length);
+              var url = matched;
+              var trailing = '';
+              final start = m.start;
+
+              // A bare URL inside emphasis initially includes the closing
+              // Markdown delimiter. Peel only a delimiter whose matching
+              // opener immediately precedes this URL, preserving legitimate
+              // URL characters in ordinary prose. Sentence punctuation can
+              // appear on either side of that closing delimiter.
+              final outsidePunctuation = RegExp(r'[.,!?:;]+$').firstMatch(url);
+              if (outsidePunctuation != null) {
+                url = url.substring(0, outsidePunctuation.start);
+                trailing = outsidePunctuation[0]!;
+              }
+              for (final delimiter in const [
+                '***',
+                '___',
+                '**',
+                '__',
+                '~~',
+                '*',
+                '_',
+              ]) {
+                if (segment.substring(0, start).endsWith(delimiter) &&
+                    url.endsWith(delimiter)) {
+                  url = url.substring(0, url.length - delimiter.length);
+                  trailing = '$delimiter$trailing';
+                  break;
+                }
+              }
+              final punctuation = RegExp(r'[.,!?:;]+$').firstMatch(url);
+              if (punctuation != null) {
+                url = url.substring(0, punctuation.start);
+                trailing = '${punctuation[0]}$trailing';
+              }
               // Skip if this URL is already a markdown link label that equals
               // the URL (produced by step 1 or authored as [url](url)).
-              final start = m.start;
               if (start >= 1 && segment[start - 1] == '[') return matched;
-              return '[$url]($url)$trailingPunctuation';
+              return '[$url]($url)$trailing';
             },
           );
           buffer.write(segment);

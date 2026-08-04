@@ -470,6 +470,28 @@ void main() {
         );
       });
 
+      testWidgets('keeps Markdown delimiters outside bare Buzz links', (
+        tester,
+      ) async {
+        const url = 'buzz://message?channel=channel-1&id=message-1';
+
+        await tester.pumpWidget(
+          _testable(const MessageContent(content: '**$url**. and _${url}_')),
+        );
+
+        expect(find.text(url), findsNWidgets(2));
+
+        await tester.tap(find.text(url).first);
+        await tester.pump();
+        final container = ProviderScope.containerOf(
+          tester.element(find.byType(MessageContent)),
+        );
+        expect(
+          container.read(pendingDeepLinkProvider),
+          const MessageDeepLink(channelId: 'channel-1', messageId: 'message-1'),
+        );
+      });
+
       testWidgets('excludes sentence punctuation from bare Buzz links', (
         tester,
       ) async {
