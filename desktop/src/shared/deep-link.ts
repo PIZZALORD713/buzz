@@ -163,6 +163,11 @@ export async function listenForDeepLinks(
 }
 
 let navigationDrainTail: Promise<void> = Promise.resolve();
+let navigationDrainGeneration = 0;
+
+export function resetNavigationDeepLinkDrain(): void {
+  navigationDrainGeneration += 1;
+}
 
 function serializeNavigationDrain(task: () => Promise<void>): Promise<void> {
   const drain = navigationDrainTail.then(task, task);
@@ -180,11 +185,12 @@ async function drainPendingNavigationDeepLinks(
     payload: MessageDeepLinkPayload,
   ) => boolean | Promise<boolean>,
 ) {
-  while (true) {
+  const generation = navigationDrainGeneration;
+  while (generation === navigationDrainGeneration) {
     const pending = await invoke<PendingNavigationDeepLink | null>(
       "take_pending_navigation_deep_link",
     );
-    if (!pending) return;
+    if (!pending || generation !== navigationDrainGeneration) return;
     const accepted = await (pending.kind === "channel"
       ? onOpenChannel({ channelId: pending.channelId })
       : pending.messageId
@@ -194,7 +200,7 @@ async function drainPendingNavigationDeepLinks(
             threadRootId: pending.threadRootId,
           })
         : false);
-    if (!accepted) return;
+    if (!accepted || generation !== navigationDrainGeneration) return;
     const acknowledged = await invoke<boolean>(
       "acknowledge_pending_navigation_deep_link",
       { id: pending.id },

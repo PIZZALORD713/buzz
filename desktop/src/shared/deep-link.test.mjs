@@ -23,7 +23,8 @@ globalThis.window = {
 };
 globalThis.__TAURI_INTERNALS__ = tauriInternals;
 
-const { listenForNavigationDeepLinks } = await import("@/shared/deep-link.ts");
+const { listenForNavigationDeepLinks, resetNavigationDeepLinkDrain } =
+  await import("@/shared/deep-link.ts");
 
 function deferred() {
   let resolve;
@@ -184,6 +185,42 @@ test("concurrent listener remount does not take or acknowledge the in-flight hea
   assert.deepEqual(acknowledged, ["in-flight"]);
   assert.equal(queue.length, 0);
   secondUnlisten();
+});
+
+test("community reset prevents an in-flight route from acknowledging", async () => {
+  const pending = {
+    id: "old-community",
+    kind: "channel",
+    channelId: "channel-1",
+    messageId: null,
+    threadRootId: null,
+  };
+  const routeGate = deferred();
+  let acknowledgeCount = 0;
+
+  ipcHandlers.set("plugin:event|listen", () => nextCallbackId);
+  ipcHandlers.set("plugin:event|unlisten", () => {});
+  ipcHandlers.set("take_pending_navigation_deep_link", () => pending);
+  ipcHandlers.set("acknowledge_pending_navigation_deep_link", () => {
+    acknowledgeCount += 1;
+    return true;
+  });
+
+  const unlisten = await listenForNavigationDeepLinks(
+    async () => {
+      await routeGate.promise;
+      return true;
+    },
+    () => true,
+  );
+  await settle();
+
+  resetNavigationDeepLinkDrain();
+  routeGate.resolve();
+  await settle();
+
+  assert.equal(acknowledgeCount, 0);
+  unlisten();
 });
 
 test("rejected navigation remains queued and is not acknowledged", async () => {
