@@ -243,8 +243,6 @@ class MessageContent extends HookConsumerWidget {
               var trailing = '';
               final start = m.start;
 
-              // Keep balanced Markdown delimiters outside the generated link
-              // without excluding legitimate URL characters globally.
               final outsidePunctuation = RegExp(r'[.,!?:;]+$').firstMatch(url);
               if (outsidePunctuation != null) {
                 url = url.substring(0, outsidePunctuation.start);
