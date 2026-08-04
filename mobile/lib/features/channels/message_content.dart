@@ -15,6 +15,8 @@ import 'package:url_launcher/url_launcher.dart';
 import 'package:video_player/video_player.dart';
 
 import '../../shared/clipboard_utils.dart';
+import '../../shared/deeplink/deep_link.dart';
+import '../../shared/deeplink/pending_deep_link_provider.dart';
 import '../../shared/relay/relay.dart';
 import '../../shared/syntax_highlight.dart';
 import '../../shared/theme/theme.dart';
@@ -345,9 +347,19 @@ class MessageContent extends HookConsumerWidget {
     return GestureDetector(
       onTap: () async {
         final uri = Uri.tryParse(url);
-        if (uri == null || (uri.scheme != 'http' && uri.scheme != 'https')) {
+        if (uri == null) return;
+
+        // `buzz://message` and `buzz://join` are app-owned links. Park the
+        // parsed target so the top-level dispatcher can route it once the
+        // authenticated/channel UI is ready; do not hand it to an OS browser,
+        // which is what made rendered mobile deep links inert.
+        if (uri.scheme == 'buzz') {
+          if (parseBuzzDeepLink(uri) != null) {
+            ref.read(pendingDeepLinkProvider.notifier).handleUri(uri);
+          }
           return;
         }
+        if (uri.scheme != 'http' && uri.scheme != 'https') return;
 
         final auth = ref.read(mediaGetAuthServiceProvider);
         if (!auth.isRelayMediaUrl(url)) {

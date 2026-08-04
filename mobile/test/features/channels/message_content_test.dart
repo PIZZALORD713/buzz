@@ -6,6 +6,8 @@ import 'package:lucide_icons_flutter/lucide_icons.dart';
 import 'package:nostr/nostr.dart' as nostr;
 import 'package:buzz/features/channels/message_content.dart';
 import 'package:buzz/features/channels/media_viewer_page.dart';
+import 'package:buzz/shared/deeplink/deep_link.dart';
+import 'package:buzz/shared/deeplink/pending_deep_link_provider.dart';
 import 'package:buzz/shared/emoji/emoji_only.dart';
 import 'package:buzz/shared/relay/relay.dart';
 import 'package:buzz/shared/theme/theme.dart';
@@ -410,6 +412,31 @@ void main() {
         // Should not show raw markdown syntax.
         expect(allText, isNot(contains('[Buzz]')));
         expect(allText, isNot(contains('(https://example.com)')));
+      });
+
+      testWidgets('renders and routes a buzz message link', (tester) async {
+        const url =
+            'buzz://message?channel=channel-1&id=message-2&thread=root-1';
+
+        await tester.pumpWidget(
+          _testable(const MessageContent(content: '[Open message]($url)')),
+        );
+
+        expect(find.text('Open message'), findsOneWidget);
+        await tester.tap(find.text('Open message'));
+        await tester.pump();
+
+        final container = ProviderScope.containerOf(
+          tester.element(find.byType(MessageContent)),
+        );
+        expect(
+          container.read(pendingDeepLinkProvider),
+          const MessageDeepLink(
+            channelId: 'channel-1',
+            messageId: 'message-2',
+            threadRootId: 'root-1',
+          ),
+        );
       });
 
       testWidgets('renders bare URL as link', (tester) async {
