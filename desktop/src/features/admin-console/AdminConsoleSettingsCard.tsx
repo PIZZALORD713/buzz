@@ -5,6 +5,12 @@
  * on their relay), then probes it to determine auth mode and whether the
  * current app identity is on the allowlist.
  *
+ * Identity boundary: the stateful body is rendered as
+ * `<AdminConsoleSettingsSession key={pubkeyHex} ...>` so that React
+ * synchronously unmounts A's entire state tree before B is rendered. Logout
+ * (pubkeyHex → empty string) renders nothing, so A's probe state, saved
+ * origin, and panel are torn down at the render level — not in a passive effect.
+ *
  * Renders the full admin panel only when probe state is `nip98Authorized`.
  * All other states surface honest, actionable copy without false hope.
  */
@@ -154,6 +160,35 @@ export function AdminConsoleSettingsCard() {
   const { data: identity } = useIdentityQuery();
   const pubkeyHex = identity?.pubkey ?? "";
 
+  return (
+    <section
+      className="flex min-h-0 flex-1 flex-col overflow-y-auto"
+      data-testid="settings-admin-console"
+    >
+      <SettingsSectionHeader
+        title="Admin console"
+        description="Connect to your relay's deployment admin API. Paste the value of BUZZ_ADMIN_HOST from your relay config."
+      />
+      {pubkeyHex ? (
+        <AdminConsoleSettingsSession key={pubkeyHex} pubkeyHex={pubkeyHex} />
+      ) : null}
+    </section>
+  );
+}
+
+// ── Stateful session — keyed by pubkeyHex ─────────────────────────────────
+//
+// React's `key` prop causes the parent to unmount this component entirely when
+// the pubkey changes. That means:
+//  - A→B switch: A's entire state tree (originInput, savedOrigin, probeUiState,
+//    isSaving, in-flight probes) is destroyed synchronously before B mounts.
+//  - Logout (pubkeyHex → ""): the parent renders `null`, so A's state is gone
+//    before any new render begins.
+//
+// This eliminates the passive-effect reset race where the parent rendered with
+// B's pubkey and A's stale origin/authorized state for one render cycle.
+
+function AdminConsoleSettingsSession({ pubkeyHex }: { pubkeyHex: string }) {
   const [originInput, setOriginInput] = useState("");
   const [savedOrigin, setSavedOrigin] = useState<string | null>(null);
   const [probeUiState, setProbeUiState] = useState<ProbeUiState>({
@@ -161,42 +196,37 @@ export function AdminConsoleSettingsCard() {
   });
   const [isSaving, setIsSaving] = useState(false);
 
-  // In-flight probe abort controller. The AbortController does not cancel the
-  // Tauri native request (not cancellable), but it prevents a stale probe
-  // result from updating UI state after identity/origin changed.
+  // In-flight probe abort controller. Does not cancel the Tauri native request
+  // (not cancellable), but prevents a stale probe result from updating UI state.
   const probeAbortRef = useRef<AbortController | null>(null);
 
-  // Synchronously abort any active probe, reset probe UI state, and clear
-  // panel-render state. Call this before starting a new probe or whenever
-  // the identity/origin context changes — the panel must not remain visible
-  // with a stale identity's origin.
+  // Save/probe context token: captures (pubkey, origin) at the time a save
+  // starts. handleSave checks this before committing any state so a delayed
+  // save cannot repopulate the wrong session.
+  type SessionToken = { pubkey: string; origin: string };
+  const sessionTokenRef = useRef<SessionToken | null>(null);
+
+  // Synchronously abort any active probe and reset probe UI state.
+  // Call before starting a new probe or on any input change.
   function abortAndResetProbe() {
     probeAbortRef.current?.abort();
     probeAbortRef.current = null;
     setProbeUiState({ kind: "idle" });
-    setSavedOrigin(null);
   }
 
-  // Load saved origin on mount and when pubkey changes.
-  // On change, synchronously reset probe + panel state BEFORE the async load
-  // so the panel never renders with the previous identity's origin.
-  // biome-ignore lint/correctness/useExhaustiveDependencies: abortAndResetProbe is stable (defined above); pubkeyHex is the only intentional trigger
+  // Load saved origin on mount (runs once per session because the component
+  // is keyed by pubkeyHex — re-mount = new pubkey).
+  // biome-ignore lint/correctness/useExhaustiveDependencies: intentional mount-once effect; identity boundary is the key prop on this component — it unmounts/remounts on pubkey change, so [] is correct.
   useEffect(() => {
-    if (!pubkeyHex) return;
-
-    // Synchronously clear previous identity's state before the async load.
-    abortAndResetProbe();
-    setOriginInput("");
-
     let active = true;
     void (async () => {
       try {
-        const saved = await getAdminOrigin();
+        const saved = await getAdminOrigin(pubkeyHex);
         if (!active) return;
         setSavedOrigin(saved);
         setOriginInput(saved ?? "");
         if (saved) {
-          runProbe(saved, pubkeyHex);
+          runProbe(saved);
         }
       } catch (e) {
         if (!active) return;
@@ -205,15 +235,16 @@ export function AdminConsoleSettingsCard() {
           kind: "error",
           message: e instanceof Error ? e.message : String(e),
         });
+        setSavedOrigin(null);
+        setOriginInput("");
       }
     })();
     return () => {
       active = false;
     };
-  }, [pubkeyHex]);
+  }, []); // Empty: runs once per session mount; identity boundary is the key prop.
 
-  function runProbe(origin: string, pkHex: string) {
-    // Cancel any in-flight probe before starting a new one.
+  function runProbe(origin: string) {
     probeAbortRef.current?.abort();
     const controller = new AbortController();
     probeAbortRef.current = controller;
@@ -224,7 +255,7 @@ export function AdminConsoleSettingsCard() {
       try {
         const result = await probeAdminOrigin(origin);
         if (controller.signal.aborted) return;
-        setProbeUiState(probeStateToUiState(result.state, origin, pkHex));
+        setProbeUiState(probeStateToUiState(result.state, origin, pubkeyHex));
       } catch (e) {
         if (controller.signal.aborted) return;
         setProbeUiState({
@@ -237,28 +268,38 @@ export function AdminConsoleSettingsCard() {
 
   async function handleSave() {
     const trimmed = originInput.trim();
+    // Capture (pubkey, origin) token at save-start time. The check below
+    // ensures a delayed completion cannot write into a different session.
+    const token: SessionToken = { pubkey: pubkeyHex, origin: trimmed };
+    sessionTokenRef.current = token;
+
     setIsSaving(true);
+    abortAndResetProbe();
     try {
       if (!trimmed) {
-        const canonical = await setAdminOrigin(null);
+        const canonical = await setAdminOrigin(null, pubkeyHex);
+        // Discard if the session changed while the native call was in flight.
+        if (sessionTokenRef.current !== token) return;
         setSavedOrigin(canonical);
         setProbeUiState({ kind: "idle" });
         return;
       }
-      const canonical = await setAdminOrigin(trimmed);
+      const canonical = await setAdminOrigin(trimmed, pubkeyHex);
+      if (sessionTokenRef.current !== token) return;
       setSavedOrigin(canonical);
       if (canonical) {
-        runProbe(canonical, pubkeyHex);
+        runProbe(canonical);
       } else {
         setProbeUiState({ kind: "idle" });
       }
     } catch (e) {
+      if (sessionTokenRef.current !== token) return;
       setProbeUiState({
         kind: "error",
         message: e instanceof Error ? e.message : String(e),
       });
     } finally {
-      setIsSaving(false);
+      if (sessionTokenRef.current === token) setIsSaving(false);
     }
   }
 
@@ -267,15 +308,7 @@ export function AdminConsoleSettingsCard() {
     probeUiState.kind === "authorized" && savedOrigin !== null;
 
   return (
-    <section
-      className="flex min-h-0 flex-1 flex-col overflow-y-auto"
-      data-testid="settings-admin-console"
-    >
-      <SettingsSectionHeader
-        title="Admin console"
-        description="Connect to your relay's deployment admin API. Paste the value of BUZZ_ADMIN_HOST from your relay config."
-      />
-
+    <>
       <div className="mb-6 space-y-3">
         <div className="flex gap-2">
           <Input
@@ -285,13 +318,10 @@ export function AdminConsoleSettingsCard() {
             disabled={isSaving}
             onChange={(e) => {
               setOriginInput(e.target.value);
-              // Abort/reset the active probe when the input changes so a stale
-              // probe result from a previous value is never committed.
-              probeAbortRef.current?.abort();
-              probeAbortRef.current = null;
-              if (probeUiState.kind === "probing") {
-                setProbeUiState({ kind: "idle" });
-              }
+              // General reset: abort and clear probe state on every input
+              // change, not only when state is `probing`. This prevents a
+              // stale probe result from a previous value being committed.
+              abortAndResetProbe();
             }}
             placeholder="https://admin.yourrelay.example.com"
             spellCheck={false}
@@ -323,7 +353,7 @@ export function AdminConsoleSettingsCard() {
               )}
               data-testid="admin-probe-refresh"
               disabled={probeUiState.kind === "probing"}
-              onClick={() => runProbe(savedOrigin, pubkeyHex)}
+              onClick={() => runProbe(savedOrigin)}
               size="sm"
               type="button"
               variant="ghost"
@@ -341,6 +371,6 @@ export function AdminConsoleSettingsCard() {
       {isAuthorized && savedOrigin && (
         <AdminConsolePanel origin={savedOrigin} pubkey={pubkeyHex} />
       )}
-    </section>
+    </>
   );
 }

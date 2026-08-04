@@ -46,21 +46,35 @@ export async function probeAdminOrigin(
 /**
  * Return the saved admin console origin for the currently active pubkey, or
  * `null` if none has been saved.
+ *
+ * `expectedPubkey` is forwarded to the Rust command as a defence-in-depth
+ * guard: if the active signing key no longer matches the pubkey that was
+ * active when the call was issued (delayed IPC after an identity switch), the
+ * Rust side rejects the read. Callers should pass the pubkey that was active
+ * when the request was initiated.
  */
-export async function getAdminOrigin(): Promise<string | null> {
-  return invokeTauri<string | null>("get_admin_origin", {});
+export async function getAdminOrigin(
+  expectedPubkey?: string,
+): Promise<string | null> {
+  return invokeTauri<string | null>("get_admin_origin", { expectedPubkey });
 }
 
 /**
  * Validate, normalise, and save `rawOrigin` as the admin console origin for
  * the current pubkey. Returns the canonical origin on success.
  * Pass `null` to clear the saved origin.
+ *
+ * `expectedPubkey` is forwarded to the Rust command: if the active signing
+ * key no longer matches, the write is rejected so a delayed save cannot write
+ * identity A's input into identity B's storage namespace.
  */
 export async function setAdminOrigin(
   rawOrigin: string | null,
+  expectedPubkey?: string,
 ): Promise<string | null> {
   return invokeTauri<string | null>("set_admin_origin", {
     rawOrigin,
+    expectedPubkey,
   });
 }
 

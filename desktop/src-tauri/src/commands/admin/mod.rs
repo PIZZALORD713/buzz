@@ -283,12 +283,13 @@ async fn read_bounded(resp: reqwest::Response, cap: u64) -> Result<Vec<u8>, Stri
 /// Rules:
 /// - Content-Type must start with `application/json` (case-insensitive).
 /// - Body must be a JSON array.
-/// - Non-empty arrays must have at least one element with an `id` field
-///   (the minimum field present on every `AdminReport` and `AdminFeedback`).
+/// - Non-empty arrays must have every element deserialise against the
+///   `AdminReport` wire contract (camelCase, `rename_all = "camelCase"`).
 ///   An empty array is valid — a fresh relay with no reports returns `[]`.
+/// - Partial / garbage elements (`{"id":null}`, `7`, `"garbage"`) are rejected.
 ///
-/// This prevents unrelated endpoints that return JSON arrays (e.g. `[1, 2]`,
-/// `["unrelated"]`) from being misclassified as the admin API.
+/// This prevents unrelated endpoints that return JSON arrays from being
+/// misclassified as the admin API.
 fn looks_like_admin_list(content_type: &str, bytes: &[u8]) -> bool {
     // Require JSON Content-Type.
     if !content_type
@@ -306,13 +307,41 @@ fn looks_like_admin_list(content_type: &str, bytes: &[u8]) -> bool {
     if arr.is_empty() {
         return true;
     }
-    // Non-empty: at least one element must be an object with an `id` field,
-    // matching the AdminReport / AdminFeedback minimum wire contract.
-    arr.iter().any(|v| {
-        v.as_object()
-            .map(|obj| obj.contains_key("id"))
-            .unwrap_or(false)
-    })
+    // Non-empty: every element must deserialise against the AdminReport probe DTO.
+    // The wire shape is camelCase (serde rename_all = "camelCase").
+    arr.iter()
+        .all(|v| serde_json::from_value::<AdminReportProbeDto>(v.clone()).is_ok())
+}
+
+/// Subset of `AdminReport` fields used for probe validation.
+///
+/// Matches the camelCase wire contract serialised by the relay
+/// (`crates/buzz-db/src/admin_moderation.rs:24-55`).
+/// Only fields that are non-optional and always present on every list row are
+/// required here; optional fields are allowed to be absent.
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AdminReportProbeDto {
+    #[allow(dead_code)]
+    id: uuid::Uuid,
+    #[allow(dead_code)]
+    community_id: uuid::Uuid,
+    #[allow(dead_code)]
+    community_host: String,
+    #[allow(dead_code)]
+    report_event_id: String,
+    #[allow(dead_code)]
+    reporter_pubkey: String,
+    #[allow(dead_code)]
+    target_kind: String,
+    #[allow(dead_code)]
+    target: String,
+    #[allow(dead_code)]
+    report_type: String,
+    #[allow(dead_code)]
+    status: String,
+    #[allow(dead_code)]
+    created_at: serde_json::Value,
 }
 
 /// Extract the normalised Content-Type base value (strips parameters).
@@ -484,21 +513,18 @@ pub async fn admin_fetch_feedback_attachment(
 
 // ── Origin storage commands ───────────────────────────────────────────────
 
-/// Return the persisted admin console origin for the active pubkey, or `None`
-/// if none has been saved yet.
+/// Core storage logic for `get_admin_origin`, parameterised by data directory
+/// and resolved pubkey hex. No `tauri::State` — testable with `tempdir`.
 ///
-/// The stored value is reparsed through `AdminOrigin::parse()` on every read.
-/// If the stored content is invalid (e.g. manually edited or from an older
-/// format), it is removed and an error returned so the settings card can show
-/// a visible setup error rather than silently degrading.
-#[tauri::command]
-pub fn get_admin_origin(
-    app: tauri::AppHandle,
-    state: tauri::State<'_, crate::app_state::AppState>,
+/// Reads the per-pubkey JSON file, reparses the stored origin through
+/// `AdminOrigin::parse()`, and returns the canonical string. Returns `None`
+/// when no file exists. On malformed/invalid content, removes the file and
+/// returns `Err` so the caller can surface a visible setup error.
+pub(crate) fn get_admin_origin_core(
+    data_dir: &std::path::Path,
+    pubkey_hex: &str,
 ) -> Result<Option<String>, String> {
-    // Fail closed: never derive the pubkey from an error fallback.
-    let pubkey = validate_pubkey_hex(state.signing_keys()?.public_key().to_hex())?;
-    let path = admin_origin_path(&app, &pubkey)?;
+    let path = data_dir.join(format!("admin-console-origin-{pubkey_hex}.json"));
     if !path.exists() {
         return Ok(None);
     }
@@ -507,8 +533,6 @@ pub fn get_admin_origin(
     let stored: StoredAdminOrigin = match serde_json::from_str(&content) {
         Ok(v) => v,
         Err(e) => {
-            // Quarantine invalid content: remove the file so the settings card
-            // shows a clear setup error rather than looping with a stale value.
             let remove_result = std::fs::remove_file(&path);
             return Err(match remove_result {
                 Ok(()) => format!("stored admin console origin is invalid (removed): {e}"),
@@ -518,8 +542,6 @@ pub fn get_admin_origin(
             });
         }
     };
-    // Reparse through AdminOrigin::parse() so the returned value is always
-    // canonical, even if the file was written by an older version.
     match origin::AdminOrigin::parse(&stored.origin) {
         Ok(o) => Ok(Some(o.as_str().to_string())),
         Err(e) => {
@@ -534,25 +556,20 @@ pub fn get_admin_origin(
     }
 }
 
-/// Validate and persist the admin console origin for the active pubkey.
+/// Core storage logic for `set_admin_origin`, parameterised by data directory
+/// and resolved pubkey hex. No `tauri::State` — testable with `tempdir`.
 ///
-/// Passes `raw_origin` through `AdminOrigin::parse` to normalise and validate
-/// it before writing. Pass `None` to clear the stored origin.
-#[tauri::command]
-pub fn set_admin_origin(
+/// Validates and persists `raw_origin`. Pass `None` to clear. Returns the
+/// canonical origin string on success, or `None` on clear.
+pub(crate) fn set_admin_origin_core(
+    data_dir: &std::path::Path,
+    pubkey_hex: &str,
     raw_origin: Option<String>,
-    app: tauri::AppHandle,
-    state: tauri::State<'_, crate::app_state::AppState>,
 ) -> Result<Option<String>, String> {
     use crate::managed_agents::storage::atomic_write_json_restricted;
-
-    // Fail closed: never derive the pubkey from an error fallback.
-    let pubkey = validate_pubkey_hex(state.signing_keys()?.public_key().to_hex())?;
-    let path = admin_origin_path(&app, &pubkey)?;
-
+    let path = data_dir.join(format!("admin-console-origin-{pubkey_hex}.json"));
     match raw_origin {
         None => {
-            // Clear.
             if path.exists() {
                 std::fs::remove_file(&path)
                     .map_err(|e| format!("failed to remove admin console origin: {e}"))?;
@@ -571,24 +588,82 @@ pub fn set_admin_origin(
     }
 }
 
-/// On-disk shape for the persisted admin console origin.
-#[derive(serde::Serialize, serde::Deserialize)]
-struct StoredAdminOrigin {
-    origin: String,
-}
-
-/// Path of the per-pubkey admin-console-origin JSON file.
-fn admin_origin_path(
-    app: &tauri::AppHandle,
-    pubkey_hex: &str,
-) -> Result<std::path::PathBuf, String> {
+/// Return the persisted admin console origin for the active pubkey, or `None`
+/// if none has been saved yet.
+///
+/// `expected_pubkey` is checked against the active signing key before
+/// reading. This is a defence-in-depth guard: if a delayed IPC call arrives
+/// after the user has switched identities, the mismatch is caught here and the
+/// read is rejected so stale-session data cannot surface in the new session.
+///
+/// The stored value is reparsed through `AdminOrigin::parse()` on every read.
+/// If the stored content is invalid, it is removed and an error returned so
+/// the settings card shows a visible setup error rather than silently degrading.
+#[tauri::command]
+pub fn get_admin_origin(
+    expected_pubkey: Option<String>,
+    app: tauri::AppHandle,
+    state: tauri::State<'_, crate::app_state::AppState>,
+) -> Result<Option<String>, String> {
+    // Fail closed: never derive the pubkey from an error fallback.
+    let pubkey = validate_pubkey_hex(state.signing_keys()?.public_key().to_hex())?;
+    // If the caller supplied an expected pubkey, reject when it no longer
+    // matches the active key — a delayed IPC from a prior session.
+    if let Some(ref expected) = expected_pubkey {
+        if *expected != pubkey {
+            return Err(
+                "admin origin read rejected: active identity changed since request was sent"
+                    .to_string(),
+            );
+        }
+    }
     use tauri::Manager as _;
     let dir = app
         .path()
         .app_data_dir()
         .map_err(|e| format!("failed to resolve app data dir: {e}"))?;
     std::fs::create_dir_all(&dir).map_err(|e| format!("failed to create app data dir: {e}"))?;
-    Ok(dir.join(format!("admin-console-origin-{pubkey_hex}.json")))
+    get_admin_origin_core(&dir, &pubkey)
+}
+
+/// Validate and persist the admin console origin for the active pubkey.
+///
+/// `expected_pubkey` guards against delayed IPC: if the active signing key no
+/// longer matches `expected_pubkey`, the write is rejected to prevent a save
+/// started under identity A from writing into identity B's storage namespace.
+///
+/// Passes `raw_origin` through `AdminOrigin::parse` to normalise and validate
+/// it before writing. Pass `None` to clear the stored origin.
+#[tauri::command]
+pub fn set_admin_origin(
+    raw_origin: Option<String>,
+    expected_pubkey: Option<String>,
+    app: tauri::AppHandle,
+    state: tauri::State<'_, crate::app_state::AppState>,
+) -> Result<Option<String>, String> {
+    // Fail closed: never derive the pubkey from an error fallback.
+    let pubkey = validate_pubkey_hex(state.signing_keys()?.public_key().to_hex())?;
+    if let Some(ref expected) = expected_pubkey {
+        if *expected != pubkey {
+            return Err(
+                "admin origin write rejected: active identity changed since request was sent"
+                    .to_string(),
+            );
+        }
+    }
+    use tauri::Manager as _;
+    let dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|e| format!("failed to resolve app data dir: {e}"))?;
+    std::fs::create_dir_all(&dir).map_err(|e| format!("failed to create app data dir: {e}"))?;
+    set_admin_origin_core(&dir, &pubkey, raw_origin)
+}
+
+/// On-disk shape for the persisted admin console origin.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct StoredAdminOrigin {
+    origin: String,
 }
 
 /// Validate that `hex` is exactly 64 lowercase hexadecimal characters.
