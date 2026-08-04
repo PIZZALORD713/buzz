@@ -11536,6 +11536,9 @@ export function maybeInstallE2eTauriMocks() {
         mockPendingCommunityDeepLinks.splice(index, 1);
         return true;
       }
+      case "clear_pending_navigation_deep_links":
+        mockPendingNavigationDeepLinks.length = 0;
+        return;
       case "take_pending_navigation_deep_link":
         return mockPendingNavigationDeepLinks[0] ?? null;
       case "acknowledge_pending_navigation_deep_link": {

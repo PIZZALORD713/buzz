@@ -47,13 +47,13 @@ import type { Community } from "./types";
  * destroyed via effect cleanup and do not need entries here.
  * See AGENTS.md "Community Switching" for the full contract.
  */
-function resetCommunityState({
+async function resetCommunityState({
   resetAvatarState,
 }: {
   resetAvatarState: boolean;
-}): void {
+}): Promise<void> {
   relayClient.disconnect();
-  resetNavigationDeepLinkDrain();
+  await resetNavigationDeepLinkDrain();
   resetRateLimitGate();
   clearAllDrafts();
   resetAgentObserverStore();
@@ -196,7 +196,7 @@ export function useCommunityInit(
           // store under the outgoing community ID and delete its snapshot.
           prevCommunityIdRef.current = null;
         }
-        resetCommunityState({
+        await resetCommunityState({
           resetAvatarState:
             appliedRelayUrlRef.current !== activeCommunity.relayUrl,
         });

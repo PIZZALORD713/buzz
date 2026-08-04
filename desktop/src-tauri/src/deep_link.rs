@@ -54,6 +54,10 @@ impl PendingNavigationDeepLinks {
         queue.push_back(pending);
     }
 
+    fn clear(&self) {
+        self.lock().clear();
+    }
+
     fn first(&self) -> Option<PendingNavigationDeepLink> {
         self.lock().front().cloned()
     }
@@ -67,6 +71,11 @@ impl PendingNavigationDeepLinks {
             false
         }
     }
+}
+
+#[tauri::command]
+pub(crate) fn clear_pending_navigation_deep_links(pending: State<'_, PendingNavigationDeepLinks>) {
+    pending.clear();
 }
 
 #[tauri::command]
@@ -551,7 +560,7 @@ mod tests {
         assert!(!queue.acknowledge("second"));
         assert!(queue.acknowledge("first"));
         assert_eq!(queue.first().unwrap().id, "second");
-        assert!(queue.acknowledge("second"));
+        queue.clear();
         assert!(queue.first().is_none());
     }
 

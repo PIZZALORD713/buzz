@@ -165,8 +165,9 @@ export async function listenForDeepLinks(
 let navigationDrainTail: Promise<void> = Promise.resolve();
 let navigationDrainGeneration = 0;
 
-export function resetNavigationDeepLinkDrain(): void {
+export async function resetNavigationDeepLinkDrain(): Promise<void> {
   navigationDrainGeneration += 1;
+  await invoke("clear_pending_navigation_deep_links");
 }
 
 function serializeNavigationDrain(task: () => Promise<void>): Promise<void> {

@@ -47,8 +47,8 @@ use builderlab::*;
 use commands::*;
 use deep_link::{
     acknowledge_pending_community_deep_link, acknowledge_pending_navigation_deep_link,
-    handle_deep_link_url, take_pending_community_deep_link, take_pending_navigation_deep_link,
-    PendingCommunityDeepLinks, PendingNavigationDeepLinks,
+    clear_pending_navigation_deep_links, handle_deep_link_url, take_pending_community_deep_link,
+    take_pending_navigation_deep_link, PendingCommunityDeepLinks, PendingNavigationDeepLinks,
 };
 use huddle::audio_output::{
     get_audio_output_device, list_audio_output_devices, set_audio_output_device,
@@ -613,6 +613,7 @@ pub fn run() {
             acknowledge_pending_community_deep_link,
             take_pending_navigation_deep_link,
             acknowledge_pending_navigation_deep_link,
+            clear_pending_navigation_deep_links,
             start_builderlab_login,
             cancel_builderlab_login,
             get_builderlab_auth,

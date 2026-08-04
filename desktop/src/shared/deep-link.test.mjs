@@ -197,9 +197,13 @@ test("community reset prevents an in-flight route from acknowledging", async () 
   };
   const routeGate = deferred();
   let acknowledgeCount = 0;
+  let clearCount = 0;
 
   ipcHandlers.set("plugin:event|listen", () => nextCallbackId);
   ipcHandlers.set("plugin:event|unlisten", () => {});
+  ipcHandlers.set("clear_pending_navigation_deep_links", () => {
+    clearCount += 1;
+  });
   ipcHandlers.set("take_pending_navigation_deep_link", () => pending);
   ipcHandlers.set("acknowledge_pending_navigation_deep_link", () => {
     acknowledgeCount += 1;
@@ -215,10 +219,11 @@ test("community reset prevents an in-flight route from acknowledging", async () 
   );
   await settle();
 
-  resetNavigationDeepLinkDrain();
+  await resetNavigationDeepLinkDrain();
   routeGate.resolve();
   await settle();
 
+  assert.equal(clearCount, 1);
   assert.equal(acknowledgeCount, 0);
   unlisten();
 });
