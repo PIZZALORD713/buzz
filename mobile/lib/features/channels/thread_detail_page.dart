@@ -24,6 +24,7 @@ import 'composer_dock_size_reporter.dart';
 import 'date_formatters.dart';
 import 'day_divider.dart';
 import '../profile/user_profile_sheet.dart';
+import 'initial_thread_tail_settle.dart';
 import 'message_actions.dart';
 import 'message_content.dart';
 import 'reaction_row.dart';
@@ -177,48 +178,22 @@ class ThreadDetailPage extends HookConsumerWidget {
     // while the last item is on screen, scroll it into view. If the user has
     // scrolled up to read, leave them where they are.
     final hasFetchedReplies = fetchedReplies != null;
-    final didEstablishInitialReplies = useRef(false);
-    final initialSettleGeneration = useRef(0);
+    final initialTailSettle = useMemoized(InitialThreadTailSettle.new);
     final previousReplyCount = useRef(replies.length);
     useEffect(() {
       // The first authoritative query result is hydration, not a live arrival.
       // Once every relay page has resolved, settle an ordinary thread open on
       // its newest reply. Deep links retain ownership of their explicit target.
       if (!hasFetchedReplies) return null;
-      if (!didEstablishInitialReplies.value) {
+      if (!initialTailSettle.isComplete) {
         previousReplyCount.value = replies.length;
-        if (initialMessageId == null && replies.isNotEmpty) {
-          final generation = ++initialSettleGeneration.value;
-          WidgetsBinding.instance.addPostFrameCallback((_) {
-            if (!context.mounted ||
-                generation != initialSettleGeneration.value) {
-              return;
-            }
-            // Let live events received during hydration rebuild the list before
-            // committing the initial target. Their effect invalidates this
-            // generation and schedules the current tail instead.
-            WidgetsBinding.instance.addPostFrameCallback((_) {
-              if (!context.mounted ||
-                  !itemScrollController.isAttached ||
-                  generation != initialSettleGeneration.value) {
-                return;
-              }
-              itemScrollController
-                  .scrollTo(
-                    index: indexForReply(replies.length - 1),
-                    alignment: 0.8,
-                    duration: const Duration(milliseconds: 1),
-                  )
-                  .whenComplete(() {
-                    if (generation == initialSettleGeneration.value) {
-                      didEstablishInitialReplies.value = true;
-                    }
-                  });
-            });
-          });
-        } else {
-          didEstablishInitialReplies.value = true;
-        }
+        initialTailSettle.schedule(
+          context: context,
+          controller: itemScrollController,
+          targetIndex: initialMessageId == null && replies.isNotEmpty
+              ? indexForReply(replies.length - 1)
+              : null,
+        );
         return null;
       }
 
