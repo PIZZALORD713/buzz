@@ -230,7 +230,9 @@ pub async fn apply_workspace(
 
         try_regenerate_nest(&app);
         if is_local_workspace {
-            let changed = crate::commands::agents::backfill_missing_agent_auth_tags(&app, &state)?;
+            let changed = crate::commands::agent_auth_backfill::backfill_missing_agent_auth_tags(
+                &app, &state,
+            )?;
             if changed > 0 {
                 eprintln!("buzz-desktop: backfilled NIP-OA auth tags for {changed} local agent(s)");
             }

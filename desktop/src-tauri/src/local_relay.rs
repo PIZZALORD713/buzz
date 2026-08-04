@@ -325,9 +325,11 @@ fn capture_stderr(
 fn stderr_context(stderr: &StderrTail) -> String {
     let tail = stderr.lock().expect("stderr tail mutex poisoned");
     let text = String::from_utf8_lossy(&tail).trim().to_string();
-    (!text.is_empty())
-        .then(|| format!("; stderr: {text}"))
-        .unwrap_or_default()
+    if text.is_empty() {
+        String::new()
+    } else {
+        format!("; stderr: {text}")
+    }
 }
 
 fn allocate_distinct_loopback_ports(
