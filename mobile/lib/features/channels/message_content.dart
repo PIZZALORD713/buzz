@@ -222,8 +222,6 @@ class MessageContent extends HookConsumerWidget {
           // Inside backticks — preserve as-is.
           buffer.write('`${parts[i]}`');
         } else {
-          // 1. Angle-bracket autolinks: <https://...> and supported Buzz
-          //    links. gpt_markdown does not auto-link custom schemes.
           var segment = parts[i].replaceAllMapped(
             RegExp(
               r'<((?:https?://|buzz://(?:message\?|join\?|channel/))[^>]+)>',
@@ -245,11 +243,8 @@ class MessageContent extends HookConsumerWidget {
               var trailing = '';
               final start = m.start;
 
-              // A bare URL inside emphasis initially includes the closing
-              // Markdown delimiter. Peel only a delimiter whose matching
-              // opener immediately precedes this URL, preserving legitimate
-              // URL characters in ordinary prose. Sentence punctuation can
-              // appear on either side of that closing delimiter.
+              // Keep balanced Markdown delimiters outside the generated link
+              // without excluding legitimate URL characters globally.
               final outsidePunctuation = RegExp(r'[.,!?:;]+$').firstMatch(url);
               if (outsidePunctuation != null) {
                 url = url.substring(0, outsidePunctuation.start);
