@@ -253,8 +253,12 @@ pub(crate) fn event_query_parity_vectors(
         (
             "gated-reader",
             gated,
-            vec![fixture.second_id.clone(), fixture.first_id.clone()],
-            2,
+            vec![
+                fixture.third_id.clone(),
+                fixture.second_id.clone(),
+                fixture.first_id.clone(),
+            ],
+            3,
         ),
         (
             "limit",
@@ -263,6 +267,20 @@ pub(crate) fn event_query_parity_vectors(
             3,
         ),
     ]
+}
+
+/// Return whether an incoming replaceable event outranks the current head.
+///
+/// NIP-16 uses second-resolution timestamps, then the lexicographically lower
+/// event ID as the deterministic same-second winner.
+pub fn incoming_replaceable_event_wins(
+    incoming_created_at: u64,
+    incoming_id: &[u8],
+    existing_created_at: u64,
+    existing_id: &[u8],
+) -> bool {
+    incoming_created_at > existing_created_at
+        || (incoming_created_at == existing_created_at && incoming_id < existing_id)
 }
 
 /// Result of atomically inserting a kind:7 reaction event and its reaction row.
@@ -1843,6 +1861,7 @@ mod tests {
             .sign_with_keys(&second_keys)
             .unwrap();
         let third = EventBuilder::new(Kind::Custom(30_175), "third")
+            .tags([Tag::parse(["shared", "true"]).unwrap()])
             .custom_created_at(Timestamp::from(102_u64))
             .sign_with_keys(&first_keys)
             .unwrap();
@@ -2191,6 +2210,18 @@ mod tests {
             Some(second.id.as_bytes().as_slice()),
             "reactivation through the tx path must preserve add_reaction's source-id update semantics"
         );
+    }
+
+    #[test]
+    fn replaceable_event_ordering_prefers_newer_then_lower_id() {
+        let lower = [0x11; 32];
+        let higher = [0x22; 32];
+
+        assert!(incoming_replaceable_event_wins(101, &higher, 100, &lower));
+        assert!(!incoming_replaceable_event_wins(99, &lower, 100, &higher));
+        assert!(incoming_replaceable_event_wins(100, &lower, 100, &higher));
+        assert!(!incoming_replaceable_event_wins(100, &higher, 100, &lower));
+        assert!(!incoming_replaceable_event_wins(100, &lower, 100, &lower));
     }
 
     #[test]

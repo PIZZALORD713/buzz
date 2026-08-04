@@ -222,9 +222,14 @@ async fn persist_command_event(
 
         let incoming_id = event.id.as_bytes().as_slice();
         if let Some((existing_ts, existing_id)) = existing {
-            let dominated = created_at < existing_ts
-                || (created_at == existing_ts && incoming_id >= existing_id.as_slice());
-            if dominated {
+            if !buzz_db::event::incoming_replaceable_event_wins(
+                event.created_at.as_secs(),
+                incoming_id,
+                u64::try_from(existing_ts.timestamp()).map_err(|_| {
+                    IngestError::Internal("error: stored event has a pre-epoch timestamp".into())
+                })?,
+                &existing_id,
+            ) {
                 return Ok(PersistResult::Duplicate);
             }
 

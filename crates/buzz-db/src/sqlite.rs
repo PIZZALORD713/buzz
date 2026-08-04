@@ -692,9 +692,12 @@ async fn replace_command_event_tx(
         if crate::event::extract_d_tag(&existing).as_deref() != Some(d_tag) {
             continue;
         }
-        if event.created_at < existing.created_at
-            || (event.created_at == existing.created_at && event.id >= existing.id)
-        {
+        if !crate::event::incoming_replaceable_event_wins(
+            event.created_at.as_secs(),
+            event.id.as_bytes(),
+            existing.created_at.as_secs(),
+            existing.id.as_bytes(),
+        ) {
             return Ok(false);
         }
         replaced_ids.push(row.try_get::<Vec<u8>, _>("id")?);
@@ -4622,6 +4625,7 @@ mod tests {
             .sign_with_keys(&second_keys)
             .unwrap();
         let third = EventBuilder::new(Kind::Custom(30_175), "third")
+            .tags([Tag::parse(["shared", "true"]).unwrap()])
             .custom_created_at(Timestamp::from(102_u64))
             .sign_with_keys(&first_keys)
             .unwrap();
@@ -6798,6 +6802,20 @@ mod tests {
             .unwrap()
     }
 
+    fn command_event_at(
+        keys: &Keys,
+        kind: u16,
+        content: &str,
+        tags: Vec<Tag>,
+        created_at: u64,
+    ) -> nostr::Event {
+        EventBuilder::new(Kind::Custom(kind), content)
+            .tags(tags)
+            .custom_created_at(Timestamp::from(created_at))
+            .sign_with_keys(keys)
+            .unwrap()
+    }
+
     #[tokio::test]
     async fn dm_command_failure_rolls_back_event_and_retry_applies_mutation() {
         let pool = connect("sqlite::memory:").await.unwrap();
@@ -6844,6 +6862,118 @@ mod tests {
             list_hidden_dms(&pool, community, &alice).await.unwrap(),
             vec![dm.id]
         );
+    }
+
+    #[tokio::test]
+    async fn workflow_command_replacement_uses_shared_newer_then_lower_id_ordering() {
+        let pool = connect("sqlite::memory:").await.unwrap();
+        let community = ensure_configured_community(&pool, "workflow-replacement.local")
+            .await
+            .unwrap()
+            .id;
+        let keys = Keys::generate();
+        let owner = keys.public_key().to_bytes().to_vec();
+        ensure_user(&pool, community, &owner).await.unwrap();
+        let workflow = Uuid::new_v4();
+        let d_tag = workflow.to_string();
+        let tags = || vec![Tag::custom(nostr::TagKind::d(), [d_tag.clone()])];
+        let older = command_event_at(&keys, 30311, "older", tags(), 100);
+        let newer = command_event_at(&keys, 30311, "newer", tags(), 101);
+        let same_second_a = command_event_at(&keys, 30311, "same-a", tags(), 102);
+        let same_second_b = command_event_at(&keys, 30311, "same-b", tags(), 102);
+        let (winner, loser) = if same_second_a.id < same_second_b.id {
+            (same_second_a, same_second_b)
+        } else {
+            (same_second_b, same_second_a)
+        };
+
+        for (event, expected) in [(&older, Some(())), (&newer, Some(())), (&older, None)] {
+            assert_eq!(
+                upsert_workflow_command(
+                    &pool,
+                    community,
+                    workflow,
+                    None,
+                    &owner,
+                    &event.content,
+                    r#"{"trigger":{"on":"manual"},"steps":[]}"#,
+                    &[1; 32],
+                    event,
+                    &d_tag,
+                )
+                .await
+                .unwrap(),
+                expected
+            );
+        }
+        assert_eq!(
+            get_workflow(&pool, community, workflow).await.unwrap().name,
+            "newer"
+        );
+
+        assert_eq!(
+            upsert_workflow_command(
+                &pool,
+                community,
+                workflow,
+                None,
+                &owner,
+                &loser.content,
+                r#"{"trigger":{"on":"manual"},"steps":[]}"#,
+                &[2; 32],
+                &loser,
+                &d_tag,
+            )
+            .await
+            .unwrap(),
+            Some(())
+        );
+        assert_eq!(
+            upsert_workflow_command(
+                &pool,
+                community,
+                workflow,
+                None,
+                &owner,
+                &winner.content,
+                r#"{"trigger":{"on":"manual"},"steps":[]}"#,
+                &[3; 32],
+                &winner,
+                &d_tag,
+            )
+            .await
+            .unwrap(),
+            Some(())
+        );
+        assert_eq!(
+            upsert_workflow_command(
+                &pool,
+                community,
+                workflow,
+                None,
+                &owner,
+                &loser.content,
+                r#"{"trigger":{"on":"manual"},"steps":[]}"#,
+                &[4; 32],
+                &loser,
+                &d_tag,
+            )
+            .await
+            .unwrap(),
+            None
+        );
+        assert_eq!(
+            get_workflow(&pool, community, workflow).await.unwrap().name,
+            winner.content
+        );
+        assert!(get_event_by_id(&pool, community, winner.id.as_bytes())
+            .await
+            .unwrap()
+            .is_some());
+        assert!(get_event_by_id(&pool, community, loser.id.as_bytes())
+            .await
+            .unwrap()
+            .is_none());
     }
 
     #[tokio::test]
