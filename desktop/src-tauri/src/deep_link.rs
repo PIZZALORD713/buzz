@@ -34,11 +34,15 @@ pub(crate) struct PendingNavigationDeepLink {
 pub(crate) struct PendingNavigationDeepLinks(Mutex<VecDeque<PendingNavigationDeepLink>>);
 
 impl PendingNavigationDeepLinks {
+    fn lock(&self) -> std::sync::MutexGuard<'_, VecDeque<PendingNavigationDeepLink>> {
+        self.0.lock().unwrap_or_else(|poisoned| {
+            eprintln!("buzz-desktop: recovering poisoned pending navigation deep-link queue");
+            poisoned.into_inner()
+        })
+    }
+
     fn enqueue(&self, pending: PendingNavigationDeepLink) {
-        let mut queue = self
-            .0
-            .lock()
-            .expect("pending navigation deep-link queue poisoned");
+        let mut queue = self.lock();
         if queue.iter().any(|item| {
             item.kind == pending.kind
                 && item.channel_id == pending.channel_id
@@ -51,18 +55,11 @@ impl PendingNavigationDeepLinks {
     }
 
     fn first(&self) -> Option<PendingNavigationDeepLink> {
-        self.0
-            .lock()
-            .expect("pending navigation deep-link queue poisoned")
-            .front()
-            .cloned()
+        self.lock().front().cloned()
     }
 
     fn acknowledge(&self, id: &str) -> bool {
-        let mut queue = self
-            .0
-            .lock()
-            .expect("pending navigation deep-link queue poisoned");
+        let mut queue = self.lock();
         if queue.front().is_some_and(|item| item.id == id) {
             queue.pop_front();
             true
@@ -555,6 +552,29 @@ mod tests {
         assert!(queue.acknowledge("first"));
         assert_eq!(queue.first().unwrap().id, "second");
         assert!(queue.acknowledge("second"));
+        assert!(queue.first().is_none());
+    }
+
+    #[test]
+    fn pending_navigation_queue_recovers_after_mutex_poisoning() {
+        let queue = std::sync::Arc::new(PendingNavigationDeepLinks::default());
+        let poisoner = std::sync::Arc::clone(&queue);
+        assert!(std::thread::spawn(move || {
+            let _guard = poisoner.0.lock().unwrap();
+            panic!("poison queue for recovery regression");
+        })
+        .join()
+        .is_err());
+
+        queue.enqueue(pending_navigation(
+            "after-poison",
+            "channel",
+            "channel-1",
+            None,
+            None,
+        ));
+        assert_eq!(queue.first().unwrap().id, "after-poison");
+        assert!(queue.acknowledge("after-poison"));
         assert!(queue.first().is_none());
     }
 

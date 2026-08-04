@@ -163,24 +163,27 @@ export async function listenForDeepLinks(
 }
 
 async function drainPendingNavigationDeepLinks(
-  onOpenChannel: (payload: ChannelDeepLinkPayload) => boolean,
-  onOpenMessage: (payload: MessageDeepLinkPayload) => boolean,
+  onOpenChannel: (
+    payload: ChannelDeepLinkPayload,
+  ) => boolean | Promise<boolean>,
+  onOpenMessage: (
+    payload: MessageDeepLinkPayload,
+  ) => boolean | Promise<boolean>,
 ) {
   while (true) {
     const pending = await invoke<PendingNavigationDeepLink | null>(
       "take_pending_navigation_deep_link",
     );
     if (!pending) return;
-    const accepted =
-      pending.kind === "channel"
-        ? onOpenChannel({ channelId: pending.channelId })
-        : pending.messageId
-          ? onOpenMessage({
-              channelId: pending.channelId,
-              messageId: pending.messageId,
-              threadRootId: pending.threadRootId,
-            })
-          : false;
+    const accepted = await (pending.kind === "channel"
+      ? onOpenChannel({ channelId: pending.channelId })
+      : pending.messageId
+        ? onOpenMessage({
+            channelId: pending.channelId,
+            messageId: pending.messageId,
+            threadRootId: pending.threadRootId,
+          })
+        : false);
     if (!accepted) return;
     const acknowledged = await invoke<boolean>(
       "acknowledge_pending_navigation_deep_link",
@@ -196,8 +199,12 @@ async function drainPendingNavigationDeepLinks(
  * effect teardown leaves an in-flight queue head available for the next mount.
  */
 export async function listenForNavigationDeepLinks(
-  onOpenChannel: (payload: ChannelDeepLinkPayload) => boolean,
-  onOpenMessage: (payload: MessageDeepLinkPayload) => boolean,
+  onOpenChannel: (
+    payload: ChannelDeepLinkPayload,
+  ) => boolean | Promise<boolean>,
+  onOpenMessage: (
+    payload: MessageDeepLinkPayload,
+  ) => boolean | Promise<boolean>,
 ): Promise<UnlistenFn> {
   let drainRunning = false;
   let drainRequested = false;

@@ -25,14 +25,14 @@ export function useMessageDeepLinks(enabled = true) {
 
     let cancelled = false;
     const unlistenPromise = listenForNavigationDeepLinks(
-      (payload) => {
+      async (payload) => {
         if (cancelled) return false;
-        void goChannel(payload.channelId);
+        await goChannel(payload.channelId);
         return true;
       },
-      (payload) => {
+      async (payload) => {
         if (cancelled) return false;
-        void goChannel(payload.channelId, {
+        await goChannel(payload.channelId, {
           messageId: payload.messageId,
           threadRootId: payload.threadRootId,
         });

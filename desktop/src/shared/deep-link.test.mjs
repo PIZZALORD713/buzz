@@ -123,3 +123,42 @@ test("listener teardown leaves an unaccepted FIFO item for the next mount", asyn
   secondUnlisten();
   assert.equal(unlistenCount, 4);
 });
+
+test("rejected navigation remains queued and is not acknowledged", async () => {
+  const pending = {
+    id: "retry-me",
+    kind: "channel",
+    channelId: "channel-1",
+    messageId: null,
+    threadRootId: null,
+  };
+  let acknowledgeCount = 0;
+  const warnings = [];
+  const originalWarn = console.warn;
+
+  ipcHandlers.set("plugin:event|listen", () => nextCallbackId);
+  ipcHandlers.set("plugin:event|unlisten", () => {});
+  ipcHandlers.set("take_pending_navigation_deep_link", () => pending);
+  ipcHandlers.set("acknowledge_pending_navigation_deep_link", () => {
+    acknowledgeCount += 1;
+    return true;
+  });
+  console.warn = (...args) => warnings.push(args);
+
+  try {
+    const unlisten = await listenForNavigationDeepLinks(
+      async () => {
+        throw new Error("route failed");
+      },
+      async () => true,
+    );
+    await settle();
+
+    assert.equal(acknowledgeCount, 0);
+    assert.equal(warnings.length, 1);
+    assert.match(String(warnings[0][1]), /route failed/);
+    unlisten();
+  } finally {
+    console.warn = originalWarn;
+  }
+});
