@@ -27,6 +27,7 @@ import '../../shared/emoji/emoji_data_provider.dart';
 import '../../shared/emoji/emoji_only.dart';
 import 'channels_provider.dart';
 import 'media_viewer_page.dart';
+import 'message_content/link_normalizer.dart';
 import 'message_media.dart';
 
 part 'message_content/media_carousel.dart';
@@ -74,25 +75,6 @@ String _safeDownloadedFilename(String filename) {
       .replaceAll(RegExp(r'[\x00-\x1F\x7F]'), '')
       .trim();
   return safe.isEmpty ? 'attachment' : safe;
-}
-
-bool _hasUnclosedMarkdownDelimiter(String prefix, String delimiter) {
-  var open = false;
-  var offset = 0;
-  while (true) {
-    final index = prefix.indexOf(delimiter, offset);
-    if (index < 0) return open;
-    final before = index == 0 ? null : prefix[index - 1];
-    final afterIndex = index + delimiter.length;
-    final after = afterIndex == prefix.length ? null : prefix[afterIndex];
-    final canOpen =
-        (after == null || after.trim().isNotEmpty) &&
-        (before == null ||
-            before.trim().isEmpty ||
-            RegExp(r'[^\w]').hasMatch(before));
-    if (open || canOpen) open = !open;
-    offset = afterIndex;
-  }
 }
 
 /// Renders message content with markdown formatting, @mentions, #channel links,
@@ -231,82 +213,17 @@ class MessageContent extends HookConsumerWidget {
         ? kEmojiOnlyCustomEmojiSize
         : kCustomEmojiInlineSize;
 
+    final linkNormalizedContent = useMemoized(
+      () => normalizeBareLinks(markdownContent),
+      [markdownContent],
+    );
+
     final finalContent = useMemoized(() {
-      // Convert autolinks and bare URLs to standard markdown links,
-      // but skip content inside backticks (inline code / fenced blocks).
-      final buffer = StringBuffer();
-      final parts = markdownContent.split('`');
-      for (var i = 0; i < parts.length; i++) {
-        if (i.isOdd) {
-          // Inside backticks — preserve as-is.
-          buffer.write('`${parts[i]}`');
-        } else {
-          var segment = parts[i].replaceAllMapped(
-            RegExp(
-              r'<((?:https?://|buzz://(?:message\?|join\?|channel/))[^>]+)>',
-            ),
-            (m) => '[${m[1]}](${m[1]})',
-          );
-          segment = segment.replaceAllMapped(
-            RegExp(
-              r'(?<![(\]=])(?:https?://|buzz://(?:message\?|join\?|channel/))[^\s)>\]]+',
-            ),
-            (m) {
-              final matched = m[0]!;
-              var url = matched;
-              var trailing = '';
-              final start = m.start;
-
-              final outsidePunctuation = RegExp(r'[.,!?:;]+$').firstMatch(url);
-              if (outsidePunctuation != null) {
-                url = url.substring(0, outsidePunctuation.start);
-                trailing = outsidePunctuation[0]!;
-              }
-              var strippedDelimiter = true;
-              while (strippedDelimiter) {
-                strippedDelimiter = false;
-                for (final delimiter in const [
-                  '***',
-                  '___',
-                  '**',
-                  '__',
-                  '~~',
-                  '*',
-                  '_',
-                ]) {
-                  if (url.endsWith(delimiter) &&
-                      _hasUnclosedMarkdownDelimiter(
-                        segment.substring(0, start),
-                        delimiter,
-                      )) {
-                    url = url.substring(0, url.length - delimiter.length);
-                    trailing = '$delimiter$trailing';
-                    strippedDelimiter = true;
-                    break;
-                  }
-                }
-              }
-              final punctuation = RegExp(r'[.,!?:;]+$').firstMatch(url);
-              if (punctuation != null) {
-                url = url.substring(0, punctuation.start);
-                trailing = '${punctuation[0]}$trailing';
-              }
-              // Skip if this URL is already a markdown link label that equals
-              // the URL (produced by step 1 or authored as [url](url)).
-              if (start >= 1 && segment[start - 1] == '[') return matched;
-              return '[$url]($url)$trailing';
-            },
-          );
-          buffer.write(segment);
-        }
-      }
-      final processed = buffer.toString();
-
       // Replace spaces with non-breaking spaces inside known mention names
       // so the gpt_markdown combined regex can match multi-word names
       // even when caseSensitive is not preserved.
       // Skip content inside backticks to avoid altering inline code.
-      final mentionParts = processed.split('`');
+      final mentionParts = linkNormalizedContent.split('`');
       final mentionBuf = StringBuffer();
       for (var i = 0; i < mentionParts.length; i++) {
         if (i.isOdd) {
@@ -325,16 +242,15 @@ class MessageContent extends HookConsumerWidget {
           mentionBuf.write(segment);
         }
       }
-      final mentionProcessed = mentionBuf.toString();
+      var result = mentionBuf.toString();
 
       // Ensure channel links at the very start of content don't get
       // swallowed by markdown processing.
-      var result = mentionProcessed;
       if (RegExp(r'^#[A-Za-z0-9_]').hasMatch(result)) {
         result = '\u200B$result';
       }
       return result;
-    }, [markdownContent, resolvedMentionNames]);
+    }, [linkNormalizedContent, resolvedMentionNames]);
 
     final markdown = KeyedSubtree(
       key: ValueKey(
