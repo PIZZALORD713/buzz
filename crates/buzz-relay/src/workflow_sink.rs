@@ -576,7 +576,7 @@ mod integration_tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires Postgres"]
+    #[ignore = "requires Postgres; SQLite skip: create_community_with_owner — community lifecycle management is PostgreSQL-only"]
     async fn workflow_send_message_p_tags_mentioned_member() {
         let state = test_state().await;
 

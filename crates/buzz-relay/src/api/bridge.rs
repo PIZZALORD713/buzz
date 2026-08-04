@@ -3363,61 +3363,19 @@ mod tests {
         }
     }
 
-    const TEST_DB_URL: &str = "postgres://buzz:buzz_dev@localhost:5432/buzz"; // sadscan:disable np.postgres.1
-
     /// Build an AppState suitable for handler-level bridge tests.
-    ///
-    /// - `require_auth_token = false` → X-Pubkey dev-mode fallback active.
-    /// - `require_relay_membership = false` → membership check short-circuits to
-    ///   OpenRelay without a DB lookup.
-    /// - `nip98_replay` replaced with an always-fresh guard → no Redis needed
-    ///   for replay detection.
-    /// - Redis pool points at the local dev instance for the admission check.
-    ///
-    /// Returns `None` when local Postgres is not reachable.
-    async fn bridge_handler_test_state() -> Option<Arc<crate::state::AppState>> {
-        let mut config = crate::config::Config::from_env().ok()?;
-        config.database_url = TEST_DB_URL.to_string();
-        // Use the real local Redis so enforce_http_admission can pass.
-        config.redis_url =
-            std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
-        config.relay_url = "wss://bridge-test.local".to_string();
-        config.require_auth_token = false;
-        config.require_relay_membership = false;
-
-        let pool = sqlx::PgPool::connect(TEST_DB_URL).await.ok()?;
-        let db = buzz_db::Db::from_pool(pool.clone());
-        let redis_pool = deadpool_redis::Config::from_url(&config.redis_url)
-            .create_pool(Some(deadpool_redis::Runtime::Tokio1))
-            .ok()?;
-        let pubsub = Arc::new(
-            buzz_pubsub::PubSubManager::new(&config.redis_url, redis_pool.clone())
-                .await
-                .ok()?,
-        );
-        let audit = buzz_audit::AuditService::new(pool.clone());
-        let auth = buzz_auth::AuthService::new(config.auth.clone());
-        let search = buzz_search::SearchService::new(pool.clone());
-        let workflow_engine = Arc::new(buzz_workflow::WorkflowEngine::new(
-            db.clone(),
-            buzz_workflow::WorkflowConfig::default(),
-        ));
-        let media_storage = buzz_media::MediaStorage::new(&config.media).ok()?;
-
-        let (mut state, _audit_shutdown) = crate::state::AppState::new(
-            config,
-            db,
-            redis_pool,
-            audit,
-            pubsub,
-            auth,
-            search,
-            workflow_engine,
-            Keys::generate(),
-            media_storage,
-        );
-        state.nip98_replay = Arc::new(AlwaysFreshReplayGuard);
-        Some(Arc::new(state))
+    async fn bridge_handler_test_state() -> Arc<crate::state::AppState> {
+        crate::test_support::test_state_with_config_and_state(
+            |config| {
+                config.redis_url = std::env::var("REDIS_URL")
+                    .unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
+                config.relay_url = "wss://bridge-test.local".to_string();
+                config.require_auth_token = false;
+                config.require_relay_membership = false;
+            },
+            |state| state.nip98_replay = Arc::new(AlwaysFreshReplayGuard),
+        )
+        .await
     }
 
     /// Drive a single POST /events request through the router and return the
@@ -3483,16 +3441,13 @@ mod tests {
     /// Discriminating: if the `reject_with_transport` call in bridge.rs's
     /// `serde_json::from_slice` map_err closure is removed, this test fails.
     #[test]
-    #[ignore = "requires Postgres"]
     fn submit_event_invalid_json_body_increments_http_transport_counter() {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .expect("current_thread runtime");
 
-        let Some(state) = rt.block_on(bridge_handler_test_state()) else {
-            panic!("local Postgres not reachable — start Postgres on 127.0.0.1:5432 before running ignored bridge handler tests");
-        };
+        let state = rt.block_on(bridge_handler_test_state());
 
         // Provision a fresh community so bind_community succeeds.
         let host = {
@@ -3539,16 +3494,13 @@ mod tests {
     /// Discriminating: if the `reject_with_transport` call in bridge.rs's
     /// IngestError::Rejected match arm is removed, this test fails.
     #[test]
-    #[ignore = "requires Postgres"]
     fn submit_event_relay_only_kind_increments_http_transport_counter() {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .expect("current_thread runtime");
 
-        let Some(state) = rt.block_on(bridge_handler_test_state()) else {
-            panic!("local Postgres not reachable — start Postgres on 127.0.0.1:5432 before running ignored bridge handler tests");
-        };
+        let state = rt.block_on(bridge_handler_test_state());
 
         let host = {
             let h = format!("bridge-test-{}.local", uuid::Uuid::new_v4().simple());
@@ -3671,16 +3623,13 @@ mod tests {
     /// Discriminating: if the attribution log is removed from the ParseFail
     /// arm in submit_event, this test fails.
     #[test]
-    #[ignore = "requires Postgres"]
     fn submit_event_invalid_json_emits_exactly_one_attribution_line() {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .expect("current_thread runtime");
 
-        let state = rt
-            .block_on(bridge_handler_test_state())
-            .expect("local Postgres not reachable — start Postgres on 127.0.0.1:5432 before running ignored bridge handler tests");
+        let state = rt.block_on(bridge_handler_test_state());
 
         let host = {
             let h = format!("bridge-attr-{}.local", uuid::Uuid::new_v4().simple());
@@ -3722,16 +3671,13 @@ mod tests {
     /// Discriminating: if two log lines are emitted (old double-log bug), this
     /// test fails.
     #[test]
-    #[ignore = "requires Postgres"]
     fn submit_event_relay_only_kind_emits_exactly_one_attribution_line() {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .expect("current_thread runtime");
 
-        let state = rt
-            .block_on(bridge_handler_test_state())
-            .expect("local Postgres not reachable — start Postgres on 127.0.0.1:5432 before running ignored bridge handler tests");
+        let state = rt.block_on(bridge_handler_test_state());
 
         let host = {
             let h = format!("bridge-attr-{}.local", uuid::Uuid::new_v4().simple());

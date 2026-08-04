@@ -32,6 +32,17 @@ pub(crate) async fn test_state() -> Arc<AppState> {
 
 /// Build relay test state after applying test-specific configuration.
 pub(crate) async fn test_state_with_config(configure: impl FnOnce(&mut Config)) -> Arc<AppState> {
+    test_state_with_config_and_state(configure, |_| {}).await
+}
+
+/// Build relay test state with test-specific configuration and state overrides.
+///
+/// The latter is intentionally limited to test-only seams such as the NIP-98
+/// replay guard; database selection remains owned by this shared harness.
+pub(crate) async fn test_state_with_config_and_state(
+    configure: impl FnOnce(&mut Config),
+    configure_state: impl FnOnce(&mut AppState),
+) -> Arc<AppState> {
     let mut config = Config::from_env().expect("default config loads");
     config.require_relay_membership = false;
     config.redis_url = "redis://127.0.0.1:1".to_string();
@@ -68,7 +79,7 @@ pub(crate) async fn test_state_with_config(configure: impl FnOnce(&mut Config)) 
         buzz_workflow::WorkflowConfig::default(),
     ));
     let media_storage = buzz_media::MediaStorage::new(&config.media).expect("media storage");
-    let (state, _audit_shutdown) = AppState::new(
+    let (mut state, _audit_shutdown) = AppState::new(
         config,
         db,
         redis_pool,
@@ -80,6 +91,7 @@ pub(crate) async fn test_state_with_config(configure: impl FnOnce(&mut Config)) 
         nostr::Keys::generate(),
         media_storage,
     );
+    configure_state(&mut state);
     Arc::new(state)
 }
 

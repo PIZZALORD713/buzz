@@ -533,7 +533,6 @@ mod tests {
         }
     }
 
-    const TEST_DB_URL: &str = "postgres://buzz:buzz_dev@localhost:5432/buzz"; // sadscan:disable np.postgres.1
     const INGRESS_HOST: &str = "operator-ingress.example";
 
     fn nip98_auth_header(keys: &Keys, url: &str, method: &str, body: Option<&[u8]>) -> String {
@@ -569,51 +568,20 @@ mod tests {
         format!("Nostr {encoded}")
     }
 
-    async fn operator_test_state(operator_keys: &[Keys]) -> Option<Arc<AppState>> {
-        let mut config = crate::config::Config::from_env().ok()?;
-        config.database_url = TEST_DB_URL.to_string();
-        config.redis_url = "redis://127.0.0.1:1".to_string();
-        config.relay_url = "wss://tenant.example".to_string();
-        config.relay_operator_api_origin = Some(format!("http://{INGRESS_HOST}"));
-        config.relay_operator_pubkeys = operator_keys
-            .iter()
-            .map(|keys| keys.public_key().to_hex())
-            .collect();
-        config.require_relay_membership = true;
-
-        let pool = sqlx::PgPool::connect(TEST_DB_URL).await.ok()?;
-        let db = buzz_db::Db::from_pool(pool.clone());
-
-        let redis_pool = deadpool_redis::Config::from_url(&config.redis_url)
-            .create_pool(Some(deadpool_redis::Runtime::Tokio1))
-            .ok()?;
-        let pubsub = Arc::new(
-            buzz_pubsub::PubSubManager::new(&config.redis_url, redis_pool.clone())
-                .await
-                .ok()?,
-        );
-        let audit = buzz_audit::AuditService::new(pool.clone());
-        let auth = buzz_auth::AuthService::new(config.auth.clone());
-        let search = buzz_search::SearchService::new(pool.clone());
-        let workflow_engine = Arc::new(buzz_workflow::WorkflowEngine::new(
-            db.clone(),
-            buzz_workflow::WorkflowConfig::default(),
-        ));
-        let media_storage = buzz_media::MediaStorage::new(&config.media).ok()?;
-        let (mut state, _audit_shutdown) = AppState::new(
-            config,
-            db,
-            redis_pool,
-            audit,
-            pubsub,
-            auth,
-            search,
-            workflow_engine,
-            Keys::generate(),
-            media_storage,
-        );
-        state.nip98_replay = Arc::new(AlwaysFreshReplayGuard);
-        Some(Arc::new(state))
+    async fn operator_test_state(operator_keys: &[Keys]) -> Arc<AppState> {
+        crate::test_support::test_state_with_config_and_state(
+            |config| {
+                config.relay_url = "wss://tenant.example".to_string();
+                config.relay_operator_api_origin = Some(format!("http://{INGRESS_HOST}"));
+                config.relay_operator_pubkeys = operator_keys
+                    .iter()
+                    .map(|keys| keys.public_key().to_hex())
+                    .collect();
+                config.require_relay_membership = true;
+            },
+            |state| state.nip98_replay = Arc::new(AlwaysFreshReplayGuard),
+        )
+        .await
     }
 
     async fn read_json(response: axum::response::Response) -> Value {
@@ -703,13 +671,10 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires Postgres"]
     async fn non_allowlisted_operator_key_gets_403() {
         let operator = Keys::generate();
         let outsider = Keys::generate();
-        let Some(state) = operator_test_state(&[operator]).await else {
-            return;
-        };
+        let state = operator_test_state(&[operator]).await;
         let body = format!(
             r#"{{"host":"community-{}.example"}}"#,
             Uuid::new_v4().simple()
@@ -735,12 +700,9 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires Postgres"]
     async fn post_operator_body_requires_payload_tag() {
         let operator = Keys::generate();
-        let Some(state) = operator_test_state(std::slice::from_ref(&operator)).await else {
-            return;
-        };
+        let state = operator_test_state(std::slice::from_ref(&operator)).await;
         let body = format!(
             r#"{{"host":"community-{}.example"}}"#,
             Uuid::new_v4().simple()
@@ -774,12 +736,10 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires Postgres"]
+    #[ignore = "requires Postgres; SQLite skip: lookup_community_by_host_for_management — community lifecycle management is PostgreSQL-only"]
     async fn unmapped_management_host_can_check_availability() {
         let operator = Keys::generate();
-        let Some(state) = operator_test_state(std::slice::from_ref(&operator)).await else {
-            return;
-        };
+        let state = operator_test_state(std::slice::from_ref(&operator)).await;
         let host = format!("community-{}.example", Uuid::new_v4().simple());
         let query = format!("host={host}");
         let url = format!("http://{INGRESS_HOST}/operator/communities/availability?{query}");
@@ -803,13 +763,11 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires Postgres"]
+    #[ignore = "requires Postgres; SQLite skip: list_communities_owned_by — community lifecycle management is PostgreSQL-only"]
     async fn unmapped_management_host_can_list_owned_communities() {
         let operator = Keys::generate();
         let owner = Keys::generate();
-        let Some(state) = operator_test_state(std::slice::from_ref(&operator)).await else {
-            return;
-        };
+        let state = operator_test_state(std::slice::from_ref(&operator)).await;
         let owner_hex = owner.public_key().to_hex();
         let query = format!("owner_pubkey={owner_hex}");
         let url = format!("http://{INGRESS_HOST}/operator/communities?{query}");
@@ -836,14 +794,12 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires Postgres"]
+    #[ignore = "requires Postgres; SQLite skip: unarchive_community_owned_by — community lifecycle management is PostgreSQL-only"]
     async fn unarchive_restores_admission_and_is_idempotent_without_changing_ownership() {
         let operator = Keys::generate();
         let owner = Keys::generate();
         let outsider = Keys::generate();
-        let Some(state) = operator_test_state(std::slice::from_ref(&operator)).await else {
-            return;
-        };
+        let state = operator_test_state(std::slice::from_ref(&operator)).await;
         let host = format!("community-{}.example", Uuid::new_v4().simple());
         assert_eq!(
             provision_community(Arc::clone(&state), &operator, &host, &owner)
@@ -927,13 +883,11 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires Postgres"]
+    #[ignore = "requires Postgres; SQLite skip: archive_community_owned_by — community lifecycle management is PostgreSQL-only"]
     async fn archive_publish_failure_is_retryable_and_preserves_timestamp() {
         let operator = Keys::generate();
         let owner = Keys::generate();
-        let Some(state) = operator_test_state(std::slice::from_ref(&operator)).await else {
-            return;
-        };
+        let state = operator_test_state(std::slice::from_ref(&operator)).await;
         let host = format!("community-{}.example", Uuid::new_v4().simple());
         let owner_hex = owner.public_key().to_hex();
         let create_body = serde_json::json!({
@@ -1039,13 +993,11 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires Postgres"]
+    #[ignore = "requires Postgres; SQLite skip: create_community_with_owner — community lifecycle management is PostgreSQL-only"]
     async fn happy_path_create_returns_created_and_bootstraps_owner() {
         let operator = Keys::generate();
         let owner = Keys::generate();
-        let Some(state) = operator_test_state(std::slice::from_ref(&operator)).await else {
-            return;
-        };
+        let state = operator_test_state(std::slice::from_ref(&operator)).await;
         let host = format!("community-{}.example", Uuid::new_v4().simple());
         let response = provision_community(state.clone(), &operator, &host, &owner).await;
 
@@ -1075,13 +1027,11 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires Postgres"]
+    #[ignore = "requires Postgres; SQLite skip: create_community_with_owner — community lifecycle management is PostgreSQL-only"]
     async fn fresh_host_at_owner_limit_returns_limit_reached_conflict() {
         let operator = Keys::generate();
         let owner = Keys::generate();
-        let Some(state) = operator_test_state(std::slice::from_ref(&operator)).await else {
-            return;
-        };
+        let state = operator_test_state(std::slice::from_ref(&operator)).await;
 
         for _ in 0..buzz_db::relay_members::MAX_COMMUNITIES_PER_OWNER {
             let host = format!("community-{}.example", Uuid::new_v4().simple());
@@ -1112,14 +1062,12 @@ mod tests {
     /// the old owner to `member`, and publishes a NIP-43 snapshot reflecting the
     /// new roles.
     #[tokio::test]
-    #[ignore = "requires Postgres"]
+    #[ignore = "requires Postgres; SQLite skip: transfer_ownership — relay membership maintenance is PostgreSQL-only"]
     async fn happy_path_transfer_swaps_owner_and_demotes_old_to_member() {
         let operator = Keys::generate();
         let initial_owner = Keys::generate();
         let new_owner = Keys::generate();
-        let Some(state) = operator_test_state(std::slice::from_ref(&operator)).await else {
-            return;
-        };
+        let state = operator_test_state(std::slice::from_ref(&operator)).await;
 
         let host = format!("community-{}.example", Uuid::new_v4().simple());
         let create_response =
@@ -1199,13 +1147,10 @@ mod tests {
 
     /// Transfer with an invalid community_id returns 400.
     #[tokio::test]
-    #[ignore = "requires Postgres"]
     async fn transfer_with_invalid_community_id_returns_400() {
         let operator = Keys::generate();
         let new_owner = Keys::generate();
-        let Some(state) = operator_test_state(std::slice::from_ref(&operator)).await else {
-            return;
-        };
+        let state = operator_test_state(std::slice::from_ref(&operator)).await;
         let body = serde_json::json!({
             "community_id": "not-a-uuid",
             "new_owner_pubkey": new_owner.public_key().to_hex(),
@@ -1226,12 +1171,9 @@ mod tests {
 
     /// Transfer with an invalid new_owner_pubkey returns 400.
     #[tokio::test]
-    #[ignore = "requires Postgres"]
     async fn transfer_with_invalid_pubkey_returns_400() {
         let operator = Keys::generate();
-        let Some(state) = operator_test_state(std::slice::from_ref(&operator)).await else {
-            return;
-        };
+        let state = operator_test_state(std::slice::from_ref(&operator)).await;
         let body = serde_json::json!({
             "community_id": Uuid::new_v4().to_string(),
             "new_owner_pubkey": "not-a-pubkey",

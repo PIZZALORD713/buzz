@@ -2644,14 +2644,8 @@ mod sec005_read_gate_tests {
 
     // ── authorize_git_read matrix (requires Postgres) ────────────────────
 
-    const TEST_DB_URL: &str = "postgres://buzz:buzz_dev@localhost:5432/buzz"; // sadscan:disable np.postgres.1
-
     async fn setup_db() -> buzz_db::Db {
-        let url = std::env::var("BUZZ_TEST_DATABASE_URL")
-            .or_else(|_| std::env::var("DATABASE_URL"))
-            .unwrap_or_else(|_| TEST_DB_URL.to_string());
-        let pool = sqlx::PgPool::connect(&url).await.expect("connect test DB");
-        buzz_db::Db::from_pool(pool)
+        crate::test_support::test_state().await.db.clone()
     }
 
     /// How the fixture's kind:30617 binds (or fails to bind) a channel.
@@ -2754,7 +2748,6 @@ mod sec005_read_gate_tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires Postgres"]
     async fn read_gate_allows_current_member_denies_removed_and_owner_bypass() {
         let f = setup_repo(Binding::Channel).await;
 
@@ -2800,7 +2793,6 @@ mod sec005_read_gate_tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires Postgres"]
     async fn read_gate_denies_missing_or_malformed_binding_and_absent_repo() {
         // Missing buzz-channel tag → deny even for a channel member, with
         // the generic body: the remediation carve-out is author-only.
@@ -2880,7 +2872,6 @@ mod sec005_read_gate_tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires Postgres"]
     async fn read_gate_gives_author_of_unbound_repo_remediation_body() {
         // Issue #3527: the author of a never-bound announcement is the one
         // identity that can fix it (30617 is keyed by (author, d)) and the
@@ -2927,7 +2918,6 @@ mod sec005_read_gate_tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires Postgres"]
     async fn read_gate_follows_current_announcement_not_stale_registry() {
         // Max's registry/pointer concern: a soft-deleted 30617 can leave the
         // `git_repo_names` reservation and the manifest pointer alive. Reads

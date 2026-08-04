@@ -696,63 +696,24 @@ mod tests {
     // explicitly in CI's Backend Integration job; requires local Postgres
     // (and hard-fails rather than skipping when it is unreachable).
 
-    const TEST_DB_URL: &str = "postgres://buzz:buzz_dev@localhost:5432/buzz"; // sadscan:disable np.postgres.1
-
     /// Build a real `AppState` + tenant for a fresh community on `host`, with
-    /// `require_relay_membership` set as given. Mirrors
-    /// `api::invites::tests::invite_test_state`.
+    /// `require_relay_membership` set as given.
     async fn workspace_profile_test_state(
         host: &str,
         require_relay_membership: bool,
     ) -> (Arc<AppState>, TenantContext) {
-        let mut config = crate::config::Config::from_env().expect("config from env");
-        let database_url = std::env::var("BUZZ_TEST_DATABASE_URL")
-            .or_else(|_| std::env::var("DATABASE_URL"))
-            .unwrap_or_else(|_| TEST_DB_URL.to_string());
-        config.database_url = database_url.clone();
-        config.redis_url = "redis://127.0.0.1:1".to_string();
-        config.relay_url = format!("wss://{host}");
-        config.require_relay_membership = require_relay_membership;
-
-        let pool = sqlx::PgPool::connect(&database_url)
-            .await
-            .expect("requires reachable Postgres");
-        let db = buzz_db::Db::from_pool(pool.clone());
-        let record = db
+        let state = crate::test_support::test_state_with_config(|config| {
+            config.relay_url = format!("wss://{host}");
+            config.require_relay_membership = require_relay_membership;
+        })
+        .await;
+        let record = state
+            .db
             .ensure_configured_community(host)
             .await
             .expect("ensure community");
         let tenant = TenantContext::resolved(record.id, host);
-
-        let redis_pool = deadpool_redis::Config::from_url(&config.redis_url)
-            .create_pool(Some(deadpool_redis::Runtime::Tokio1))
-            .expect("redis pool config");
-        let pubsub = Arc::new(
-            buzz_pubsub::PubSubManager::new(&config.redis_url, redis_pool.clone())
-                .await
-                .expect("pubsub manager"),
-        );
-        let audit = buzz_audit::AuditService::new(pool.clone());
-        let auth = buzz_auth::AuthService::new(config.auth.clone());
-        let search = buzz_search::SearchService::new(pool.clone());
-        let workflow_engine = Arc::new(buzz_workflow::WorkflowEngine::new(
-            db.clone(),
-            buzz_workflow::WorkflowConfig::default(),
-        ));
-        let media_storage = buzz_media::MediaStorage::new(&config.media).expect("media storage");
-        let (state, _audit_shutdown) = AppState::new(
-            config,
-            db,
-            redis_pool,
-            audit,
-            pubsub,
-            auth,
-            search,
-            workflow_engine,
-            Keys::generate(),
-            media_storage,
-        );
-        (Arc::new(state), tenant)
+        (state, tenant)
     }
 
     /// Sign a fresh kind:9033 with `icon` and run it through the real
@@ -785,7 +746,6 @@ mod tests {
     /// Discriminating: fails if the call site inverts or drops
     /// `require_relay_membership`, or stops consulting `has_admin_or_owner`.
     #[tokio::test]
-    #[ignore = "requires Postgres"]
     async fn open_relay_9033_admits_roleless_only_until_a_steward_exists() {
         let host = format!("icon-gate-open-{}.example", uuid::Uuid::new_v4().simple());
         let (state, tenant) = workspace_profile_test_state(&host, false).await;
@@ -844,7 +804,6 @@ mod tests {
     /// branch. Together with the open-relay test this kills the inverted-flag
     /// mutant: no assignment of the flag satisfies both.
     #[tokio::test]
-    #[ignore = "requires Postgres"]
     async fn closed_relay_9033_still_requires_admin_or_owner() {
         let host = format!("icon-gate-closed-{}.example", uuid::Uuid::new_v4().simple());
         let (state, tenant) = workspace_profile_test_state(&host, true).await;
