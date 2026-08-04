@@ -78,7 +78,7 @@ Set `BUZZ_ADMIN_AUTH` to one of:
 | `token` | Requires `Authorization: Bearer <token>` where the token equals `BUZZ_ADMIN_TOKEN` |
 | `disabled` | No credential required (development use only) |
 
-The default is `nip98`.
+The default is `token`.
 
 ## Desktop app
 

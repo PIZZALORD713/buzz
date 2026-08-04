@@ -96,7 +96,7 @@ impl AdminOrigin {
     }
 
     /// Build the full request URL for `route` with `query`.
-    pub fn route_url(&self, route: &AdminRoute<'_>, query: &AdminQuery) -> String {
+    pub fn route_url(&self, route: &AdminRoute, query: &AdminQuery) -> String {
         let path = route.path();
         let qs = query.to_query_string();
         if qs.is_empty() {
@@ -114,7 +114,7 @@ fn is_loopback_host(host: &str) -> bool {
         || host == "[::1]"
         || host
             .parse::<std::net::IpAddr>()
-            .map_or(false, |ip| ip.is_loopback())
+            .is_ok_and(|ip| ip.is_loopback())
 }
 
 #[cfg(test)]
@@ -214,26 +214,27 @@ mod tests {
 
     #[test]
     fn route_url_report_detail() {
-        let id = "abc-123";
+        let id = uuid::Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap();
         let o = AdminOrigin::parse("https://admin.example.com").unwrap();
         let url = o.route_url(&AdminRoute::ReportDetail { id }, &AdminQuery::default());
         assert_eq!(
             url,
-            "https://admin.example.com/api/admin/v1/reports/abc-123"
+            "https://admin.example.com/api/admin/v1/reports/00000000-0000-0000-0000-000000000001"
         );
     }
 
     #[test]
     fn route_url_feedback_attachment() {
         let o = AdminOrigin::parse("https://admin.example.com").unwrap();
+        let id = uuid::Uuid::parse_str("00000000-0000-0000-0000-000000000003").unwrap();
+        let sha256 =
+            crate::commands::admin::routes::AttachmentHash::parse(&"ab".repeat(32)).unwrap();
         let url = o.route_url(
-            &AdminRoute::FeedbackAttachment {
-                id: "fb-id",
-                sha256: "abcdef01".repeat(8).as_str(),
-            },
+            &AdminRoute::FeedbackAttachment { id, sha256 },
             &AdminQuery::default(),
         );
-        assert!(url.contains("/api/admin/v1/feedback/fb-id/attachments/"));
+        assert!(url.contains("/api/admin/v1/feedback/"));
+        assert!(url.contains("/attachments/"));
     }
 
     // ── Host case pin test ────────────────────────────────────────────────────

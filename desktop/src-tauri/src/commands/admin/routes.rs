@@ -1,22 +1,62 @@
 //! Closed route enum and typed query parameters for the admin API.
 //!
 //! No IPC surface accepts an arbitrary path; every URL is constructed here
-//! from a typed route and typed query parameters.
+//! from a typed route and typed query parameters. IDs are carried as `Uuid`
+//! values so path injection is structurally impossible; the attachment hash is
+//! validated to match the relay's exact lowercase-hex-only grammar before a
+//! route is constructed.
+
+/// A validated lowercase 64-hex SHA-256 hash suitable for use as an attachment
+/// path segment. Constructed only through [`AttachmentHash::parse`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AttachmentHash(String);
+
+impl AttachmentHash {
+    /// Parse `raw` as a lowercase 64-hex SHA-256. Returns `Err` for any input
+    /// that isn't exactly 64 lowercase hex digits, including uppercase A-F (the
+    /// relay stores lowercase and returns 404 on uppercase).
+    pub fn parse(raw: &str) -> Result<Self, String> {
+        if raw.len() != 64 {
+            return Err(format!(
+                "attachment hash must be exactly 64 hex characters; got {} characters",
+                raw.len()
+            ));
+        }
+        if !raw.chars().all(|c| matches!(c, '0'..='9' | 'a'..='f')) {
+            return Err("attachment hash must be lowercase hex only (0-9, a-f); \
+                 uppercase is rejected — the relay stores lowercase and returns 404 otherwise"
+                .to_string());
+        }
+        Ok(AttachmentHash(raw.to_string()))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
 
 /// The five read routes exposed by `/api/admin/v1`.
 ///
-/// Named `'_` lifetime on borrowed id/sha256 fields so callers can pass
-/// `&str` slices without allocating.
+/// IDs are typed `Uuid` — path injection via slash, `..`, `?`, `#`, or
+/// percent-escapes is structurally impossible. The attachment hash is an
+/// `AttachmentHash`, enforcing exact lowercase-hex grammar.
 #[derive(Debug)]
-pub enum AdminRoute<'a> {
+pub enum AdminRoute {
     ReportsList,
-    ReportDetail { id: &'a str },
+    ReportDetail {
+        id: uuid::Uuid,
+    },
     FeedbackList,
-    FeedbackDetail { id: &'a str },
-    FeedbackAttachment { id: &'a str, sha256: &'a str },
+    FeedbackDetail {
+        id: uuid::Uuid,
+    },
+    FeedbackAttachment {
+        id: uuid::Uuid,
+        sha256: AttachmentHash,
+    },
 }
 
-impl<'a> AdminRoute<'a> {
+impl AdminRoute {
     /// Return the URL path component (not including the `/api/admin/v1` prefix).
     pub fn path(&self) -> String {
         match self {
@@ -25,7 +65,7 @@ impl<'a> AdminRoute<'a> {
             AdminRoute::FeedbackList => "/feedback".to_string(),
             AdminRoute::FeedbackDetail { id } => format!("/feedback/{id}"),
             AdminRoute::FeedbackAttachment { id, sha256 } => {
-                format!("/feedback/{id}/attachments/{sha256}")
+                format!("/feedback/{id}/attachments/{}", sha256.as_str())
             }
         }
     }
@@ -85,6 +125,70 @@ fn urlencoded(value: &str) -> String {
 mod tests {
     use super::*;
 
+    // ── AttachmentHash validation ─────────────────────────────────────────────
+
+    #[test]
+    fn attachment_hash_valid_lowercase_hex() {
+        let h = AttachmentHash::parse(&"a".repeat(64)).unwrap();
+        assert_eq!(h.as_str(), "a".repeat(64));
+    }
+
+    #[test]
+    fn attachment_hash_rejects_too_short() {
+        assert!(AttachmentHash::parse(&"a".repeat(63)).is_err());
+    }
+
+    #[test]
+    fn attachment_hash_rejects_too_long() {
+        assert!(AttachmentHash::parse(&"a".repeat(65)).is_err());
+    }
+
+    #[test]
+    fn attachment_hash_rejects_uppercase() {
+        // Uppercase passes is_ascii_hexdigit() but the relay returns 404 for it.
+        // AttachmentHash::parse must reject uppercase.
+        assert!(AttachmentHash::parse(&"A".repeat(64)).is_err());
+        let mixed = format!("{}A{}", "a".repeat(32), "a".repeat(31));
+        assert!(AttachmentHash::parse(&mixed).is_err());
+    }
+
+    #[test]
+    fn attachment_hash_rejects_non_hex_chars() {
+        // 'g' is not a hex digit.
+        assert!(AttachmentHash::parse(&"g".repeat(64)).is_err());
+    }
+
+    #[test]
+    fn attachment_hash_rejects_slash() {
+        let s = format!("{}/{}", "a".repeat(32), "a".repeat(31));
+        assert!(AttachmentHash::parse(&s).is_err());
+    }
+
+    #[test]
+    fn attachment_hash_rejects_dot_dot() {
+        let s = format!("{}..{}", "a".repeat(31), "a".repeat(31));
+        assert!(AttachmentHash::parse(&s).is_err());
+    }
+
+    #[test]
+    fn attachment_hash_rejects_percent_escape() {
+        // URL-encoded slash would be %2F — 3 chars, must fail length check too.
+        assert!(AttachmentHash::parse("%2F").is_err());
+        // But also reject any % in a 64-char input.
+        let s = format!("{}%2{}", "a".repeat(31), "a".repeat(31));
+        assert!(AttachmentHash::parse(&s).is_err());
+    }
+
+    #[test]
+    fn attachment_hash_rejects_query_fragment() {
+        let s = format!("{}?{}", "a".repeat(32), "a".repeat(31));
+        assert!(AttachmentHash::parse(&s).is_err());
+        let s2 = format!("{}#{}", "a".repeat(32), "a".repeat(31));
+        assert!(AttachmentHash::parse(&s2).is_err());
+    }
+
+    // ── AdminRoute::path ─────────────────────────────────────────────────────
+
     #[test]
     fn reports_list_path() {
         assert_eq!(AdminRoute::ReportsList.path(), "/reports");
@@ -92,24 +196,32 @@ mod tests {
 
     #[test]
     fn report_detail_path() {
+        let id = uuid::Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap();
         assert_eq!(
-            AdminRoute::ReportDetail { id: "abc-123" }.path(),
-            "/reports/abc-123"
+            AdminRoute::ReportDetail { id }.path(),
+            "/reports/00000000-0000-0000-0000-000000000001"
         );
     }
 
     #[test]
     fn feedback_attachment_path() {
-        let hash = "a".repeat(64);
+        let id = uuid::Uuid::parse_str("00000000-0000-0000-0000-000000000002").unwrap();
+        let hash = AttachmentHash::parse(&"ab".repeat(32)).unwrap();
+        let path = AdminRoute::FeedbackAttachment {
+            id,
+            sha256: hash.clone(),
+        }
+        .path();
         assert_eq!(
-            AdminRoute::FeedbackAttachment {
-                id: "fb-id",
-                sha256: &hash
-            }
-            .path(),
-            format!("/feedback/fb-id/attachments/{hash}")
+            path,
+            format!(
+                "/feedback/00000000-0000-0000-0000-000000000002/attachments/{}",
+                hash.as_str()
+            )
         );
     }
+
+    // ── AdminQuery ───────────────────────────────────────────────────────────
 
     #[test]
     fn query_empty_produces_no_string() {

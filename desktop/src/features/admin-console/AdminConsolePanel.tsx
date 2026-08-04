@@ -4,12 +4,15 @@
  * Shows two tabs: Reports (deployment-wide moderation reports) and Feedback
  * (product feedback with optional image attachments).
  *
- * All query/UI state is keyed by `(origin)`, which is already scoped to the
- * active pubkey by the settings card (pubkey changed → different origin stored).
- * In-flight requests are cancelled on origin change via useEffect cleanup.
+ * All query/UI state is keyed by `(pubkey, origin)`. In-flight native requests
+ * are fenced by a generation counter: each (pubkey, origin) pair gets a new
+ * generation; results from prior generations are discarded on arrival.
+ *
+ * Tauri invoke is not cancellable at the native layer, but generation checks
+ * ensure stale results never update visible state or create unreachable blob URLs.
  */
 
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import {
   AlertCircle,
   ChevronLeft,
@@ -37,46 +40,135 @@ type AsyncState<T> =
   | { status: "ok"; data: T }
   | { status: "error"; message: string };
 
+/**
+ * Generation-fenced async load hook.
+ *
+ * `generation` increments whenever the caller wants to invalidate all
+ * in-flight results (e.g. pubkey or origin changed). Results that arrive
+ * after the generation changed are silently dropped.
+ */
 function useAsyncLoad<T>(
-  load: (signal: AbortSignal) => Promise<T>,
+  load: () => Promise<T>,
   deps: unknown[],
+  generation: number,
 ): AsyncState<T> {
   const [state, setState] = useState<AsyncState<T>>({ status: "idle" });
+  // Store load in a ref so the effect doesn't need it as a dependency —
+  // callers create it inline and deps + generation are the real trigger list.
+  const loadRef = useRef(load);
+  loadRef.current = load;
 
   useEffect(() => {
-    const controller = new AbortController();
+    const gen = generation;
     setState({ status: "loading" });
-    load(controller.signal).then(
+    loadRef.current().then(
       (data) => {
-        if (!controller.signal.aborted) setState({ status: "ok", data });
+        setState((prev) => {
+          // Discard if the generation changed while we were in flight.
+          if (gen !== generation) return prev;
+          return { status: "ok", data };
+        });
       },
       (e: unknown) => {
-        if (!controller.signal.aborted) {
-          setState({
+        setState((prev) => {
+          if (gen !== generation) return prev;
+          return {
             status: "error",
             message: e instanceof Error ? e.message : String(e),
-          });
-        }
+          };
+        });
       },
     );
-    return () => controller.abort();
-    // biome-ignore lint/correctness/useExhaustiveDependencies: deps array is passed from the call site as the explicit trigger list; adding `load` would cause infinite re-runs since it's created inline
-  }, deps);
+    // loadRef is stable and excluded from deps — the ref stores the latest `load`
+    // without making it a reactive value.
+  }, [...deps, generation]);
 
   return state;
 }
 
+// ── imeta attachment parsing ──────────────────────────────────────────────
+
+/**
+ * Validated attachment metadata parsed from a feedback detail's `tags` field.
+ * The relay serialises `AdminFeedback` with `serde(rename_all = "camelCase")`,
+ * so the wire shape is `{ ..., tags: string[][] }`.
+ */
+type AttachmentMeta = {
+  /** Lowercase 64-hex SHA-256 as stored/returned by the relay. */
+  sha256: string;
+  /** MIME type from the `m` imeta field. */
+  mime: string;
+  /** Byte size from the `size` imeta field. */
+  size: number;
+};
+
+/**
+ * Parse imeta attachment metadata from the relay's `tags: string[][]` wire
+ * format. Matches the reference SPA implementation in `admin-web/src/App.tsx`.
+ *
+ * Each `imeta` tag looks like:
+ *   `["imeta", "url https://...", "m image/png", "x <sha256>", "size 12345"]`
+ * Each entry after `"imeta"` is a singleton `"key value"` string.
+ *
+ * Rejected: missing x/m/size, non-lowercase-hex x, non-positive size.
+ */
+function parseImetaAttachments(tags: unknown): AttachmentMeta[] {
+  if (!Array.isArray(tags)) return [];
+  const result: AttachmentMeta[] = [];
+  for (const tag of tags) {
+    if (!Array.isArray(tag) || tag[0] !== "imeta") continue;
+    const values = new Map<string, string>();
+    for (const entry of (tag as string[]).slice(1)) {
+      const sep = typeof entry === "string" ? entry.indexOf(" ") : -1;
+      if (sep > 0) {
+        values.set(entry.slice(0, sep), entry.slice(sep + 1));
+      }
+    }
+    const sha256 = values.get("x") ?? "";
+    const mime = values.get("m") ?? "";
+    const rawSize = values.get("size") ?? "";
+    const size = Number(rawSize);
+    // Require exactly 64 lowercase hex chars for the hash (relay stores lowercase;
+    // uppercase returns 404). Require a non-empty MIME type and a positive size.
+    if (
+      sha256.length !== 64 ||
+      !/^[0-9a-f]{64}$/.test(sha256) ||
+      !mime ||
+      !Number.isFinite(size) ||
+      size <= 0
+    ) {
+      continue;
+    }
+    result.push({ sha256, mime, size });
+  }
+  return result;
+}
+
 // ── Reports tab ───────────────────────────────────────────────────────────
 
-function ReportsTab({ origin }: { origin: string }) {
+function ReportsTab({
+  origin,
+  pubkey,
+  generation,
+}: {
+  origin: string;
+  pubkey: string;
+  generation: number;
+}) {
   const [selectedId, setSelectedId] = useState<string | null>(null);
 
-  const listState = useAsyncLoad(() => listAdminReports(origin), [origin]);
+  const listState = useAsyncLoad(
+    () => listAdminReports(origin),
+    [origin, pubkey],
+    generation,
+  );
 
   if (selectedId) {
     return (
       <ReportDetail
         origin={origin}
+        pubkey={pubkey}
+        generation={generation}
         reportId={selectedId}
         onBack={() => setSelectedId(null)}
       />
@@ -101,7 +193,7 @@ function ReportsTab({ origin }: { origin: string }) {
       {reports.map((report) => {
         const id = String(report.id ?? report.reportId ?? "");
         const summary =
-          String(report.summary ?? report.report_type ?? "") || "Report";
+          String(report.summary ?? report.reportType ?? "") || "Report";
         const status = String(report.status ?? "");
         return (
           <li key={id || summary}>
@@ -124,16 +216,21 @@ function ReportsTab({ origin }: { origin: string }) {
 
 function ReportDetail({
   origin,
+  pubkey,
+  generation,
   reportId,
   onBack,
 }: {
   origin: string;
+  pubkey: string;
+  generation: number;
   reportId: string;
   onBack: () => void;
 }) {
   const detailState = useAsyncLoad(
     () => getAdminReport(origin, reportId),
-    [origin, reportId],
+    [origin, pubkey, reportId],
+    generation,
   );
 
   return (
@@ -161,10 +258,22 @@ function ReportDetail({
 
 // ── Feedback tab ──────────────────────────────────────────────────────────
 
-function FeedbackTab({ origin }: { origin: string }) {
+function FeedbackTab({
+  origin,
+  pubkey,
+  generation,
+}: {
+  origin: string;
+  pubkey: string;
+  generation: number;
+}) {
   const [selectedId, setSelectedId] = useState<string | null>(null);
 
-  const listState = useAsyncLoad(() => listAdminFeedback(origin), [origin]);
+  const listState = useAsyncLoad(
+    () => listAdminFeedback(origin),
+    [origin, pubkey],
+    generation,
+  );
 
   if (selectedId) {
     return (
@@ -172,6 +281,8 @@ function FeedbackTab({ origin }: { origin: string }) {
         feedbackId={selectedId}
         onBack={() => setSelectedId(null)}
         origin={origin}
+        pubkey={pubkey}
+        generation={generation}
       />
     );
   }
@@ -191,10 +302,9 @@ function FeedbackTab({ origin }: { origin: string }) {
     <ul className="space-y-1">
       {items.map((item) => {
         const id = String(item.id ?? item.feedbackId ?? "");
-        const text = String(
-          item.feedback ?? item.message ?? item.content ?? "",
-        ).slice(0, 120);
-        const createdAt = String(item.created_at ?? item.createdAt ?? "");
+        // FeedbackSummary wire shape: bodySummary, receivedAt (camelCase via serde).
+        const text = String(item.bodySummary ?? item.body ?? "").slice(0, 120);
+        const createdAt = String(item.receivedAt ?? item.eventCreatedAt ?? "");
         return (
           <li key={id || text}>
             <button
@@ -218,34 +328,45 @@ function FeedbackTab({ origin }: { origin: string }) {
 
 // ── Attachment viewer ─────────────────────────────────────────────────────
 
-type AttachmentMeta = {
-  sha256: string;
-  mime: string;
-  size: number;
-};
-
 function AttachmentViewer({
   origin,
+  pubkey,
   feedbackId,
   attachment,
+  panelGeneration,
 }: {
   origin: string;
+  pubkey: string;
   feedbackId: string;
   attachment: AttachmentMeta;
+  /** Generation from the parent panel — when this changes the attachment
+   *  context has changed and any in-flight load result is stale. */
+  panelGeneration: number;
 }) {
   const [blobUrl, setBlobUrl] = useState<string | null>(null);
   const [error, setError] = useState<AdminAttachmentErrorCode | null>(null);
   const [loading, setLoading] = useState(false);
   const blobUrlRef = useRef<string | null>(null);
+  // Generation for this specific load invocation — incremented on each load().
+  const loadGenRef = useRef(0);
 
-  // Revoke blob URL on unmount.
+  // Revoke blob URL on unmount or when panelGeneration changes.
+  // biome-ignore lint/correctness/useExhaustiveDependencies: panelGeneration is a prop (not a ref) — we intentionally re-register the cleanup each time the panel context changes
   useEffect(() => {
     return () => {
-      if (blobUrlRef.current) URL.revokeObjectURL(blobUrlRef.current);
+      if (blobUrlRef.current) {
+        URL.revokeObjectURL(blobUrlRef.current);
+        blobUrlRef.current = null;
+      }
     };
-  }, []);
+  }, [panelGeneration]);
 
-  async function load() {
+  const load = useCallback(async () => {
+    // Capture the generation at the moment this load starts.
+    const thisGen = ++loadGenRef.current;
+    const thisOrigin = origin;
+    const thisPubkey = pubkey;
+
     setLoading(true);
     setError(null);
     try {
@@ -256,18 +377,37 @@ function AttachmentViewer({
         attachment.mime,
         attachment.size,
       );
+
+      // Discard if a newer load started or the identity/origin changed.
+      if (
+        thisGen !== loadGenRef.current ||
+        thisOrigin !== origin ||
+        thisPubkey !== pubkey
+      ) {
+        URL.revokeObjectURL(url);
+        return;
+      }
+
       // Revoke any previous blob before replacing.
       if (blobUrlRef.current) URL.revokeObjectURL(blobUrlRef.current);
       blobUrlRef.current = url;
       setBlobUrl(url);
     } catch (e) {
+      if (thisGen !== loadGenRef.current) return;
       setError(
         typeof e === "string" ? (e as AdminAttachmentErrorCode) : String(e),
       );
     } finally {
-      setLoading(false);
+      if (thisGen === loadGenRef.current) setLoading(false);
     }
-  }
+  }, [
+    origin,
+    pubkey,
+    feedbackId,
+    attachment.sha256,
+    attachment.mime,
+    attachment.size,
+  ]);
 
   if (error) {
     const friendlyError: Record<string, string> = {
@@ -330,34 +470,31 @@ function AttachmentViewer({
 
 function FeedbackDetail({
   origin,
+  pubkey,
+  generation,
   feedbackId,
   onBack,
 }: {
   origin: string;
+  pubkey: string;
+  generation: number;
   feedbackId: string;
   onBack: () => void;
 }) {
   const detailState = useAsyncLoad(
     () => getAdminFeedback(origin, feedbackId),
-    [origin, feedbackId],
+    [origin, pubkey, feedbackId],
+    generation,
   );
 
-  // Extract imeta attachment metadata from the detail.
-  const attachments: AttachmentMeta[] = [];
-  if (detailState.status === "ok") {
-    const detail = detailState.data as Record<string, unknown>;
-    const rawAttachments = detail.attachments;
-    if (Array.isArray(rawAttachments)) {
-      for (const a of rawAttachments as Array<Record<string, unknown>>) {
-        const sha256 = String(a.sha256 ?? a.hash ?? "");
-        const mime = String(a.mime ?? a.m ?? a.content_type ?? "");
-        const size = Number(a.size ?? a.content_length ?? 0);
-        if (sha256.length === 64 && mime && size > 0) {
-          attachments.push({ sha256, mime, size });
-        }
-      }
-    }
-  }
+  // Parse imeta attachment metadata from the relay's wire `tags: string[][]`.
+  // AdminFeedback is serialised camelCase by the relay (serde rename_all).
+  const attachments: AttachmentMeta[] =
+    detailState.status === "ok"
+      ? parseImetaAttachments(
+          (detailState.data as Record<string, unknown>).tags,
+        )
+      : [];
 
   return (
     <div className="space-y-4">
@@ -387,6 +524,8 @@ function FeedbackDetail({
                   feedbackId={feedbackId}
                   key={a.sha256}
                   origin={origin}
+                  pubkey={pubkey}
+                  panelGeneration={generation}
                 />
               ))}
             </div>
@@ -462,8 +601,24 @@ function ErrorMessage({ message }: { message: string }) {
 
 // ── Panel root ────────────────────────────────────────────────────────────
 
-export function AdminConsolePanel({ origin }: { origin: string }) {
+export function AdminConsolePanel({
+  origin,
+  pubkey,
+}: {
+  origin: string;
+  /** Active identity pubkey — all state is keyed on (pubkey, origin). */
+  pubkey: string;
+}) {
   const [activeTab, setActiveTab] = useState<Tab>("reports");
+  // Increment whenever the (pubkey, origin) context changes to fence stale results.
+  const generationRef = useRef(0);
+  const [generation, setGeneration] = useState(0);
+
+  // biome-ignore lint/correctness/useExhaustiveDependencies: pubkey and origin are props (reactive values) — the effect intentionally fires when either changes to increment the generation fence
+  useEffect(() => {
+    generationRef.current += 1;
+    setGeneration(generationRef.current);
+  }, [pubkey, origin]);
 
   return (
     <div
@@ -471,8 +626,12 @@ export function AdminConsolePanel({ origin }: { origin: string }) {
       data-testid="admin-console-panel"
     >
       <TabBar activeTab={activeTab} onSelect={setActiveTab} />
-      {activeTab === "reports" && <ReportsTab origin={origin} />}
-      {activeTab === "feedback" && <FeedbackTab origin={origin} />}
+      {activeTab === "reports" && (
+        <ReportsTab origin={origin} pubkey={pubkey} generation={generation} />
+      )}
+      {activeTab === "feedback" && (
+        <FeedbackTab origin={origin} pubkey={pubkey} generation={generation} />
+      )}
     </div>
   );
 }

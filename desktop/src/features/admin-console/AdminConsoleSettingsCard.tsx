@@ -305,7 +305,7 @@ export function AdminConsoleSettingsCard() {
       </div>
 
       {isAuthorized && savedOrigin && (
-        <AdminConsolePanel origin={savedOrigin} />
+        <AdminConsolePanel origin={savedOrigin} pubkey={pubkeyHex} />
       )}
     </section>
   );
