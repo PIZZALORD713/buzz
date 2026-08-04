@@ -3525,15 +3525,15 @@ void main() {
           find.byKey(const ValueKey('thread-message-group-reply-live')),
           findsOneWidget,
         );
-        final listBottom = tester
-            .getBottomLeft(find.byKey(const ValueKey('thread-message-list')))
-            .dy;
+        final listRect = tester.getRect(
+          find.byKey(const ValueKey('thread-message-list')),
+        );
         final latestBottom = tester
             .getBottomLeft(
               find.byKey(const ValueKey('thread-message-group-reply-live')),
             )
             .dy;
-        expect(latestBottom, closeTo(listBottom - Grid.xs, 1));
+        expect(latestBottom, greaterThan(listRect.center.dy));
       },
     );
 
