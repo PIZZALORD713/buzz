@@ -6562,6 +6562,65 @@ mod tests {
         .await;
     }
 
+    /// Migrations must outlive the runtime caps — an index build or an
+    /// `ACCESS EXCLUSIVE` wait routinely exceeds them, and startup treats a
+    /// migration failure as fatal — and the relaxed session must not survive
+    /// into the pool afterwards.
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn migrations_ignore_runtime_timeouts_and_leak_no_relaxed_session() {
+        const TIGHT: &str = "50ms";
+
+        let admin = PgPool::connect(&admin_url().await)
+            .await
+            .expect("connect admin");
+        let name = format!("migration_timeouts_{}", Uuid::new_v4().simple());
+        sqlx::query(sqlx::AssertSqlSafe(format!("CREATE DATABASE {name}")))
+            .execute(&admin)
+            .await
+            .expect("create scratch db");
+        let base = admin_url().await;
+        let idx = base.rfind('/').expect("db url has a path segment");
+        let scratch_url = format!("{}/{}", &base[..idx], name);
+
+        // Far shorter than the migration suite needs, ample for a pooled query.
+        let db = Db::new(&DbConfig {
+            database_url: scratch_url,
+            max_connections: 2,
+            min_connections: 2,
+            statement_timeout: TIGHT.to_string(),
+            lock_timeout: TIGHT.to_string(),
+            ..DbConfig::default()
+        })
+        .await
+        .expect("connect Db against the unmigrated scratch db");
+
+        db.migrate()
+            .await
+            .expect("migrations must not inherit the runtime caps");
+
+        // Hold every connection at once so a leaked relaxed session cannot hide
+        // behind a freshly dialed one.
+        let mut held = Vec::new();
+        for _ in 0..2 {
+            let mut connection = db.pool.acquire().await.expect("acquire pooled connection");
+            let statement_timeout: String = sqlx::query_scalar("SHOW statement_timeout")
+                .fetch_one(&mut *connection)
+                .await
+                .expect("SHOW statement_timeout");
+            let lock_timeout: String = sqlx::query_scalar("SHOW lock_timeout")
+                .fetch_one(&mut *connection)
+                .await
+                .expect("SHOW lock_timeout");
+            assert_eq!(statement_timeout, TIGHT);
+            assert_eq!(lock_timeout, TIGHT);
+            held.push(connection);
+        }
+        drop(held);
+
+        drop_scratch_db(&admin, db.pool.clone(), &name).await;
+    }
+
     /// Insert identical community + channel rows into a database so the same
     /// (community, channel) ids resolve in both writer and replica.
     async fn seed_community_channel(

@@ -38,18 +38,31 @@ pub async fn run_migrations(pool: &PgPool) -> Result<()> {
 
 async fn run_migrator_without_runtime_timeouts(pool: &PgPool) -> Result<()> {
     let mut connection = pool.acquire().await?;
+    lift_runtime_timeouts(&mut connection).await?;
+    let migrated = MIGRATOR.run(&mut *connection).await;
+    // Retire the connection either way; report the migration outcome first so a
+    // close failure cannot mask it.
+    let retired = retire_connection(connection).await;
+    migrated?;
+    retired?;
+    Ok(())
+}
+
+/// Remove both runtime limits from one connection's session.
+async fn lift_runtime_timeouts(connection: &mut sqlx::PgConnection) -> Result<()> {
     crate::apply_runtime_connection_timeouts(
-        &mut connection,
+        connection,
         crate::TIMEOUT_DISABLED,
         crate::TIMEOUT_DISABLED,
     )
     .await?;
-    let migrated = MIGRATOR.run(&mut *connection).await;
-    // Retire the connection either way; report the migration outcome first so a
-    // close failure cannot mask it.
-    let closed = connection.detach().close().await;
-    migrated?;
-    closed?;
+    Ok(())
+}
+
+/// Close a connection instead of returning it to the pool, so a session that
+/// carries lifted limits can never serve traffic.
+async fn retire_connection(connection: sqlx::pool::PoolConnection<sqlx::Postgres>) -> Result<()> {
+    connection.detach().close().await?;
     Ok(())
 }
 
@@ -1147,6 +1160,69 @@ mod tests {
         .fetch_all(pool)
         .await
         .expect("read applied migrations")
+    }
+
+    /// The migration connection must have both limits lifted, and it must not
+    /// come back to the pool afterwards — a session with no statement timeout
+    /// serving traffic is the failure this exemption trades against.
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn migration_connection_is_unbounded_and_is_retired_not_reused() {
+        const TIGHT: &str = "50ms";
+
+        let database_url = std::env::var("BUZZ_TEST_DATABASE_URL")
+            .or_else(|_| std::env::var("DATABASE_URL"))
+            .unwrap_or_else(|_| TEST_DB_URL.to_owned());
+        // One slot: a reused connection would be handed straight back below.
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(1)
+            .after_connect(|connection, _meta| {
+                Box::pin(crate::apply_runtime_connection_timeouts(
+                    connection, TIGHT, TIGHT,
+                ))
+            })
+            .connect(&database_url)
+            .await
+            .expect("connect to test DB");
+
+        let mut connection = pool.acquire().await.expect("acquire");
+        assert_eq!(
+            show_timeout(&mut connection, "statement_timeout").await,
+            TIGHT
+        );
+
+        lift_runtime_timeouts(&mut connection)
+            .await
+            .expect("lift runtime timeouts");
+        for setting in ["statement_timeout", "lock_timeout"] {
+            assert_eq!(
+                show_timeout(&mut connection, setting).await,
+                "0",
+                "{setting} must be lifted for the migrator"
+            );
+        }
+
+        retire_connection(connection)
+            .await
+            .expect("retire migration connection");
+
+        let mut fresh = pool.acquire().await.expect("re-acquire");
+        for setting in ["statement_timeout", "lock_timeout"] {
+            assert_eq!(
+                show_timeout(&mut fresh, setting).await,
+                TIGHT,
+                "the pool must not hand out the relaxed migration session"
+            );
+        }
+        drop(fresh);
+        pool.close().await;
+    }
+
+    async fn show_timeout(connection: &mut sqlx::PgConnection, setting: &str) -> String {
+        sqlx::query_scalar(sqlx::AssertSqlSafe(format!("SHOW {setting}")))
+            .fetch_one(connection)
+            .await
+            .unwrap_or_else(|error| panic!("SHOW {setting}: {error}"))
     }
 
     #[tokio::test]
