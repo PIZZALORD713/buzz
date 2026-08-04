@@ -4,6 +4,8 @@ import 'package:hooks_riverpod/hooks_riverpod.dart';
 import 'package:hooks_riverpod/misc.dart';
 import 'package:lucide_icons_flutter/lucide_icons.dart';
 import 'package:nostr/nostr.dart' as nostr;
+import 'package:buzz/features/channels/channel.dart';
+import 'package:buzz/features/channels/channels_provider.dart';
 import 'package:buzz/features/channels/message_content.dart';
 import 'package:buzz/features/channels/media_viewer_page.dart';
 import 'package:buzz/shared/deeplink/deep_link.dart';
@@ -153,6 +155,15 @@ bool _spanHasStyle(
     return true;
   });
   return found;
+}
+
+class _TestChannelsNotifier extends ChannelsNotifier {
+  _TestChannelsNotifier(this.channels);
+
+  final Future<List<Channel>> channels;
+
+  @override
+  Future<List<Channel>> build() => channels;
 }
 
 void main() {
@@ -459,6 +470,44 @@ void main() {
         );
       });
 
+      testWidgets('excludes sentence punctuation from bare Buzz links', (
+        tester,
+      ) async {
+        const messageUrl = 'buzz://message?channel=channel-1&id=message-1';
+        const joinUrl =
+            'buzz://join?relay=wss%3A%2F%2Frelay.example.com&code=invite-1';
+
+        await tester.pumpWidget(
+          _testable(
+            const MessageContent(content: 'See $messageUrl. Then $joinUrl!'),
+          ),
+        );
+
+        expect(find.text(messageUrl), findsOneWidget);
+        expect(find.text(joinUrl), findsOneWidget);
+        expect(_allRichText(tester), contains('See \u{FFFC}. Then \u{FFFC}!'));
+
+        await tester.tap(find.text(messageUrl));
+        await tester.pump();
+        final container = ProviderScope.containerOf(
+          tester.element(find.byType(MessageContent)),
+        );
+        expect(
+          container.read(pendingDeepLinkProvider),
+          const MessageDeepLink(channelId: 'channel-1', messageId: 'message-1'),
+        );
+
+        await tester.tap(find.text(joinUrl));
+        await tester.pump();
+        expect(
+          container.read(pendingDeepLinkProvider),
+          const InviteDeepLink(
+            relayUrl: 'wss://relay.example.com',
+            code: 'invite-1',
+          ),
+        );
+      });
+
       testWidgets('renders and routes autolinked Buzz thread links', (
         tester,
       ) async {
@@ -509,7 +558,75 @@ void main() {
         );
       });
 
-      testWidgets('leaves unsupported Buzz forms as plain text', (
+      testWidgets('renders and routes bare Buzz channel links', (tester) async {
+        const url = 'buzz://channel/580ca78b-9dae-46f3-8854-bd671853ba32';
+
+        await tester.pumpWidget(
+          _testable(const MessageContent(content: 'See $url now')),
+        );
+
+        expect(find.text(url), findsOneWidget);
+        await tester.tap(find.text(url));
+        await tester.pump();
+
+        final container = ProviderScope.containerOf(
+          tester.element(find.byType(MessageContent)),
+        );
+        expect(
+          container.read(pendingDeepLinkProvider),
+          const ChannelDeepLink(
+            channelId: '580ca78b-9dae-46f3-8854-bd671853ba32',
+          ),
+        );
+      });
+
+      testWidgets('renders and routes labeled Buzz channel links', (
+        tester,
+      ) async {
+        const url = 'buzz://channel/580ca78b-9dae-46f3-8854-bd671853ba32';
+
+        await tester.pumpWidget(
+          _testable(const MessageContent(content: '[Open channel]($url)')),
+        );
+
+        await tester.tap(find.text('Open channel'));
+        await tester.pump();
+
+        final container = ProviderScope.containerOf(
+          tester.element(find.byType(MessageContent)),
+        );
+        expect(
+          container.read(pendingDeepLinkProvider),
+          const ChannelDeepLink(
+            channelId: '580ca78b-9dae-46f3-8854-bd671853ba32',
+          ),
+        );
+      });
+
+      testWidgets('renders and routes autolinked Buzz channel links', (
+        tester,
+      ) async {
+        const url = 'buzz://channel/580ca78b-9dae-46f3-8854-bd671853ba32';
+
+        await tester.pumpWidget(
+          _testable(const MessageContent(content: '<$url>')),
+        );
+
+        await tester.tap(find.text(url));
+        await tester.pump();
+
+        final container = ProviderScope.containerOf(
+          tester.element(find.byType(MessageContent)),
+        );
+        expect(
+          container.read(pendingDeepLinkProvider),
+          const ChannelDeepLink(
+            channelId: '580ca78b-9dae-46f3-8854-bd671853ba32',
+          ),
+        );
+      });
+
+      testWidgets('leaves malformed Buzz channel forms as plain text', (
         tester,
       ) async {
         const url = 'buzz://channel?channel=channel-1';
@@ -1618,6 +1735,48 @@ Photos
 
         await tester.tap(find.text('#general'));
         expect(tappedId, 'ch-id-1');
+      });
+
+      testWidgets('resolved #channel defaults to in-app navigation', (
+        tester,
+      ) async {
+        final channels = Future.value([
+          Channel(
+            id: '580ca78b-9dae-46f3-8854-bd671853ba32',
+            name: 'general',
+            channelType: 'stream',
+            visibility: 'open',
+            description: '',
+            createdBy: 'creator',
+            createdAt: DateTime(2026),
+            memberCount: 1,
+            isMember: true,
+          ),
+        ]);
+        await tester.pumpWidget(
+          _testable(
+            const MessageContent(content: 'See #general'),
+            overrides: [
+              channelsProvider.overrideWith(
+                () => _TestChannelsNotifier(channels),
+              ),
+            ],
+          ),
+        );
+        await tester.pumpAndSettle();
+
+        await tester.tap(find.text('#general'));
+        await tester.pump();
+
+        final container = ProviderScope.containerOf(
+          tester.element(find.byType(MessageContent)),
+        );
+        expect(
+          container.read(pendingDeepLinkProvider),
+          const ChannelDeepLink(
+            channelId: '580ca78b-9dae-46f3-8854-bd671853ba32',
+          ),
+        );
       });
 
       testWidgets('unknown channel renders without tap', (tester) async {

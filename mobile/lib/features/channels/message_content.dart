@@ -25,6 +25,7 @@ import '../../shared/custom_emoji/custom_emoji_provider.dart';
 import '../../shared/custom_emoji/custom_emoji_render.dart';
 import '../../shared/emoji/emoji_data_provider.dart';
 import '../../shared/emoji/emoji_only.dart';
+import 'channels_provider.dart';
 import 'media_viewer_page.dart';
 import 'message_media.dart';
 
@@ -154,6 +155,26 @@ class MessageContent extends HookConsumerWidget {
     final resolvedAgentMentionPubkeys = {
       ...agentMentionPubkeys.map((pubkey) => pubkey.toLowerCase()),
     };
+    final resolvedChannelNames = channelNames.isNotEmpty
+        ? channelNames
+        : <String, String>{
+            for (final channel
+                in ref.watch(channelsProvider).asData?.value ?? const [])
+              channel.name.toLowerCase(): channel.id,
+          };
+    final resolvedChannelTap =
+        onChannelTap ??
+        (String channelId) {
+          ref
+              .read(pendingDeepLinkProvider.notifier)
+              .open(Uri(scheme: 'buzz', host: 'channel', path: channelId));
+        };
+    final channelPresentationKey = [
+      for (final entry
+          in (resolvedChannelNames.entries.toList()
+            ..sort((a, b) => a.key.compareTo(b.key))))
+        '${entry.key}\u0000${entry.value}',
+    ].join('\u0001');
     final imetaByUrl = parseImetaTags(tags);
     final trailingGallery = maxLines == null
         ? _extractTrailingImageGallery(content, imetaByUrl)
@@ -204,7 +225,9 @@ class MessageContent extends HookConsumerWidget {
           // 1. Angle-bracket autolinks: <https://...> and supported Buzz
           //    links. gpt_markdown does not auto-link custom schemes.
           var segment = parts[i].replaceAllMapped(
-            RegExp(r'<((?:https?://|buzz://(?:message\?|join\?))[^>]+)>'),
+            RegExp(
+              r'<((?:https?://|buzz://(?:message\?|join\?|channel/))[^>]+)>',
+            ),
             (m) => '[${m[1]}](${m[1]})',
           );
           // 2. Bare URLs not already inside markdown link/image syntax.
@@ -214,15 +237,17 @@ class MessageContent extends HookConsumerWidget {
           //    or imeta tags.
           segment = segment.replaceAllMapped(
             RegExp(
-              r'(?<![(\]=])(?:https?://|buzz://(?:message\?|join\?))[^\s)>\]]+',
+              r'(?<![(\]=])(?:https?://|buzz://(?:message\?|join\?|channel/))[^\s)>\]]+',
             ),
             (m) {
-              final url = m[0]!;
+              final matched = m[0]!;
+              final url = matched.replaceFirst(RegExp(r'[.,!?:;]+$'), '');
+              final trailingPunctuation = matched.substring(url.length);
               // Skip if this URL is already a markdown link label that equals
               // the URL (produced by step 1 or authored as [url](url)).
               final start = m.start;
-              if (start >= 1 && segment[start - 1] == '[') return url;
-              return '[$url]($url)';
+              if (start >= 1 && segment[start - 1] == '[') return matched;
+              return '[$url]($url)$trailingPunctuation';
             },
           );
           buffer.write(segment);
@@ -265,7 +290,9 @@ class MessageContent extends HookConsumerWidget {
     }, [markdownContent, resolvedMentionNames]);
 
     final markdown = KeyedSubtree(
-      key: ValueKey('$finalContent\u0000$mentionPresentationKey'),
+      key: ValueKey(
+        '$finalContent\u0000$mentionPresentationKey\u0000$channelPresentationKey',
+      ),
       child: GptMarkdown(
         finalContent,
         style: style,
@@ -285,8 +312,8 @@ class MessageContent extends HookConsumerWidget {
           ),
           CustomEmojiMd(customEmoji, size: inlineCustomEmojiSize),
           _ChannelLinkMd(
-            channelNames: channelNames,
-            onChannelTap: onChannelTap,
+            channelNames: resolvedChannelNames,
+            onChannelTap: resolvedChannelTap,
           ),
           ...MarkdownComponent.inlineComponents,
         ],

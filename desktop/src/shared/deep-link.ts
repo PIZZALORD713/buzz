@@ -15,6 +15,8 @@ export interface DeepLinkDeps {
   onAddCommunityAvailable: (listener: () => void) => () => void;
 }
 
+export type ChannelDeepLinkPayload = { channelId: string };
+
 /**
  * Payload emitted by the Rust deep-link handler for `buzz://message?…`.
  * Field names match the JSON shape produced in `desktop/src-tauri/src/lib.rs`.
@@ -22,6 +24,14 @@ export interface DeepLinkDeps {
 export type MessageDeepLinkPayload = {
   channelId: string;
   messageId: string;
+  threadRootId: string | null;
+};
+
+type PendingNavigationDeepLink = {
+  id: string;
+  kind: "channel" | "message";
+  channelId: string;
+  messageId: string | null;
   threadRootId: string | null;
 };
 
@@ -157,12 +167,58 @@ export async function listenForDeepLinks(
  * inside the router tree (e.g. AppShell) because the navigation callback
  * uses TanStack Router state.
  */
-export function listenForMessageDeepLinks(
-  onOpen: (payload: MessageDeepLinkPayload) => void,
+export async function listenForNavigationDeepLinks(
+  onOpenChannel: (payload: ChannelDeepLinkPayload) => void,
+  onOpenMessage: (payload: MessageDeepLinkPayload) => void,
 ): Promise<UnlistenFn> {
-  return listen<MessageDeepLinkPayload>("deep-link-message", (event) => {
-    onOpen(event.payload);
-  });
+  let drainRunning = false;
+  let drainRequested = false;
+  const drain = () => {
+    drainRequested = true;
+    if (drainRunning) return;
+    drainRunning = true;
+    void (async () => {
+      try {
+        while (drainRequested) {
+          drainRequested = false;
+          while (true) {
+            const pending = await invoke<PendingNavigationDeepLink | null>(
+              "take_pending_navigation_deep_link",
+            );
+            if (!pending) break;
+            if (pending.kind === "channel") {
+              onOpenChannel({ channelId: pending.channelId });
+            } else if (pending.messageId) {
+              onOpenMessage({
+                channelId: pending.channelId,
+                messageId: pending.messageId,
+                threadRootId: pending.threadRootId,
+              });
+            }
+            const acknowledged = await invoke<boolean>(
+              "acknowledge_pending_navigation_deep_link",
+              { id: pending.id },
+            );
+            if (!acknowledged) break;
+          }
+        }
+      } catch (error: unknown) {
+        console.warn("Failed to drain pending navigation deep links", error);
+      } finally {
+        drainRunning = false;
+        if (drainRequested) drain();
+      }
+    })();
+  };
+
+  const unlistens = await Promise.all([
+    listen<ChannelDeepLinkPayload>("deep-link-channel", drain),
+    listen<MessageDeepLinkPayload>("deep-link-message", drain),
+  ]);
+  drain();
+  return () => {
+    for (const unlisten of unlistens) unlisten();
+  };
 }
 
 export function listenForNostrBindDeepLinks(
