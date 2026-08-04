@@ -16,6 +16,7 @@ class InitialThreadTailSettle {
     required ItemScrollController controller,
     required ItemPositionsListener positionsListener,
     required int? targetIndex,
+    required double hiddenBottomFraction,
   }) {
     if (_isComplete) return;
 
@@ -40,7 +41,7 @@ class InitialThreadTailSettle {
           (position) =>
               position.index == targetIndex &&
               position.itemLeadingEdge >= 0 &&
-              position.itemTrailingEdge <= 1,
+              position.itemTrailingEdge <= 1 - hiddenBottomFraction,
         );
         // Short threads already expose their tail from the top anchor. Moving
         // that fully visible target down would only add empty space above the
@@ -52,7 +53,7 @@ class InitialThreadTailSettle {
         controller
             .scrollTo(
               index: targetIndex,
-              alignment: 0.8,
+              alignment: 0.0,
               duration: const Duration(milliseconds: 1),
             )
             .whenComplete(() {

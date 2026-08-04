@@ -118,6 +118,7 @@ class ThreadDetailPage extends HookConsumerWidget {
     final itemPositionsListener = useMemoized(ItemPositionsListener.create);
     final didJumpToInitialMessage = useRef(false);
     final followsThreadTail = useRef(false);
+    final userOptedOutOfTailFollow = useRef(false);
     final pendingTailAlignment = useRef<double?>(null);
     final tailRealignmentQueued = useRef(false);
 
@@ -137,7 +138,9 @@ class ThreadDetailPage extends HookConsumerWidget {
 
     useEffect(() {
       void onPositionsChanged() {
-        if (threadTailIsVisible()) followsThreadTail.value = true;
+        if (!userOptedOutOfTailFollow.value && threadTailIsVisible()) {
+          followsThreadTail.value = true;
+        }
       }
 
       itemPositionsListener.itemPositions.addListener(onPositionsChanged);
@@ -194,6 +197,8 @@ class ThreadDetailPage extends HookConsumerWidget {
           targetIndex: initialMessageId == null && replies.isNotEmpty
               ? indexForReply(replies.length - 1)
               : null,
+          hiddenBottomFraction:
+              composerDockHeight.value / MediaQuery.sizeOf(context).height,
         );
         return null;
       }
@@ -273,7 +278,9 @@ class ThreadDetailPage extends HookConsumerWidget {
       final heightDelta = height - previousHeight;
       if (heightDelta.abs() < 0.5) return;
 
-      final shouldFollowTail = followsThreadTail.value || threadTailIsVisible();
+      final shouldFollowTail =
+          !userOptedOutOfTailFollow.value &&
+          (followsThreadTail.value || threadTailIsVisible());
       if (shouldFollowTail) followsThreadTail.value = true;
       composerDockHeight.value = height;
       if (heightDelta <= 0 || !shouldFollowTail) {
@@ -306,7 +313,9 @@ class ThreadDetailPage extends HookConsumerWidget {
     // keyboard appears. Re-align after that latter layout pass too, but only
     // while the user was already following the thread tail.
     void realignThreadTailAfterMetricsChange() {
-      final shouldFollowTail = followsThreadTail.value || threadTailIsVisible();
+      final shouldFollowTail =
+          !userOptedOutOfTailFollow.value &&
+          (followsThreadTail.value || threadTailIsVisible());
       if (!shouldFollowTail || tailRealignmentQueued.value) return;
       followsThreadTail.value = true;
       tailRealignmentQueued.value = true;
@@ -358,6 +367,7 @@ class ThreadDetailPage extends HookConsumerWidget {
               Expanded(
                 child: KeyboardDismissOnDrag(
                   onUserScrollStart: () {
+                    userOptedOutOfTailFollow.value = true;
                     followsThreadTail.value = false;
                     pendingTailAlignment.value = null;
                   },
