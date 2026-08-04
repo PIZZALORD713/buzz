@@ -162,6 +162,16 @@ export async function listenForDeepLinks(
   };
 }
 
+let navigationDrainTail: Promise<void> = Promise.resolve();
+
+function serializeNavigationDrain(task: () => Promise<void>): Promise<void> {
+  const drain = navigationDrainTail.then(task, task);
+  // Keep the shared tail fulfilled so one route failure cannot poison future
+  // listener mounts. The caller still receives `drain` and reports the error.
+  navigationDrainTail = drain.catch(() => {});
+  return drain;
+}
+
 async function drainPendingNavigationDeepLinks(
   onOpenChannel: (
     payload: ChannelDeepLinkPayload,
@@ -216,7 +226,9 @@ export async function listenForNavigationDeepLinks(
       try {
         while (drainRequested) {
           drainRequested = false;
-          await drainPendingNavigationDeepLinks(onOpenChannel, onOpenMessage);
+          await serializeNavigationDrain(() =>
+            drainPendingNavigationDeepLinks(onOpenChannel, onOpenMessage),
+          );
         }
       } catch (error: unknown) {
         console.warn("Failed to drain pending navigation deep links", error);

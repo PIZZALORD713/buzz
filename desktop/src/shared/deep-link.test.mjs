@@ -124,6 +124,68 @@ test("listener teardown leaves an unaccepted FIFO item for the next mount", asyn
   assert.equal(unlistenCount, 4);
 });
 
+test("concurrent listener remount does not take or acknowledge the in-flight head twice", async () => {
+  const queue = [
+    {
+      id: "in-flight",
+      kind: "channel",
+      channelId: "channel-1",
+      messageId: null,
+      threadRootId: null,
+    },
+  ];
+  const acknowledgeGate = deferred();
+  const opened = [];
+  const acknowledged = [];
+
+  ipcHandlers.set("plugin:event|listen", () => nextCallbackId);
+  ipcHandlers.set("plugin:event|unlisten", () => {});
+  ipcHandlers.set("take_pending_navigation_deep_link", () => queue[0] ?? null);
+  ipcHandlers.set(
+    "acknowledge_pending_navigation_deep_link",
+    async ({ id }) => {
+      acknowledged.push(id);
+      await acknowledgeGate.promise;
+      assert.equal(queue[0]?.id, id);
+      queue.shift();
+      return true;
+    },
+  );
+
+  const firstUnlisten = await listenForNavigationDeepLinks(
+    (payload) => {
+      opened.push(`first:${payload.channelId}`);
+      return true;
+    },
+    () => true,
+  );
+  await settle();
+  assert.deepEqual(opened, ["first:channel-1"]);
+  assert.deepEqual(acknowledged, ["in-flight"]);
+
+  firstUnlisten();
+  const secondUnlisten = await listenForNavigationDeepLinks(
+    (payload) => {
+      opened.push(`second:${payload.channelId}`);
+      return true;
+    },
+    () => true,
+  );
+  await settle();
+
+  assert.deepEqual(opened, ["first:channel-1"]);
+  assert.deepEqual(acknowledged, ["in-flight"]);
+
+  acknowledgeGate.resolve();
+  await settle();
+  await settle();
+
+  assert.deepEqual(opened, ["first:channel-1"]);
+  assert.deepEqual(acknowledged, ["in-flight"]);
+  assert.equal(queue.length, 0);
+  secondUnlisten();
+});
+
 test("rejected navigation remains queued and is not acknowledged", async () => {
   const pending = {
     id: "retry-me",
