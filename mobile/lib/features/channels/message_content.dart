@@ -201,16 +201,21 @@ class MessageContent extends HookConsumerWidget {
           // Inside backticks — preserve as-is.
           buffer.write('`${parts[i]}`');
         } else {
-          // 1. Angle-bracket autolinks: <https://...>
+          // 1. Angle-bracket autolinks: <https://...> and supported Buzz
+          //    links. gpt_markdown does not auto-link custom schemes.
           var segment = parts[i].replaceAllMapped(
-            RegExp(r'<(https?://[^>]+)>'),
+            RegExp(r'<((?:https?://|buzz://(?:message\?|join\?))[^>]+)>'),
             (m) => '[${m[1]}](${m[1]})',
           );
           // 2. Bare URLs not already inside markdown link/image syntax.
-          //    Negative lookbehind avoids matching URLs preceded by ]( or =
-          //    which are already part of markdown links or imeta tags.
+          //    Keep this in sync with the app-owned links accepted by
+          //    parseBuzzDeepLink. Negative lookbehind avoids matching URLs
+          //    preceded by ]( or =, which are already part of markdown links
+          //    or imeta tags.
           segment = segment.replaceAllMapped(
-            RegExp(r'(?<![(\]=])https?://[^\s)>\]]+'),
+            RegExp(
+              r'(?<![(\]=])(?:https?://|buzz://(?:message\?|join\?))[^\s)>\]]+',
+            ),
             (m) {
               final url = m[0]!;
               // Skip if this URL is already a markdown link label that equals
@@ -355,7 +360,7 @@ class MessageContent extends HookConsumerWidget {
         // which is what made rendered mobile deep links inert.
         if (uri.scheme == 'buzz') {
           if (parseBuzzDeepLink(uri) != null) {
-            ref.read(pendingDeepLinkProvider.notifier).handleUri(uri);
+            ref.read(pendingDeepLinkProvider.notifier).open(uri);
           }
           return;
         }

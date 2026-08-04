@@ -439,6 +439,93 @@ void main() {
         );
       });
 
+      testWidgets('renders and routes bare Buzz message links', (tester) async {
+        const url = 'buzz://message?channel=channel-1&id=message-1';
+
+        await tester.pumpWidget(
+          _testable(const MessageContent(content: 'See $url now')),
+        );
+
+        expect(find.text(url), findsOneWidget);
+        await tester.tap(find.text(url));
+        await tester.pump();
+
+        final container = ProviderScope.containerOf(
+          tester.element(find.byType(MessageContent)),
+        );
+        expect(
+          container.read(pendingDeepLinkProvider),
+          const MessageDeepLink(channelId: 'channel-1', messageId: 'message-1'),
+        );
+      });
+
+      testWidgets('renders and routes autolinked Buzz thread links', (
+        tester,
+      ) async {
+        const url = 'buzz://message?channel=channel-1&id=reply-1&thread=root-1';
+
+        await tester.pumpWidget(
+          _testable(const MessageContent(content: '<$url>')),
+        );
+
+        expect(find.text(url), findsOneWidget);
+        await tester.tap(find.text(url));
+        await tester.pump();
+
+        final container = ProviderScope.containerOf(
+          tester.element(find.byType(MessageContent)),
+        );
+        expect(
+          container.read(pendingDeepLinkProvider),
+          const MessageDeepLink(
+            channelId: 'channel-1',
+            messageId: 'reply-1',
+            threadRootId: 'root-1',
+          ),
+        );
+      });
+
+      testWidgets('renders and routes bare Buzz join links', (tester) async {
+        const url =
+            'buzz://join?relay=wss%3A%2F%2Frelay.example.com&code=invite-1';
+
+        await tester.pumpWidget(
+          _testable(const MessageContent(content: 'Join with $url')),
+        );
+
+        expect(find.text(url), findsOneWidget);
+        await tester.tap(find.text(url));
+        await tester.pump();
+
+        final container = ProviderScope.containerOf(
+          tester.element(find.byType(MessageContent)),
+        );
+        expect(
+          container.read(pendingDeepLinkProvider),
+          const InviteDeepLink(
+            relayUrl: 'wss://relay.example.com',
+            code: 'invite-1',
+          ),
+        );
+      });
+
+      testWidgets('leaves unsupported Buzz forms as plain text', (
+        tester,
+      ) async {
+        const url = 'buzz://channel?channel=channel-1';
+
+        await tester.pumpWidget(
+          _testable(const MessageContent(content: 'See $url now')),
+        );
+
+        expect(find.text(url), findsNothing);
+        expect(_allRichText(tester), contains(url));
+        final container = ProviderScope.containerOf(
+          tester.element(find.byType(MessageContent)),
+        );
+        expect(container.read(pendingDeepLinkProvider), isNull);
+      });
+
       testWidgets('renders bare URL as link', (tester) async {
         await tester.pumpWidget(
           _testable(
