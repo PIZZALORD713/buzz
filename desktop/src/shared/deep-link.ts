@@ -167,7 +167,14 @@ let navigationDrainGeneration = 0;
 
 export async function resetNavigationDeepLinkDrain(): Promise<void> {
   navigationDrainGeneration += 1;
-  await invoke("clear_pending_navigation_deep_links");
+  try {
+    await invoke("clear_pending_navigation_deep_links");
+  } catch (error: unknown) {
+    // A community switch must not strand the app behind its loading gate if
+    // the best-effort native queue cleanup is unavailable. The generation
+    // bump above still prevents in-flight JavaScript drains from acknowledging.
+    console.warn("Failed to clear pending navigation deep links", error);
+  }
 }
 
 function serializeNavigationDrain(task: () => Promise<void>): Promise<void> {

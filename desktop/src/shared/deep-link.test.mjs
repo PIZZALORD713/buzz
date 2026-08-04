@@ -228,6 +228,113 @@ test("community reset prevents an in-flight route from acknowledging", async () 
   unlisten();
 });
 
+test("community reset after take does not route the stale item", async () => {
+  const takeGate = deferred();
+  const opened = [];
+
+  ipcHandlers.set("plugin:event|listen", () => nextCallbackId);
+  ipcHandlers.set("plugin:event|unlisten", () => {});
+  ipcHandlers.set("clear_pending_navigation_deep_links", () => {});
+  ipcHandlers.set("take_pending_navigation_deep_link", async () => {
+    await takeGate.promise;
+    return {
+      id: "old-community",
+      kind: "channel",
+      channelId: "channel-1",
+      messageId: null,
+      threadRootId: null,
+    };
+  });
+  ipcHandlers.set("acknowledge_pending_navigation_deep_link", () => true);
+
+  const unlisten = await listenForNavigationDeepLinks(
+    (payload) => {
+      opened.push(payload.channelId);
+      return true;
+    },
+    () => true,
+  );
+  await settle();
+
+  await resetNavigationDeepLinkDrain();
+  takeGate.resolve();
+  await settle();
+
+  assert.deepEqual(opened, []);
+  unlisten();
+});
+
+test("community reset stops the stale drain before taking another item", async () => {
+  const queue = [
+    {
+      id: "first",
+      kind: "channel",
+      channelId: "channel-1",
+      messageId: null,
+      threadRootId: null,
+    },
+    {
+      id: "second",
+      kind: "channel",
+      channelId: "channel-2",
+      messageId: null,
+      threadRootId: null,
+    },
+  ];
+  const opened = [];
+  let takeCount = 0;
+
+  ipcHandlers.set("plugin:event|listen", () => nextCallbackId);
+  ipcHandlers.set("plugin:event|unlisten", () => {});
+  ipcHandlers.set("clear_pending_navigation_deep_links", () => {
+    queue.length = 0;
+  });
+  ipcHandlers.set("take_pending_navigation_deep_link", () => {
+    takeCount += 1;
+    return queue[0] ?? null;
+  });
+  ipcHandlers.set(
+    "acknowledge_pending_navigation_deep_link",
+    async ({ id }) => {
+      assert.equal(queue[0]?.id, id);
+      queue.shift();
+      await resetNavigationDeepLinkDrain();
+      return true;
+    },
+  );
+
+  const unlisten = await listenForNavigationDeepLinks(
+    (payload) => {
+      opened.push(payload.channelId);
+      return true;
+    },
+    () => true,
+  );
+  await settle();
+  await settle();
+
+  assert.deepEqual(opened, ["channel-1"]);
+  assert.equal(takeCount, 1);
+  unlisten();
+});
+
+test("community reset tolerates native queue clear rejection", async () => {
+  const warnings = [];
+  const originalWarn = console.warn;
+  ipcHandlers.set("clear_pending_navigation_deep_links", () => {
+    throw new Error("clear failed");
+  });
+  console.warn = (...args) => warnings.push(args);
+
+  try {
+    await resetNavigationDeepLinkDrain();
+    assert.equal(warnings.length, 1);
+    assert.match(String(warnings[0][1]), /clear failed/);
+  } finally {
+    console.warn = originalWarn;
+  }
+});
+
 test("rejected navigation remains queued and is not acknowledged", async () => {
   const pending = {
     id: "retry-me",

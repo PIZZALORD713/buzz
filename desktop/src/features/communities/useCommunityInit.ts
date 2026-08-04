@@ -122,6 +122,12 @@ export function useCommunityInit(
 
     async function init() {
       if (!activeCommunity) {
+        if (hasInitializedRef.current) {
+          await resetCommunityState({ resetAvatarState: true });
+          hasInitializedRef.current = false;
+          prevCommunityIdRef.current = null;
+          appliedRelayUrlRef.current = null;
+        }
         try {
           const defaultRelayUrl = await getDefaultRelayUrl();
           const autoConnectDefaultRelay =

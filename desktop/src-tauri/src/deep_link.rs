@@ -560,6 +560,28 @@ mod tests {
         assert!(!queue.acknowledge("second"));
         assert!(queue.acknowledge("first"));
         assert_eq!(queue.first().unwrap().id, "second");
+        assert!(queue.acknowledge("second"));
+        assert!(queue.first().is_none());
+    }
+
+    #[test]
+    fn pending_navigation_links_can_be_cleared() {
+        let queue = PendingNavigationDeepLinks::default();
+        queue.enqueue(pending_navigation(
+            "first",
+            "channel",
+            "channel-1",
+            None,
+            None,
+        ));
+        queue.enqueue(pending_navigation(
+            "second",
+            "message",
+            "channel-1",
+            Some("message-1"),
+            None,
+        ));
+
         queue.clear();
         assert!(queue.first().is_none());
     }

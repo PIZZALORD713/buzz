@@ -76,6 +76,25 @@ String _safeDownloadedFilename(String filename) {
   return safe.isEmpty ? 'attachment' : safe;
 }
 
+bool _hasUnclosedMarkdownDelimiter(String prefix, String delimiter) {
+  var open = false;
+  var offset = 0;
+  while (true) {
+    final index = prefix.indexOf(delimiter, offset);
+    if (index < 0) return open;
+    final before = index == 0 ? null : prefix[index - 1];
+    final afterIndex = index + delimiter.length;
+    final after = afterIndex == prefix.length ? null : prefix[afterIndex];
+    final canOpen =
+        (after == null || after.trim().isNotEmpty) &&
+        (before == null ||
+            before.trim().isEmpty ||
+            RegExp(r'[^\w]').hasMatch(before));
+    if (open || canOpen) open = !open;
+    offset = afterIndex;
+  }
+}
+
 /// Renders message content with markdown formatting, @mentions, #channel links,
 /// and media-aware markdown images/videos.
 class MessageContent extends HookConsumerWidget {
@@ -243,20 +262,28 @@ class MessageContent extends HookConsumerWidget {
                 url = url.substring(0, outsidePunctuation.start);
                 trailing = outsidePunctuation[0]!;
               }
-              for (final delimiter in const [
-                '***',
-                '___',
-                '**',
-                '__',
-                '~~',
-                '*',
-                '_',
-              ]) {
-                if (segment.substring(0, start).endsWith(delimiter) &&
-                    url.endsWith(delimiter)) {
-                  url = url.substring(0, url.length - delimiter.length);
-                  trailing = '$delimiter$trailing';
-                  break;
+              var strippedDelimiter = true;
+              while (strippedDelimiter) {
+                strippedDelimiter = false;
+                for (final delimiter in const [
+                  '***',
+                  '___',
+                  '**',
+                  '__',
+                  '~~',
+                  '*',
+                  '_',
+                ]) {
+                  if (url.endsWith(delimiter) &&
+                      _hasUnclosedMarkdownDelimiter(
+                        segment.substring(0, start),
+                        delimiter,
+                      )) {
+                    url = url.substring(0, url.length - delimiter.length);
+                    trailing = '$delimiter$trailing';
+                    strippedDelimiter = true;
+                    break;
+                  }
                 }
               }
               final punctuation = RegExp(r'[.,!?:;]+$').firstMatch(url);

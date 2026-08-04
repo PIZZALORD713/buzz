@@ -492,6 +492,39 @@ void main() {
         );
       });
 
+      testWidgets('keeps non-adjacent Markdown delimiters outside links', (
+        tester,
+      ) async {
+        const url = 'buzz://message?channel=channel-1&id=message-1';
+
+        await tester.pumpWidget(
+          _testable(
+            const MessageContent(
+              content:
+                  '*join $url* and **open $url** and '
+                  '~~visit $url~~ and **_${url}_**.',
+            ),
+          ),
+        );
+
+        expect(find.text(url), findsNWidgets(4));
+        final container = ProviderScope.containerOf(
+          tester.element(find.byType(MessageContent)),
+        );
+        for (final link in find.text(url).evaluate()) {
+          await tester.tap(find.byWidget(link.widget));
+          await tester.pump();
+          expect(
+            container.read(pendingDeepLinkProvider),
+            const MessageDeepLink(
+              channelId: 'channel-1',
+              messageId: 'message-1',
+            ),
+          );
+          container.read(pendingDeepLinkProvider.notifier).state = null;
+        }
+      });
+
       testWidgets('excludes sentence punctuation from bare Buzz links', (
         tester,
       ) async {
