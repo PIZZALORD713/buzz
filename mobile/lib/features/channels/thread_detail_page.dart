@@ -121,8 +121,6 @@ class ThreadDetailPage extends HookConsumerWidget {
     final userOptedOutOfTailFollow = useRef(false);
     final pendingTailAlignment = useRef<double?>(null);
     final tailRealignmentQueued = useRef(false);
-
-    // Item 0 is the thread head; reply `i` lives at `i + 1`.
     const headIndex = 0;
     int indexForReply(int chronologicalIndex) => chronologicalIndex + 1;
 
@@ -165,9 +163,6 @@ class ThreadDetailPage extends HookConsumerWidget {
       if (targetIndex == null || didJumpToInitialMessage.value) return null;
       WidgetsBinding.instance.addPostFrameCallback((_) {
         if (!context.mounted || !itemScrollController.isAttached) return;
-        // The provisional route snapshot can make the linked reply look like
-        // the tail. This authoritative deep-link jump intentionally leaves
-        // the user at an older item, so it must opt out of follow-tail first.
         followsThreadTail.value = false;
         pendingTailAlignment.value = null;
         itemScrollController.jumpTo(index: targetIndex, alignment: 0.35);
@@ -184,9 +179,6 @@ class ThreadDetailPage extends HookConsumerWidget {
     final initialTailSettle = useMemoized(InitialThreadTailSettle.new);
     final previousReplyCount = useRef(replies.length);
     useEffect(() {
-      // The first authoritative query result is hydration, not a live arrival.
-      // Once every relay page has resolved, settle an ordinary thread open on
-      // its newest reply. Deep links retain ownership of their explicit target.
       if (!hasFetchedReplies) return null;
       if (!initialTailSettle.isComplete) {
         previousReplyCount.value = replies.length;
@@ -208,9 +200,6 @@ class ThreadDetailPage extends HookConsumerWidget {
       if (replies.length <= previous) return null;
       final positions = itemPositionsListener.itemPositions.value;
       final lastIndex = indexForReply(replies.length - 1);
-      // Positions still describe the list as it was *before* these replies, so
-      // compare against the old tail. Measuring against the new one only reads
-      // as "at the tail" when exactly one reply arrived.
       final previousLastIndex = previous == 0
           ? headIndex
           : indexForReply(previous - 1);
