@@ -14,6 +14,7 @@ import {
   MessagesSquare,
   MonitorCog,
   Moon,
+  Server,
   ShieldAlert,
   Smartphone,
   Smile,
@@ -85,6 +86,7 @@ import { ProfileSettingsCard } from "./ProfileSettingsCard";
 import { UpdateChecker } from "../UpdateChecker";
 import { SettingsSectionHeader } from "./SettingsSectionHeader";
 import { VoiceSettingsCard } from "./VoiceSettingsCard";
+import { AdminConsoleSettingsCard } from "@/features/admin-console/AdminConsoleSettingsCard";
 
 export type SettingsSection =
   | "profile"
@@ -102,7 +104,8 @@ export type SettingsSection =
   | "custom-emoji"
   | "local-archive"
   | "mobile"
-  | "updates";
+  | "updates"
+  | "admin-console";
 
 export const DEFAULT_SETTINGS_SECTION: SettingsSection = "profile";
 
@@ -123,6 +126,7 @@ const SETTINGS_SECTION_VALUES: readonly SettingsSection[] = [
   "local-archive",
   "mobile",
   "updates",
+  "admin-console",
 ];
 
 export function isSettingsSection(value: unknown): value is SettingsSection {
@@ -238,6 +242,11 @@ export const settingsSections: SettingsSectionDescriptor[] = [
     value: "updates",
     label: "Updates",
     icon: Download,
+  },
+  {
+    value: "admin-console",
+    label: "Admin console",
+    icon: Server,
   },
 ];
 
@@ -852,6 +861,8 @@ export function renderSettingsSection(
       return <MobilePairingCard currentPubkey={props.currentPubkey} />;
     case "updates":
       return <UpdateChecker />;
+    case "admin-console":
+      return <AdminConsoleSettingsCard />;
     default: {
       const exhaustiveCheck: never = section;
       return exhaustiveCheck;
