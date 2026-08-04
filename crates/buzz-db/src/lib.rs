@@ -5767,8 +5767,14 @@ impl Db {
 
     /// Returns `true` if any member of `community` holds the `admin` or
     /// `owner` role.
+    #[sqlite_backend(implemented)]
     pub async fn has_admin_or_owner(&self, community: CommunityId) -> Result<bool> {
-        relay_members::has_admin_or_owner(&self.pool, community).await
+        match &self.backend {
+            DbBackend::SQLite(pool) => sqlite::has_admin_or_owner(pool, community).await,
+            DbBackend::Postgres => {
+                relay_members::has_admin_or_owner(self.pg_pool()?, community).await
+            }
+        }
     }
 
     /// Atomically transfers ownership of `community` to `new_owner_pubkey`,

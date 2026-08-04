@@ -4380,6 +4380,16 @@ pub(crate) async fn is_relay_member(
         != 0)
 }
 
+pub(crate) async fn has_admin_or_owner(pool: &SqlitePool, community: CommunityId) -> Result<bool> {
+    Ok(sqlx::query_scalar::<_, i64>(
+        "SELECT count(*) FROM relay_members WHERE community_id = ?1 AND role IN ('admin', 'owner')",
+    )
+    .bind(community.as_uuid().to_string())
+    .fetch_one(pool)
+    .await?
+        != 0)
+}
+
 pub(crate) async fn get_relay_member(
     pool: &SqlitePool,
     community: CommunityId,
