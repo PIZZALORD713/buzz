@@ -3448,7 +3448,7 @@ void main() {
     });
 
     testWidgets(
-      'initial thread hydration keeps the head visible instead of following the tail',
+      'initial thread hydration settles on the latest reply after pagination',
       (tester) async {
         final rootEvent = _textMsg(
           id: 'thread-root',
@@ -3469,10 +3469,12 @@ void main() {
             ),
         ];
         final completer = Completer<List<NostrEvent>>();
+        final messagesNotifier = _FakeMessagesNotifier([rootEvent]);
 
         await tester.pumpWidget(
           _buildTestable(
             messages: [rootEvent],
+            messagesNotifier: messagesNotifier,
             pendingThreadReplies: {'thread-root': completer.future},
             users: const {
               'alice': UserProfile(pubkey: 'alice', displayName: 'Alice'),
@@ -3502,16 +3504,36 @@ void main() {
         );
 
         completer.complete(replies);
+        await tester.pump();
+        final latestLiveReply = _textMsg(
+          id: 'reply-live',
+          pubkey: 'bob',
+          content: 'Live during settle',
+          createdAt: 1200,
+          extraTags: const [
+            ['e', 'thread-root', '', 'reply'],
+          ],
+        );
+        messagesNotifier.setMessages([rootEvent, latestLiveReply]);
         await tester.pumpAndSettle();
 
         expect(
           find.byKey(const ValueKey('thread-message-group-thread-root')),
-          findsOneWidget,
-        );
-        expect(
-          find.byKey(const ValueKey('thread-message-group-reply-29')),
           findsNothing,
         );
+        expect(
+          find.byKey(const ValueKey('thread-message-group-reply-live')),
+          findsOneWidget,
+        );
+        final listBottom = tester
+            .getBottomLeft(find.byKey(const ValueKey('thread-message-list')))
+            .dy;
+        final latestBottom = tester
+            .getBottomLeft(
+              find.byKey(const ValueKey('thread-message-group-reply-live')),
+            )
+            .dy;
+        expect(latestBottom, closeTo(listBottom - Grid.xs, 1));
       },
     );
 

@@ -177,15 +177,48 @@ class ThreadDetailPage extends HookConsumerWidget {
     // while the last item is on screen, scroll it into view. If the user has
     // scrolled up to read, leave them where they are.
     final hasFetchedReplies = fetchedReplies != null;
-    final didEstablishInitialReplies = useRef(hasFetchedReplies);
+    final didEstablishInitialReplies = useRef(false);
+    final initialSettleGeneration = useRef(0);
     final previousReplyCount = useRef(replies.length);
     useEffect(() {
       // The first authoritative query result is hydration, not a live arrival.
-      // Establish the baseline without moving the user away from the head.
+      // Once every relay page has resolved, settle an ordinary thread open on
+      // its newest reply. Deep links retain ownership of their explicit target.
       if (!hasFetchedReplies) return null;
       if (!didEstablishInitialReplies.value) {
-        didEstablishInitialReplies.value = true;
         previousReplyCount.value = replies.length;
+        if (initialMessageId == null && replies.isNotEmpty) {
+          final generation = ++initialSettleGeneration.value;
+          WidgetsBinding.instance.addPostFrameCallback((_) {
+            if (!context.mounted ||
+                generation != initialSettleGeneration.value) {
+              return;
+            }
+            // Let live events received during hydration rebuild the list before
+            // committing the initial target. Their effect invalidates this
+            // generation and schedules the current tail instead.
+            WidgetsBinding.instance.addPostFrameCallback((_) {
+              if (!context.mounted ||
+                  !itemScrollController.isAttached ||
+                  generation != initialSettleGeneration.value) {
+                return;
+              }
+              itemScrollController
+                  .scrollTo(
+                    index: indexForReply(replies.length - 1),
+                    alignment: 0.8,
+                    duration: const Duration(milliseconds: 1),
+                  )
+                  .whenComplete(() {
+                    if (generation == initialSettleGeneration.value) {
+                      didEstablishInitialReplies.value = true;
+                    }
+                  });
+            });
+          });
+        } else {
+          didEstablishInitialReplies.value = true;
+        }
         return null;
       }
 
@@ -200,9 +233,9 @@ class ThreadDetailPage extends HookConsumerWidget {
       final previousLastIndex = previous == 0
           ? headIndex
           : indexForReply(previous - 1);
-      final wasAtTail =
-          positions.isEmpty ||
-          positions.any((position) => position.index >= previousLastIndex);
+      final wasAtTail = positions.any(
+        (position) => position.index == previousLastIndex,
+      );
       final localPubkey = currentPubkey?.toLowerCase();
       final hasNewLocalReply =
           localPubkey != null &&
