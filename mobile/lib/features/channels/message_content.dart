@@ -228,11 +228,6 @@ class MessageContent extends HookConsumerWidget {
             ),
             (m) => '[${m[1]}](${m[1]})',
           );
-          // 2. Bare URLs not already inside markdown link/image syntax.
-          //    Keep this in sync with the app-owned links accepted by
-          //    parseBuzzDeepLink. Negative lookbehind avoids matching URLs
-          //    preceded by ]( or =, which are already part of markdown links
-          //    or imeta tags.
           segment = segment.replaceAllMapped(
             RegExp(
               r'(?<![(\]=])(?:https?://|buzz://(?:message\?|join\?|channel/))[^\s)>\]]+',
