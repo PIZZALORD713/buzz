@@ -4,16 +4,27 @@
 //! multi-tenant rewrite owns a clean consolidated `0001`; legacy single-tenant
 //! cutover/backfill is a separate operator script, not startup migration state.
 
-use sqlx::PgPool;
+use sqlx::{Connection, PgPool};
 
 use crate::Result;
 
 static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("../../migrations");
 
 /// Run all pending Buzz database migrations.
+///
+/// DDL runs with the runtime `statement_timeout` and `lock_timeout` lifted. An
+/// index build on a populated table, or an `ACCESS EXCLUSIVE` wait behind live
+/// traffic, routinely outlasts the runtime caps — and because startup treats a
+/// migration failure as fatal, inheriting them would turn a slow migration into
+/// a relay that cannot boot. sqlx also takes its migration advisory lock as a
+/// single waiting statement, so a second replica rolling out would be canceled
+/// mid-wait rather than queueing behind the first.
+///
+/// The connection is closed instead of returned to the pool: its session still
+/// carries the lifted limits and must never serve traffic.
 pub async fn run_migrations(pool: &PgPool) -> Result<()> {
     reject_legacy_nip_rs_cardinality_ambiguity(pool).await?;
-    MIGRATOR.run(pool).await?;
+    run_migrator_without_runtime_timeouts(pool).await?;
     // The replica-fence proof (see `replica_fence`) requires the commit-time
     // `created_at` floor trigger from migration 0021 — correctly shaped — on
     // the `events` parent and every partition. `CREATE TABLE .. PARTITION OF`
@@ -22,6 +33,23 @@ pub async fn run_migrations(pool: &PgPool) -> Result<()> {
     // guard, so migration fails closed if any is missing. (The fence probe
     // re-runs this same check at startup on non-migrating relays.)
     crate::replica_fence::verify_floor_guard_catalog(pool).await?;
+    Ok(())
+}
+
+async fn run_migrator_without_runtime_timeouts(pool: &PgPool) -> Result<()> {
+    let mut connection = pool.acquire().await?;
+    crate::apply_runtime_connection_timeouts(
+        &mut connection,
+        crate::TIMEOUT_DISABLED,
+        crate::TIMEOUT_DISABLED,
+    )
+    .await?;
+    let migrated = MIGRATOR.run(&mut *connection).await;
+    // Retire the connection either way; report the migration outcome first so a
+    // close failure cannot mask it.
+    let closed = connection.detach().close().await;
+    migrated?;
+    closed?;
     Ok(())
 }
 

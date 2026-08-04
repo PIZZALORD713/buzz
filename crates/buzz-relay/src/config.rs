@@ -99,6 +99,14 @@ pub struct Config {
     /// independently so reader capacity can be tuned against the replica's
     /// headroom without touching the writer pool.
     pub db_read_pool_size: Option<u32>,
+    /// Postgres `statement_timeout` for every runtime connection
+    /// (`BUZZ_DB_STATEMENT_TIMEOUT`, e.g. `45s`, `500ms`, `0` to disable).
+    /// Tunable so a backfill or an incident does not need a code change.
+    pub db_statement_timeout: String,
+    /// Postgres `lock_timeout` for every runtime connection
+    /// (`BUZZ_DB_LOCK_TIMEOUT`). Schema migrations always run with both limits
+    /// lifted — see `buzz_db::migration::run_migrations`.
+    pub db_lock_timeout: String,
     /// Public WebSocket URL of this relay, advertised in NIP-11.
     pub relay_url: String,
     /// Public WebSocket URL of the dedicated device-pairing relay, when configured.
@@ -300,6 +308,37 @@ pub struct Config {
 fn parse_bind_addr(raw: &str) -> Result<SocketAddr, ConfigError> {
     raw.parse::<SocketAddr>()
         .map_err(|e| ConfigError::InvalidBindAddr(e.to_string()))
+}
+
+/// Postgres accepts a timeout as an integer (milliseconds) with an optional
+/// unit. Anything else is refused in favor of the default rather than failing
+/// the config: a malformed value would break every `after_connect`, taking all
+/// Postgres access with it, and a relay that keeps its documented default is a
+/// better outcome than one that will not start.
+fn pg_timeout_or_default(raw: Option<&str>, default: &str) -> String {
+    const UNITS: [&str; 6] = ["us", "ms", "s", "min", "h", "d"];
+
+    let candidate = raw.map(str::trim).filter(|value| !value.is_empty());
+    let Some(candidate) = candidate else {
+        return default.to_string();
+    };
+
+    let digits = candidate.chars().take_while(char::is_ascii_digit).count();
+    let (magnitude, unit) = candidate.split_at(digits);
+    let unit = unit.trim();
+    let valid = !magnitude.is_empty()
+        && (unit.is_empty() || UNITS.iter().any(|known| unit.eq_ignore_ascii_case(known)));
+    if valid {
+        candidate.to_string()
+    } else {
+        tracing::warn!(
+            value = candidate,
+            default,
+            "ignoring malformed Postgres timeout — expected an integer with an optional \
+             us/ms/s/min/h/d unit"
+        );
+        default.to_string()
+    }
 }
 
 fn positive_u64_from_env(name: &str, default: u64) -> Result<u64, ConfigError> {
@@ -509,6 +548,15 @@ impl Config {
             .ok()
             .and_then(|v| v.parse::<u32>().ok())
             .filter(|&v| v > 0);
+
+        let db_statement_timeout = pg_timeout_or_default(
+            std::env::var("BUZZ_DB_STATEMENT_TIMEOUT").ok().as_deref(),
+            buzz_db::RUNTIME_STATEMENT_TIMEOUT,
+        );
+        let db_lock_timeout = pg_timeout_or_default(
+            std::env::var("BUZZ_DB_LOCK_TIMEOUT").ok().as_deref(),
+            buzz_db::RUNTIME_LOCK_TIMEOUT,
+        );
 
         let relay_url =
             std::env::var("RELAY_URL").unwrap_or_else(|_| "ws://localhost:3000".to_string());
@@ -976,6 +1024,8 @@ impl Config {
             redis_pool_size,
             db_pool_size,
             db_read_pool_size,
+            db_statement_timeout,
+            db_lock_timeout,
             relay_url,
             pairing_relay_url,
             max_connections,
@@ -1194,6 +1244,68 @@ mod tests {
         assert_eq!(overridden, 80);
         assert_eq!(zero, 50, "zero must fall back to the default");
         assert_eq!(junk, 50, "unparsable value must fall back to the default");
+    }
+
+    #[test]
+    fn pg_timeout_accepts_postgres_spellings_and_refuses_the_rest() {
+        for accepted in ["30s", "500ms", "0", "45S", "2min", " 10s "] {
+            assert_eq!(
+                pg_timeout_or_default(Some(accepted), "30s"),
+                accepted.trim(),
+                "{accepted} is a valid Postgres timeout"
+            );
+        }
+
+        // A rejected value must not reach Postgres: `after_connect` would fail
+        // for every connection, which is worse than the documented default.
+        for rejected in ["", "   ", "soon", "30 seconds", "s30", "-5s", "30s;DROP"] {
+            assert_eq!(
+                pg_timeout_or_default(Some(rejected), "30s"),
+                "30s",
+                "{rejected:?} must fall back to the default"
+            );
+        }
+
+        assert_eq!(pg_timeout_or_default(None, "5s"), "5s");
+    }
+
+    #[test]
+    fn db_timeout_env_overrides_and_invalid_fallback() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        let previous_statement = std::env::var_os("BUZZ_DB_STATEMENT_TIMEOUT");
+        let previous_lock = std::env::var_os("BUZZ_DB_LOCK_TIMEOUT");
+
+        std::env::remove_var("BUZZ_DB_STATEMENT_TIMEOUT");
+        std::env::remove_var("BUZZ_DB_LOCK_TIMEOUT");
+        let defaults = Config::from_env().expect("config");
+        assert_eq!(
+            defaults.db_statement_timeout,
+            buzz_db::RUNTIME_STATEMENT_TIMEOUT
+        );
+        assert_eq!(defaults.db_lock_timeout, buzz_db::RUNTIME_LOCK_TIMEOUT);
+
+        std::env::set_var("BUZZ_DB_STATEMENT_TIMEOUT", "90s");
+        std::env::set_var("BUZZ_DB_LOCK_TIMEOUT", "250ms");
+        let overridden = Config::from_env().expect("config");
+        assert_eq!(overridden.db_statement_timeout, "90s");
+        assert_eq!(overridden.db_lock_timeout, "250ms");
+
+        std::env::set_var("BUZZ_DB_STATEMENT_TIMEOUT", "half a minute");
+        let junk = Config::from_env().expect("config");
+        assert_eq!(
+            junk.db_statement_timeout,
+            buzz_db::RUNTIME_STATEMENT_TIMEOUT,
+            "a malformed value must not be handed to Postgres"
+        );
+
+        match previous_statement {
+            Some(value) => std::env::set_var("BUZZ_DB_STATEMENT_TIMEOUT", value),
+            None => std::env::remove_var("BUZZ_DB_STATEMENT_TIMEOUT"),
+        }
+        match previous_lock {
+            Some(value) => std::env::set_var("BUZZ_DB_LOCK_TIMEOUT", value),
+            None => std::env::remove_var("BUZZ_DB_LOCK_TIMEOUT"),
+        }
     }
 
     #[test]

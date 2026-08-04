@@ -65,22 +65,27 @@ use uuid::Uuid;
 
 use buzz_core::{CommunityId, StoredEvent};
 
-/// Maximum time a runtime query may execute before Postgres cancels it.
+/// Default maximum time a runtime query may execute before Postgres cancels it.
 pub const RUNTIME_STATEMENT_TIMEOUT: &str = "30s";
-/// Maximum time a runtime query may wait to acquire a lock.
+/// Default maximum time a runtime query may wait to acquire a lock.
 pub const RUNTIME_LOCK_TIMEOUT: &str = "5s";
+/// Postgres spelling of "no limit", used for schema migrations.
+pub const TIMEOUT_DISABLED: &str = "0";
 
 /// Apply the runtime safety limits shared by writer, reader, audit, and search
-/// pools.
+/// pools. Values are Postgres interval strings (`"30s"`, `"500ms"`), with
+/// [`TIMEOUT_DISABLED`] lifting a limit entirely.
 pub async fn apply_runtime_connection_timeouts(
     connection: &mut PgConnection,
+    statement_timeout: &str,
+    lock_timeout: &str,
 ) -> std::result::Result<(), sqlx::Error> {
     sqlx::query(
         "SELECT set_config('statement_timeout', $1, false), \
                 set_config('lock_timeout', $2, false)",
     )
-    .bind(RUNTIME_STATEMENT_TIMEOUT)
-    .bind(RUNTIME_LOCK_TIMEOUT)
+    .bind(statement_timeout)
+    .bind(lock_timeout)
     .execute(connection)
     .await?;
     Ok(())
@@ -548,6 +553,14 @@ pub struct DbConfig {
     /// than the staleness gate never routes anyway, so a larger budget
     /// would only misrepresent the config.
     pub replica_read_max_age_ms: u64,
+    /// Postgres `statement_timeout` applied to every runtime connection. An
+    /// operator running a backfill or working an incident can widen this without
+    /// a code change; [`TIMEOUT_DISABLED`] removes the cap.
+    pub statement_timeout: String,
+    /// Postgres `lock_timeout` applied to every runtime connection. Bounds
+    /// heavyweight and row lock waits only — advisory-lock waits are bounded by
+    /// [`Self::statement_timeout`] instead.
+    pub lock_timeout: String,
 }
 
 impl Default for DbConfig {
@@ -565,6 +578,8 @@ impl Default for DbConfig {
             max_lifetime_secs: 1800,
             idle_timeout_secs: 600,
             replica_read_max_age_ms: 0,
+            statement_timeout: RUNTIME_STATEMENT_TIMEOUT.to_string(),
+            lock_timeout: RUNTIME_LOCK_TIMEOUT.to_string(),
         }
     }
 }
@@ -703,9 +718,13 @@ impl Db {
             .acquire_timeout(Duration::from_secs(config.acquire_timeout_secs))
             .max_lifetime(Duration::from_secs(config.max_lifetime_secs))
             .idle_timeout(Duration::from_secs(config.idle_timeout_secs));
+        let statement_timeout = config.statement_timeout.clone();
+        let lock_timeout = config.lock_timeout.clone();
         options = options.after_connect(move |conn, _meta| {
+            let statement_timeout = statement_timeout.clone();
+            let lock_timeout = lock_timeout.clone();
             Box::pin(async move {
-                apply_runtime_connection_timeouts(conn).await?;
+                apply_runtime_connection_timeouts(conn, &statement_timeout, &lock_timeout).await?;
                 if arm_floor_guard {
                     // `SET` cannot take bind parameters; `set_config` can.
                     sqlx::query("SELECT set_config('buzz.created_at_floor', $1, false)")
@@ -743,14 +762,21 @@ impl Db {
     /// No floor guard: replica sessions are read-only, the trigger never
     /// fires there (see [`Db::connect_pool`]).
     fn connect_read_pool(config: &DbConfig, url: &str, max_connections: u32) -> Result<PgPool> {
+        let statement_timeout = config.statement_timeout.clone();
+        let lock_timeout = config.lock_timeout.clone();
         Ok(PgPoolOptions::new()
             .max_connections(max_connections)
             .min_connections(0)
             .acquire_timeout(Self::READER_ACQUIRE_TIMEOUT)
             .max_lifetime(Duration::from_secs(config.max_lifetime_secs))
             .idle_timeout(Duration::from_secs(config.idle_timeout_secs))
-            .after_connect(|connection, _meta| {
-                Box::pin(apply_runtime_connection_timeouts(connection))
+            .after_connect(move |connection, _meta| {
+                let statement_timeout = statement_timeout.clone();
+                let lock_timeout = lock_timeout.clone();
+                Box::pin(async move {
+                    apply_runtime_connection_timeouts(connection, &statement_timeout, &lock_timeout)
+                        .await
+                })
             })
             .connect_lazy(url)?)
     }
