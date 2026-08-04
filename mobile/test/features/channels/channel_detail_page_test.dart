@@ -3447,6 +3447,80 @@ void main() {
       );
     });
 
+    testWidgets('short initial thread hydration remains top-anchored', (
+      tester,
+    ) async {
+      final rootEvent = _textMsg(
+        id: 'thread-root',
+        pubkey: 'alice',
+        content: 'Thread root',
+        createdAt: 1000,
+      );
+      final replies = [
+        _textMsg(
+          id: 'reply-1',
+          pubkey: 'bob',
+          content: 'First reply',
+          createdAt: 1100,
+          extraTags: const [
+            ['e', 'thread-root', '', 'reply'],
+          ],
+        ),
+        _textMsg(
+          id: 'reply-2',
+          pubkey: 'bob',
+          content: 'Second reply',
+          createdAt: 1101,
+          extraTags: const [
+            ['e', 'thread-root', '', 'reply'],
+          ],
+        ),
+      ];
+      final completer = Completer<List<NostrEvent>>();
+
+      await tester.pumpWidget(
+        _buildTestable(
+          messages: [rootEvent],
+          pendingThreadReplies: {'thread-root': completer.future},
+          users: const {
+            'alice': UserProfile(pubkey: 'alice', displayName: 'Alice'),
+            'bob': UserProfile(pubkey: 'bob', displayName: 'Bob'),
+          },
+        ),
+      );
+      await tester.pumpAndSettle();
+
+      final threadHead = formatTimeline([rootEvent]).single;
+      Navigator.of(tester.element(find.byType(ChannelDetailPage))).push(
+        MaterialPageRoute<void>(
+          builder: (_) => ThreadDetailPage(
+            threadHead: threadHead,
+            allMessages: [threadHead],
+            channelId: _channelId,
+            currentPubkey: 'self',
+            isMember: true,
+            isArchived: false,
+          ),
+        ),
+      );
+      await tester.pumpAndSettle();
+
+      final headFinder = find.byKey(
+        const ValueKey('thread-message-group-thread-root'),
+      );
+      final initialHeadY = tester.getTopLeft(headFinder).dy;
+
+      completer.complete(replies);
+      await tester.pumpAndSettle();
+
+      expect(headFinder, findsOneWidget);
+      expect(
+        find.byKey(const ValueKey('thread-message-group-reply-2')),
+        findsOneWidget,
+      );
+      expect(tester.getTopLeft(headFinder).dy, closeTo(initialHeadY, 0.5));
+    });
+
     testWidgets(
       'initial thread hydration settles on the latest reply after pagination',
       (tester) async {

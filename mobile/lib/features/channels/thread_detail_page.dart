@@ -190,6 +190,7 @@ class ThreadDetailPage extends HookConsumerWidget {
         initialTailSettle.schedule(
           context: context,
           controller: itemScrollController,
+          positionsListener: itemPositionsListener,
           targetIndex: initialMessageId == null && replies.isNotEmpty
               ? indexForReply(replies.length - 1)
               : null,

@@ -14,6 +14,7 @@ class InitialThreadTailSettle {
   void schedule({
     required BuildContext context,
     required ItemScrollController controller,
+    required ItemPositionsListener positionsListener,
     required int? targetIndex,
   }) {
     if (_isComplete) return;
@@ -33,6 +34,19 @@ class InitialThreadTailSettle {
         if (!context.mounted ||
             !controller.isAttached ||
             generation != _generation) {
+          return;
+        }
+        final targetIsFullyVisible = positionsListener.itemPositions.value.any(
+          (position) =>
+              position.index == targetIndex &&
+              position.itemLeadingEdge >= 0 &&
+              position.itemTrailingEdge <= 1,
+        );
+        // Short threads already expose their tail from the top anchor. Moving
+        // that fully visible target down would only add empty space above the
+        // head. A clipped tail still takes the measured correction path.
+        if (targetIsFullyVisible) {
+          _isComplete = true;
           return;
         }
         controller
