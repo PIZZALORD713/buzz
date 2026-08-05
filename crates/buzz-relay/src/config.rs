@@ -316,7 +316,9 @@ fn parse_bind_addr(raw: &str) -> Result<SocketAddr, ConfigError> {
 fn pg_timeout_millis(magnitude: &str, unit: &str) -> Option<u128> {
     let value = magnitude.parse::<u128>().ok()?;
     match unit {
-        "us" => Some((value + 500) / 1_000),
+        // Round half up without the `value + 500` intermediate, which overflows
+        // for the top 500 representable microsecond values.
+        "us" => Some(value / 1_000 + u128::from(value % 1_000 >= 500)),
         "" | "ms" => Some(value),
         "s" => value.checked_mul(1_000),
         "min" => value.checked_mul(60_000),
@@ -1310,6 +1312,11 @@ mod tests {
             // Wider than any integer type — must fall back, not overflow.
             "999999999999999999999999999999999999999999d",
             "99999999999999999999999999999999999999999999999999",
+            // Parses as u128, so unlike the two above it reaches the unit
+            // conversion — where rounding must not overflow on the way to the
+            // range check.
+            &format!("{}us", u128::MAX),
+            &format!("{}us", u128::MAX - 499),
         ] {
             assert_eq!(
                 pg_timeout_or_default(Some(rejected), "30s"),
