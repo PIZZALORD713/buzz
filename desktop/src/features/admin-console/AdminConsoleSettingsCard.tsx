@@ -206,6 +206,12 @@ function AdminConsoleSettingsSession({ pubkeyHex }: { pubkeyHex: string }) {
   type SessionToken = { pubkey: string; origin: string };
   const sessionTokenRef = useRef<SessionToken | null>(null);
 
+  // Mount guard: false after this component unmounts. Prevents A's handleSave
+  // continuation from calling runProbe() on the IPC layer after A unmounts due
+  // to an identity switch. sessionTokenRef prevents same-session state corruption;
+  // isMountedRef prevents the cross-identity stale probe IPC call.
+  const isMountedRef = useRef(true);
+
   // Synchronously abort any active probe and reset probe UI state.
   // Call before starting a new probe or on any input change.
   function abortAndResetProbe() {
@@ -213,6 +219,15 @@ function AdminConsoleSettingsSession({ pubkeyHex }: { pubkeyHex: string }) {
     probeAbortRef.current = null;
     setProbeUiState({ kind: "idle" });
   }
+
+  // Set isMountedRef to false when this component unmounts. Paired with the
+  // load-saved-origin effect below: that effect has an explicit biome-ignore;
+  // this cleanup-only effect has no deps and Biome accepts it without suppression.
+  useEffect(() => {
+    return () => {
+      isMountedRef.current = false;
+    };
+  }, []);
 
   // Load saved origin on mount (runs once per session because the component
   // is keyed by pubkeyHex — re-mount = new pubkey).
@@ -285,7 +300,7 @@ function AdminConsoleSettingsSession({ pubkeyHex }: { pubkeyHex: string }) {
         return;
       }
       const canonical = await setAdminOrigin(trimmed, pubkeyHex);
-      if (sessionTokenRef.current !== token) return;
+      if (!isMountedRef.current || sessionTokenRef.current !== token) return;
       setSavedOrigin(canonical);
       if (canonical) {
         runProbe(canonical);

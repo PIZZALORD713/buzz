@@ -16,10 +16,9 @@
  *   - `active` flag cleanup is removed from useAsyncLoad (old-list-after-new-list)
  *   - the `getAdminOrigin()` catch is changed to silent-degrade (storage-error test)
  *
- * authorized-logout-teardown lives here (MinimalDocument, not jsdom) because the jsdom
- * React 19 global scheduler leaves pending promises when the mutation is applied, causing
- * the jsdom runner to report CANCELLED instead of a clean AssertionError. The
- * flushSync(render)+flushSync(unmount) approach works cleanly in MinimalDocument.
+ * authorized-logout-teardown lives here (MinimalDocument, not jsdom) because the test is
+ * query-driven (act + qc.setQueryData + settle), not event-driven. The MinimalDocument
+ * suite handles async transitions cleanly without the jsdom global scheduler.
  *
  * Cross-identity delayed-save and all event-driven tests (origin-edit, detail-navigation,
  * attachment-unmount, same-session-save-race) live in adminConsolePanelEvents.jsdom-test.mjs
@@ -647,61 +646,69 @@ test("parseImetaAttachments: extracts from camelCase AdminFeedback relay fixture
 
 test("authorized-logout-teardown: A's session is gone when pubkeyHex becomes empty", async () => {
   // Verifies the `pubkeyHex ? <AdminConsoleSettingsSession key=…> : null` render
-  // gate in AdminConsoleSettingsCard. When pubkeyHex transitions to "", the gate
-  // must render null — no input, no session component.
+  // gate in AdminConsoleSettingsCard. Drives the full authorized→logout transition:
+  // mount with a real identity A, drive to authorized (input visible, panel rendered),
+  // then switch pubkeyHex to "" and assert both input and panel are gone.
   //
-  // Fails if the render gate is removed: AdminConsoleSettingsSession mounts with
-  // pubkeyHex="" and the input appears in the DOM.
+  // Fails if the render gate is removed: after the transition to pubkeyHex="",
+  // AdminConsoleSettingsSession re-mounts with empty pubkey and the input remains.
   //
-  // Design: flushSync(render) + flushSync(unmount) — no async effects
-  //
-  // When the gate is absent, AdminConsoleSettingsSession mounts with pubkeyHex=""
-  // and would schedule async effects (get_admin_origin). To prevent those effects
-  // from keeping the event loop alive (which causes CANCELLED instead of FAILED),
-  // we immediately unmount via flushSync. The render commit is synchronous, so we
-  // can check the DOM between render and unmount. The unmount runs synchronously
-  // before any passive effects fire, cancelling them — no pending promises.
+  // Design: identical to identity-switch — act + qc.setQueryData + settle.
+  // React Query's notifyManager fires onStoreChange via setTimeout(0), which
+  // act() drains during the inner settle(). The MinimalDocument environment
+  // handles this cleanly without the jsdom global scheduler side-effects.
 
-  setIpcHandler("get_admin_origin", () => Promise.resolve(null));
-  setIpcHandler("admin_probe", () => Promise.resolve({ state: "disabled" }));
+  const pubkeyA = "a".repeat(64);
+  const originA = "https://admin-a.example.com";
 
-  const qc = makeQueryClient("");
-  const container = document.createElement("div");
-  document.body.appendChild(container);
-  const root = createRoot(container);
+  setIpcHandler("get_admin_origin", (args) => {
+    if (args?.expectedPubkey === pubkeyA) return Promise.resolve(originA);
+    return Promise.resolve(null);
+  });
+  setIpcHandler("admin_probe", () =>
+    Promise.resolve({ state: "nip98Authorized" }),
+  );
+  setIpcHandler("admin_list_reports", () => Promise.resolve([]));
+  setIpcHandler("admin_list_feedback", () => Promise.resolve([]));
 
-  const { flushSync } = await import("react-dom");
+  const qc = makeQueryClient(pubkeyA);
+  const { container, doRender, unmount } = mountCard(qc);
+  await doRender();
+  await settle(50);
 
-  // Render synchronously. The gate is a pure render-time conditional, so the DOM
-  // already reflects the committed tree after flushSync.
-  flushSync(() => {
-    root.render(
-      React.createElement(
-        QueryClientProvider,
-        { client: qc },
-        React.createElement(AdminConsoleSettingsCard),
-      ),
-    );
+  // A is authorized — input and panel must be present.
+  const inputA = container.querySelector("[data-testid='admin-origin-input']");
+  assert.ok(inputA, "input must render for pubkeyA in authorized state");
+  const panelA = container.querySelector("[data-testid='admin-console-panel']");
+  assert.ok(panelA, "admin-console-panel must render when A is authorized");
+
+  // Transition to logout — same pattern as identity-switch.
+  await act(async () => {
+    qc.setQueryData(["identity"], { pubkey: "" });
+    await new Promise((r) => setTimeout(r, 25));
   });
 
-  // Capture DOM state BEFORE any effects run.
-  const input = container.querySelector("[data-testid='admin-origin-input']");
+  // After the transition: gate renders null, both input and panel must be gone.
+  const inputAfter = container.querySelector(
+    "[data-testid='admin-origin-input']",
+  );
+  const panelAfter = container.querySelector(
+    "[data-testid='admin-console-panel']",
+  );
 
-  // Synchronously unmount before passive effects fire. This cancels any scheduled
-  // effects, preventing the event loop from staying alive with pending promises.
-  flushSync(() => {
-    root.unmount();
-  });
-  document.body.removeChild(container);
+  await unmount();
 
-  // Assert after cleanup — no async work is pending at this point.
   assert.equal(
-    input,
+    inputAfter,
     null,
     "admin origin input must not render when pubkeyHex is empty — render gate missing",
   );
+  assert.equal(
+    panelAfter,
+    null,
+    "admin-console-panel must not render after logout — render gate missing",
+  );
 });
-
 test("identity-switch: fresh session mounts with empty input on pubkey change", async () => {
   // Verifies the key-prop boundary. Without `key={pubkeyHex}`, React reuses
   // the component and A's origin state survives the switch to B.

@@ -795,6 +795,7 @@ test("cross-identity-delayed-save: A's late save carries A's expectedPubkey and 
   //     a. The set_admin_origin call recorded expectedPubkey = pubkeyA.
   //     b. B's input is still empty (A's late state writes discarded by React).
   //     c. B's panel does not show A's origin as authorized.
+  //     d. No admin_probe fires for A's origin after the identity switch.
   //
   // Fails if expectedPubkey is dropped from the set_admin_origin invocation path
   // (api.ts forwarding): the recorded call has no expectedPubkey, so the Rust-level
@@ -852,8 +853,12 @@ test("cross-identity-delayed-save: A's late save carries A's expectedPubkey and 
     if (args?.expectedPubkey === pubkeyB) return Promise.resolve(null);
     return Promise.resolve(null);
   });
-  // After switch, probe for B returns disabled (B has no origin to probe).
-  setIpcHandler("admin_probe", () => Promise.resolve({ state: "disabled" }));
+  // After switch, record admin_probe calls to detect any stale A probe firing.
+  const probeRecords = [];
+  setIpcHandler("admin_probe", (args) => {
+    probeRecords.push({ ...args });
+    return Promise.resolve({ state: "disabled" });
+  });
   await act(async () => {
     qc.setQueryData(["identity"], { pubkey: pubkeyB });
     await new Promise((r) => setTimeout(r, 20));
@@ -891,6 +896,24 @@ test("cross-identity-delayed-save: A's late save carries A's expectedPubkey and 
     panel,
     null,
     "admin-console-panel must not render for B — B has no authorized origin",
+  );
+
+  // (d) No admin_probe must have fired for A's origin after the identity switch.
+  // A's handleSave continuation calls runProbe(canonical) after the save resolves.
+  // The sessionTokenRef check prevents same-session concurrent saves from firing
+  // a stale probe, but it does not stop A's own continuation after A unmounts:
+  // A's sessionTokenRef still matches A's token, so the check passes and
+  // runProbe(newOriginA) fires as an IPC call. React discards the state update
+  // on the unmounted component, so B is unaffected — but the probe IPC fires.
+  // This assertion catches any such stale probe call: if a probe with A's origin
+  // is recorded here, production code is calling probeAdminOrigin after unmount.
+  const staleProbe = probeRecords.find(
+    (p) => p?.origin === originA || p?.origin === newOriginA,
+  );
+  assert.equal(
+    staleProbe,
+    undefined,
+    `no admin_probe must fire for A's origin after identity switch; got: ${JSON.stringify(staleProbe)}`,
   );
 
   await unmount();
