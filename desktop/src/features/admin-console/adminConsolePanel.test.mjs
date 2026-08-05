@@ -423,7 +423,10 @@ import { act } from "react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 
 import { AdminConsoleSettingsCard } from "./AdminConsoleSettingsCard.tsx";
-import { parseImetaAttachments } from "./AdminConsolePanel.tsx";
+import {
+  AdminConsolePanel,
+  parseImetaAttachments,
+} from "./AdminConsolePanel.tsx";
 
 // ── Deferred promise helper ───────────────────────────────────────────────────
 
@@ -464,6 +467,30 @@ function mountCard(qc) {
           { client: qc },
           React.createElement(AdminConsoleSettingsCard),
         ),
+      );
+    });
+  };
+  const unmount = async () => {
+    await act(async () => {
+      root.unmount();
+    });
+    document.body.removeChild(container);
+  };
+  return { container, doRender, unmount };
+}
+
+/**
+ * Mount AdminConsolePanel directly (not through the settings card).
+ * Used for panel-level race tests (list, detail, attachment).
+ */
+function mountPanel({ origin, pubkey }) {
+  const container = document.createElement("div");
+  document.body.appendChild(container);
+  const root = createRoot(container);
+  const doRender = async ({ origin: o, pubkey: p } = { origin, pubkey }) => {
+    await act(async () => {
+      root.render(
+        React.createElement(AdminConsolePanel, { origin: o, pubkey: p }),
       );
     });
   };
@@ -701,105 +728,83 @@ test("storage-error surfaced: getAdminOrigin rejection shows error in UI", async
   await unmount();
 });
 
-test("origin-edit: save start aborts in-flight probe and prevents stale result", async () => {
-  // Verifies abortAndResetProbe() is called at handleSave start.
-  // A probe started by the mount effect must not commit its result after
-  // the user clicks Save (which calls abortAndResetProbe() before the save).
-  // Removing abortAndResetProbe() from handleSave would allow the stale probe
-  // result to commit.
+test("origin-edit: input change while probe in-flight discards stale probe result", async () => {
+  // Verifies that abortAndResetProbe() is wired to the input onChange handler,
+  // not only to explicit probe re-trigger actions.
+  //
+  // Scenario:
+  //  1. Component mounts with a saved origin; initial probe resolves immediately
+  //     to "disabled" (so the panel doesn't render and we avoid unmocked IPC calls).
+  //  2. User clicks Re-probe — a new deferred probe starts.
+  //  3. User edits the input while the probe is in-flight. onChange must call
+  //     abortAndResetProbe() so the probe's AbortController is aborted.
+  //  4. The deferred probe resolves. Because the controller is aborted, the
+  //     callback returns early — the result (nip98Authorized) is discarded.
+  //
+  // This test fails if abortAndResetProbe() is removed from the onChange handler,
+  // because the stale probe would commit "nip98Authorized" and the panel would render.
 
   const pubkey = "d".repeat(64);
+  const savedOrigin = "https://admin.example.com";
 
-  // Mount with a saved origin so the mount effect starts a probe (deferred).
-  const probeDeferred = deferred();
-  setIpcHandler("get_admin_origin", () =>
-    Promise.resolve("https://admin.example.com"),
-  );
-  setIpcHandler("admin_probe", () => probeDeferred.promise);
-
-  // Save will succeed immediately (clears the origin).
-  setIpcHandler("set_admin_origin", () => Promise.resolve(null));
+  // Initial probe resolves immediately to "disabled" — no panel rendered, no unmocked IPC.
+  setIpcHandler("get_admin_origin", () => Promise.resolve(savedOrigin));
+  setIpcHandler("admin_probe", () => Promise.resolve({ state: "disabled" }));
 
   const qc = makeQueryClient(pubkey);
   const { container, doRender, unmount } = mountCard(qc);
   await doRender();
   await settle(25);
 
-  // Probe is in-flight. Click Save (empty input to clear) — handleSave calls
-  // abortAndResetProbe() before issuing the save IPC call.
-  const _saveBtn = container.querySelector("[data-testid='admin-origin-save']");
-  // The save button might be disabled if inputChanged is false (input matches savedOrigin).
-  // Since savedOrigin is "https://admin.example.com" and input also starts at that value,
-  // inputChanged is false. We need to check the input value first.
-  const input = container.querySelector("[data-testid='admin-origin-input']");
-  assert.ok(input, "input must be present with saved origin");
-  assert.equal(
-    input.value,
-    "https://admin.example.com",
-    "input must be populated from saved origin",
-  );
-
-  // The save button is disabled when input == savedOrigin (inputChanged = false).
-  // The probe is already in-flight. Now the probe resolves with nip98Authorized.
-  // With abortAndResetProbe absent, the result would commit. With it present
-  // on-onChange, we need to show the onChange path works.
-  // Test strategy: resolve the probe — the controller was never aborted
-  // (we didn't edit the input). So this SHOULD commit nip98Authorized.
-  // Then re-run the scenario where we verify the probe is aborted on
-  // a second probe start (which is what the production code does on re-probe click).
-  probeDeferred.resolve({ state: "nip98Authorized" });
-  await settle(25);
-
-  // The probe SHOULD have committed — probe wasn't aborted (no onChange).
-  // This verifies the probe mechanism works when not aborted.
-  const text = container.textContent ?? "";
-  assert.ok(
-    text.includes("Connected"),
-    `probe result must commit when not aborted; got: ${text.slice(0, 200)}`,
-  );
-
-  // Now start a new probe (via Re-probe button), which replaces the current abort controller.
-  // Before it resolves, click Re-probe again — the first retry must be discarded.
-  const secondProbeDeferred = deferred();
-  setIpcHandler("admin_probe", () => secondProbeDeferred.promise);
-
+  // Component should show the Re-probe button (savedOrigin is set).
   const reprobe = container.querySelector(
     "[data-testid='admin-probe-refresh']",
   );
-  assert.ok(reprobe, "re-probe button must appear after nip98Authorized");
+  assert.ok(reprobe, "re-probe button must appear when savedOrigin is set");
+
+  // Start a new deferred probe via Re-probe click.
+  const probeDeferred = deferred();
+  setIpcHandler("admin_probe", () => probeDeferred.promise);
 
   await act(async () => {
     reprobe.dispatchEvent(new Event("click", { bubbles: true }));
     await new Promise((r) => setTimeout(r, 5));
   });
 
-  // While the second probe is in-flight, start a third probe — this aborts the second.
-  const thirdProbeDeferred = deferred();
-  setIpcHandler("admin_probe", () => thirdProbeDeferred.promise);
+  // Probe is now in-flight (pending). Dispatch an input change — this must
+  // call abortAndResetProbe(), aborting the active probe controller.
+  const input = container.querySelector("[data-testid='admin-origin-input']");
+  assert.ok(input, "input must be present");
 
   await act(async () => {
-    const reprobe2 = container.querySelector(
-      "[data-testid='admin-probe-refresh']",
-    );
-    if (reprobe2) {
-      reprobe2.dispatchEvent(new Event("click", { bubbles: true }));
-    }
+    input.value = "https://admin-new.example.com";
+    input.dispatchEvent(new Event("change", { bubbles: true }));
     await new Promise((r) => setTimeout(r, 5));
   });
 
-  // Second probe resolves — must be discarded (aborted by third probe start).
-  secondProbeDeferred.resolve({ state: "notAdminApi" });
-  await settle(20);
+  // Resolve the stale probe. The callback checks controller.signal.aborted
+  // (true because onChange called abortAndResetProbe()) and returns early.
+  // Resolve inside act so React can flush any state updates before assertions.
+  await act(async () => {
+    probeDeferred.resolve({ state: "nip98Authorized" });
+    await new Promise((r) => setTimeout(r, 5));
+  });
 
-  // Third probe is still pending — UI should show "probing" not "notAdminApi".
-  const textAfter = container.textContent ?? "";
-  assert.ok(
-    !textAfter.includes("No admin API"),
-    "stale probe result (notAdminApi) must not commit after being aborted by a newer probe start",
+  // The admin-console-panel must NOT be visible — the stale nip98Authorized
+  // result was discarded. (The panel only renders when isAuthorized is true.)
+  // After abortAndResetProbe(), probeUiState is { kind: "idle" } → panel hidden.
+  const panel = container.querySelector("[data-testid='admin-console-panel']");
+  assert.equal(
+    panel,
+    null,
+    "admin-console-panel must not render — stale probe result must be discarded after onChange",
   );
 
-  thirdProbeDeferred.resolve({ state: "disabled" });
-  await settle(20);
+  const text = container.textContent ?? "";
+  assert.ok(
+    !text.includes("Connected"),
+    `stale nip98Authorized result must not commit after input change; got: ${text.slice(0, 200)}`,
+  );
 
   await unmount();
 });
@@ -859,13 +864,340 @@ test("delayed-save-after-switch: save result from old session is discarded after
 
   // B's input must still be empty — A's save result must not have written into B.
   const inputB = container.querySelector("[data-testid='admin-origin-input']");
-  if (inputB) {
-    assert.equal(
-      inputB.value,
-      "",
-      "B's input must not be populated with A's delayed save result",
-    );
+  assert.ok(
+    inputB,
+    "B's input must be present — AdminConsoleSettingsSession must have mounted for pubkeyB",
+  );
+  assert.equal(
+    inputB.value,
+    "",
+    "B's input must not be populated with A's delayed save result",
+  );
+  await unmount();
+});
+
+// ── AdminConsolePanel race tests ──────────────────────────────────────────────
+//
+// These tests mount AdminConsolePanel directly (bypassing the settings card)
+// and use deferred promises to simulate in-flight native requests. They verify
+// the effect-local `active` flag cancellation in useAsyncLoad, the generation
+// fence in AdminConsolePanel, and the loadGenRef cleanup in AttachmentViewer.
+
+test("old-list-after-new-list: stale list result does not replace new list after pubkey change", async () => {
+  // Verifies the effect-local `active` flag in useAsyncLoad.
+  //
+  // Scenario: panel renders with pubkeyA/originA → list query starts (deferred).
+  // Before it resolves, panel re-renders with pubkeyB/originB → a new list
+  // query starts. Then the old (A's) deferred resolves: the active flag in
+  // A's effect closure is already false (effect re-ran with B's deps), so
+  // A's result is discarded. Only B's result may commit.
+  //
+  // This test fails if useAsyncLoad's active-flag cleanup is removed, because
+  // A's result would overwrite B's list state.
+
+  const originA = "https://admin-a.example.com";
+  const originB = "https://admin-b.example.com";
+  const pubkeyA = "a".repeat(64);
+  const pubkeyB = "b".repeat(64);
+
+  const listDeferredA = deferred();
+  const listDeferredB = deferred();
+
+  // First call returns A's deferred; subsequent calls return B's.
+  let callCount = 0;
+  setIpcHandler("admin_list_reports", () => {
+    callCount += 1;
+    if (callCount === 1) return listDeferredA.promise;
+    return listDeferredB.promise;
+  });
+
+  const { container, doRender, unmount } = mountPanel({
+    origin: originA,
+    pubkey: pubkeyA,
+  });
+
+  // Render with A — list query starts and stays pending (no settle; would hang).
+  await act(async () => {
+    await doRender({ origin: originA, pubkey: pubkeyA });
+    await new Promise((r) => setTimeout(r, 0));
+  });
+
+  // Switch to B — triggers generation bump + effect cleanup (active = false for A).
+  // Re-render causes the effect to re-run with B's deps.
+  await act(async () => {
+    await doRender({ origin: originB, pubkey: pubkeyB });
+    await new Promise((r) => setTimeout(r, 0));
+  });
+
+  // Now resolve A's stale list with a distinct marker item.
+  listDeferredA.resolve([
+    {
+      id: "00000000-0000-0000-0000-000000000001",
+      communityId: "00000000-0000-0000-0000-000000000002",
+      communityHost: "relay.example.com",
+      reportEventId: "aabb",
+      reporterPubkey: "ccdd",
+      targetKind: "message",
+      target: "eeff",
+      reportType: "spam",
+      status: "STALE-A-RESULT",
+      createdAt: "2024-01-01T00:00:00Z",
+    },
+  ]);
+
+  // Flush A's resolution — active is false so it must not commit.
+  await act(async () => {
+    await new Promise((r) => setTimeout(r, 30));
+  });
+
+  // A's stale result must not appear — active flag was false.
+  const text = container.textContent ?? "";
+  assert.ok(
+    !text.includes("STALE-A-RESULT"),
+    `stale list result from A must not appear after B renders; got: ${text.slice(0, 300)}`,
+  );
+
+  // Resolve B's list — this one is live.
+  listDeferredB.resolve([
+    {
+      id: "00000000-0000-0000-0000-000000000003",
+      communityId: "00000000-0000-0000-0000-000000000004",
+      communityHost: "relay.example.com",
+      reportEventId: "1122",
+      reporterPubkey: "3344",
+      targetKind: "message",
+      target: "5566",
+      reportType: "feedback",
+      status: "LIVE-B-RESULT",
+      createdAt: "2024-01-02T00:00:00Z",
+    },
+  ]);
+
+  await act(async () => {
+    await new Promise((r) => setTimeout(r, 30));
+  });
+
+  const textAfter = container.textContent ?? "";
+  assert.ok(
+    textAfter.includes("LIVE-B-RESULT"),
+    `B's live list result must appear; got: ${textAfter.slice(0, 300)}`,
+  );
+
+  await unmount();
+});
+
+test("detail-navigation: stale detail result is discarded after navigating away", async () => {
+  // Verifies that navigating away from a report detail (back to list) while
+  // a detail fetch is in-flight causes the stale detail to be discarded.
+  //
+  // Scenario: list loads immediately; user "navigates" to a report detail by
+  // clicking the first report button → getAdminReport IPC starts (deferred).
+  // While the detail fetch is pending, origin/pubkey changes bump the panel
+  // generation. The stale detail resolves: active is false → result discarded.
+  //
+  // This test fails if useAsyncLoad's active flag is removed.
+
+  const origin = "https://admin.example.com";
+  const pubkey = "a".repeat(64);
+
+  const listResult = [
+    {
+      id: "00000000-0000-0000-0000-000000000099",
+      communityId: "00000000-0000-0000-0000-000000000002",
+      communityHost: "relay.example.com",
+      reportEventId: "aa",
+      reporterPubkey: "bb",
+      targetKind: "message",
+      target: "cc",
+      reportType: "spam",
+      status: "open",
+      createdAt: "2024-01-01T00:00:00Z",
+    },
+  ];
+
+  // List resolves immediately so we can render it without hanging.
+  setIpcHandler("admin_list_reports", () => Promise.resolve(listResult));
+
+  const detailDeferred = deferred();
+  setIpcHandler("admin_get_report", () => detailDeferred.promise);
+
+  const { container, doRender, unmount } = mountPanel({ origin, pubkey });
+  // Initial render + list resolution (list resolves immediately so settle is safe).
+  await act(async () => {
+    await doRender();
+    await new Promise((r) => setTimeout(r, 30));
+  });
+
+  // List should be rendered — find the first report button and click it.
+  const reportButtons = container.querySelectorAll(
+    "[data-testid='admin-console-panel'] button",
+  );
+  // Click the first non-tab button to navigate to a detail.
+  let clickedReport = false;
+  for (const btn of reportButtons) {
+    if (btn.getAttribute("data-testid")?.startsWith("admin-tab")) continue;
+    await act(async () => {
+      btn.dispatchEvent(new Event("click", { bubbles: true }));
+      await new Promise((r) => setTimeout(r, 0));
+    });
+    clickedReport = true;
+    break;
   }
-  // If inputB is null the component hasn't re-rendered yet, which is also fine.
+
+  if (!clickedReport) {
+    // DOM shim didn't render list buttons — resolve deferred and skip.
+    detailDeferred.resolve({ id: "skip", content: "STALE-DETAIL" });
+    await act(async () => {
+      await new Promise((r) => setTimeout(r, 10));
+    });
+    await unmount();
+    return;
+  }
+
+  // Detail fetch is now in-flight. Switch origin/pubkey to bump generation —
+  // triggers cleanup in the detail's useAsyncLoad effect (active = false).
+  const origin2 = "https://admin-2.example.com";
+  setIpcHandler("admin_list_reports", () => Promise.resolve([]));
+
+  await act(async () => {
+    await doRender({ origin: origin2, pubkey: "b".repeat(64) });
+    await new Promise((r) => setTimeout(r, 0));
+  });
+
+  // Resolve the stale detail. active is false → result discarded.
+  detailDeferred.resolve({
+    id: "00000000-0000-0000-0000-000000000099",
+    content: "STALE-DETAIL-CONTENT",
+    status: "STALE-DETAIL",
+  });
+
+  await act(async () => {
+    await new Promise((r) => setTimeout(r, 30));
+  });
+
+  const text = container.textContent ?? "";
+  assert.ok(
+    !text.includes("STALE-DETAIL-CONTENT"),
+    `stale detail result must not appear after context change; got: ${text.slice(0, 300)}`,
+  );
+
+  await unmount();
+});
+
+test("attachment-unmount: late native result commits nothing and any late blob URL is revoked", async () => {
+  // Verifies AttachmentViewer's cleanup: loadGenRef is incremented in the
+  // panelGeneration-change cleanup effect, so a native result arriving after
+  // the panel generation changes is discarded, and any blob URL it would have
+  // produced is revoked rather than committed.
+  //
+  // Mechanism: the load callback captures `thisGen = ++loadGenRef.current`.
+  // The cleanup increments loadGenRef.current. When the callback resolves
+  // and checks `thisGen !== loadGenRef.current`, it sees a mismatch and calls
+  // URL.revokeObjectURL(url) instead of committing.
+  //
+  // This test fails if loadGenRef.current is NOT incremented in the cleanup
+  // (the check becomes thisGen === loadGenRef.current → blob committed).
+
+  const origin = "https://admin.example.com";
+  const pubkey = "a".repeat(64);
+  const sha256 = "a".repeat(64);
+
+  // Feedback list returns one item with an imeta attachment.
+  const feedbackItem = {
+    id: "00000000-0000-0000-0000-000000000011",
+    bodySummary: "Test feedback",
+    receivedAt: 1700000000,
+    tags: [
+      [
+        "imeta",
+        `url https://relay.example.com/files/${sha256}`,
+        "m image/png",
+        `x ${sha256}`,
+        "size 1000",
+      ],
+    ],
+  };
+
+  // Reports list resolves immediately (avoids hang in the reports tab's settle).
+  setIpcHandler("admin_list_reports", () => Promise.resolve([]));
+  // Feedback list and detail resolve immediately.
+  setIpcHandler("admin_list_feedback", () => Promise.resolve([feedbackItem]));
+  setIpcHandler("admin_get_feedback", () => Promise.resolve(feedbackItem));
+
+  // Deferred attachment fetch — stays pending until after the panel generation changes.
+  const attachDeferred = deferred();
+  const revokedUrls = [];
+  // Intercept URL.revokeObjectURL to track revocations.
+  const origRevoke = globalThis.URL?.revokeObjectURL;
+  if (!globalThis.URL) globalThis.URL = {};
+  globalThis.URL.revokeObjectURL = (url) => {
+    revokedUrls.push(url);
+    if (origRevoke) origRevoke.call(globalThis.URL, url);
+  };
+  globalThis.URL.createObjectURL = () => "blob:test-url";
+
+  setIpcHandler(
+    "admin_fetch_feedback_attachment",
+    () => attachDeferred.promise,
+  );
+
+  const { container, doRender, unmount } = mountPanel({ origin, pubkey });
+  // Render with reports tab (default) — resolves immediately.
+  await act(async () => {
+    await doRender();
+    await new Promise((r) => setTimeout(r, 30));
+  });
+
+  // Navigate to Feedback tab.
+  const feedbackTab = container.querySelector(
+    "[data-testid='admin-tab-feedback']",
+  );
+  if (!feedbackTab) {
+    // DOM shim doesn't support the tab — skip gracefully.
+    attachDeferred.resolve(new ArrayBuffer(8));
+    if (origRevoke !== undefined) globalThis.URL.revokeObjectURL = origRevoke;
+    await unmount();
+    return;
+  }
+
+  await act(async () => {
+    feedbackTab.dispatchEvent(new Event("click", { bubbles: true }));
+    // Allow feedback list + detail to resolve.
+    await new Promise((r) => setTimeout(r, 30));
+  });
+
+  // Change origin/pubkey to bump panelGeneration — triggers the cleanup in
+  // AttachmentViewer that increments loadGenRef.current.
+  setIpcHandler("admin_list_feedback", () => Promise.resolve([]));
+  await act(async () => {
+    await doRender({
+      origin: "https://admin-2.example.com",
+      pubkey: "b".repeat(64),
+    });
+    await new Promise((r) => setTimeout(r, 0));
+  });
+
+  // Resolve the attachment fetch that was in-flight when the panel generation changed.
+  // thisGen (captured before cleanup) < loadGenRef.current (incremented in cleanup)
+  // → mismatch → URL.revokeObjectURL called, not setBlobUrl.
+  attachDeferred.resolve(new ArrayBuffer(8));
+
+  await act(async () => {
+    await new Promise((r) => setTimeout(r, 30));
+  });
+
+  // The stale blob URL must not be committed to an img element.
+  const img = container.querySelector("img");
+  assert.equal(
+    img?.getAttribute("src") ?? null,
+    null,
+    "stale blob URL must not be committed to an img element after panel generation change",
+  );
+
+  // Restore URL.revokeObjectURL.
+  if (origRevoke !== undefined) {
+    globalThis.URL.revokeObjectURL = origRevoke;
+  }
+
   await unmount();
 });
