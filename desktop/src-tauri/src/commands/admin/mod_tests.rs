@@ -106,8 +106,13 @@ fn valid_admin_report_json(id: &str) -> String {
             "reporterPubkey": "ddeeff",
             "targetKind": "message",
             "target": "112233",
+            "channelId": null,
             "reportType": "spam",
+            "note": null,
             "status": "open",
+            "resolvedBy": null,
+            "resolvedAt": null,
+            "actionId": null,
             "createdAt": "2024-01-01T00:00:00Z"
         }}"#
     )
@@ -138,6 +143,60 @@ fn looks_like_admin_list_rejects_id_null() {
         "application/json",
         b"[{\"id\":null}]"
     ));
+}
+
+#[test]
+fn looks_like_admin_list_rejects_created_at_null() {
+    // Full-shape element with `createdAt: null` must be rejected — the wire
+    // contract requires a real RFC-3339 timestamp for `createdAt`.
+    let body = r#"[{
+            "id": "00000000-0000-0000-0000-000000000001",
+            "communityId": "00000000-0000-0000-0000-000000000002",
+            "communityHost": "relay.example.com",
+            "reportEventId": "aabbcc",
+            "reporterPubkey": "ddeeff",
+            "targetKind": "message",
+            "target": "112233",
+            "channelId": null,
+            "reportType": "spam",
+            "note": null,
+            "status": "open",
+            "resolvedBy": null,
+            "resolvedAt": null,
+            "actionId": null,
+            "createdAt": null
+        }]"#;
+    assert!(
+        !looks_like_admin_list("application/json", body.as_bytes()),
+        "full-shape element with createdAt: null must not classify as admin list"
+    );
+}
+
+#[test]
+fn looks_like_admin_list_rejects_malformed_optional_field() {
+    // Full-shape element with a malformed optional UUID field (`channelId: 7`)
+    // must be rejected — the wire contract requires Option<Uuid> for channelId.
+    let body = r#"[{
+            "id": "00000000-0000-0000-0000-000000000001",
+            "communityId": "00000000-0000-0000-0000-000000000002",
+            "communityHost": "relay.example.com",
+            "reportEventId": "aabbcc",
+            "reporterPubkey": "ddeeff",
+            "targetKind": "message",
+            "target": "112233",
+            "channelId": 7,
+            "reportType": "spam",
+            "note": null,
+            "status": "open",
+            "resolvedBy": null,
+            "resolvedAt": null,
+            "actionId": null,
+            "createdAt": "2024-01-01T00:00:00Z"
+        }]"#;
+    assert!(
+        !looks_like_admin_list("application/json", body.as_bytes()),
+        "full-shape element with channelId: 7 (not a UUID) must not classify as admin list"
+    );
 }
 
 #[test]

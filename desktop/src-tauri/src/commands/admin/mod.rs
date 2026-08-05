@@ -313,12 +313,14 @@ fn looks_like_admin_list(content_type: &str, bytes: &[u8]) -> bool {
         .all(|v| serde_json::from_value::<AdminReportProbeDto>(v.clone()).is_ok())
 }
 
-/// Subset of `AdminReport` fields used for probe validation.
+/// Full `AdminReport` wire contract used for probe validation.
 ///
-/// Matches the camelCase wire contract serialised by the relay
-/// (`crates/buzz-db/src/admin_moderation.rs:24-55`).
-/// Only fields that are non-optional and always present on every list row are
-/// required here; optional fields are allowed to be absent.
+/// Mirrors the camelCase serialisation of `AdminReport` in
+/// `crates/buzz-db/src/admin_moderation.rs:24-55` exactly — required fields
+/// are typed strictly, optional fields use `Option<T>` with real types.
+/// This ensures that a response with `createdAt: null` or a malformed optional
+/// field (e.g. `channelId: 7`) is rejected, not silently classified as the
+/// admin API.
 #[derive(serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct AdminReportProbeDto {
@@ -337,11 +339,21 @@ struct AdminReportProbeDto {
     #[allow(dead_code)]
     target: String,
     #[allow(dead_code)]
+    channel_id: Option<uuid::Uuid>,
+    #[allow(dead_code)]
     report_type: String,
+    #[allow(dead_code)]
+    note: Option<String>,
     #[allow(dead_code)]
     status: String,
     #[allow(dead_code)]
-    created_at: serde_json::Value,
+    resolved_by: Option<String>,
+    #[allow(dead_code)]
+    resolved_at: Option<chrono::DateTime<chrono::Utc>>,
+    #[allow(dead_code)]
+    action_id: Option<uuid::Uuid>,
+    #[allow(dead_code)]
+    created_at: chrono::DateTime<chrono::Utc>,
 }
 
 /// Extract the normalised Content-Type base value (strips parameters).

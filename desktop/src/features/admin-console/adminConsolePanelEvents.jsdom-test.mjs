@@ -15,6 +15,8 @@
  *     → same-session-save-race goes red (stale save clobbers B's input)
  *   - `active = false` cleanup is removed from useAsyncLoad
  *     → detail-navigation goes red (stale detail commits)
+ *   - `expectedPubkey` dropped from the set_admin_origin invocation path
+ *     → cross-identity-delayed-save goes red (A's save lacks expectedPubkey)
  *
  * What these tests also prove:
  *   - `loadGenRef.current += 1` cleanup removed from AttachmentViewer
@@ -22,6 +24,11 @@
  *     Note: the existing attachment-unmount test exercises the same guard but via
  *     origin/pubkey re-render which also updates originRef/pubkeyRef. The back-
  *     navigation test isolates loadGenRef by unmounting without context change.
+ *   - `pubkeyHex ? <AdminConsoleSettingsSession key=…> : null` render gate removed
+ *     → authorized-logout-teardown goes red (empty-pubkey session renders, input present)
+ *     Note: this test lives in adminConsolePanel.test.mjs (MinimalDocument suite) because
+ *     the jsdom React 19 global scheduler leaves pending promises when the gate is absent,
+ *     causing the jsdom test runner to report CANCELLED instead of a clean AssertionError.
  */
 import assert from "node:assert/strict";
 import { afterEach, test } from "node:test";
@@ -90,11 +97,11 @@ function makeQueryClient(pubkeyHex) {
   const qc = new QueryClient({
     defaultOptions: { queries: { retry: false, gcTime: Infinity } },
   });
-  if (pubkeyHex) {
-    qc.setQueryData(["identity"], { pubkey: pubkeyHex });
-  } else {
-    qc.setQueryData(["identity"], undefined);
-  }
+  // Always set identity data (even for empty pubkey) so React Query never calls
+  // queryFn = getIdentity (which would hit the unmocked IPC).
+  // Component reads pubkeyHex = identity?.pubkey ?? "" — so { pubkey: "" }
+  // produces pubkeyHex = "" which is the correct logged-out representation.
+  qc.setQueryData(["identity"], { pubkey: pubkeyHex });
   return qc;
 }
 
@@ -763,5 +770,128 @@ test("blob-leak-on-back-navigation: loadGenRef cleanup prevents orphaned blob UR
   );
 
   if (origRevoke !== undefined) globalThis.URL.revokeObjectURL = origRevoke;
+  await unmount();
+});
+
+// ── cross-identity delayed save ───────────────────────────────────────────────
+
+test("cross-identity-delayed-save: A's late save carries A's expectedPubkey and does not touch B's state", async () => {
+  // Verifies that set_admin_origin IPC is called with expectedPubkey = A's pubkey,
+  // and that A's late save completion does not alter B's component state.
+  //
+  // The cross-session boundary is enforced by key={pubkeyHex}: when pubkey changes,
+  // A's component unmounts and B's mounts fresh. A's deferred save resolves and
+  // its continuation calls runProbe — but React state updates on the unmounted A
+  // component are discarded. B's input and panel are unaffected.
+  //
+  // Scenario:
+  //  1. Mount with pubkeyA; drive to authorized (probe nip98Authorized, panel rendered).
+  //  2. Edit input and start save — deferred set_admin_origin with expectedPubkey=A.
+  //  3. Switch identity to pubkeyB while A's save is pending:
+  //     - A's component is synchronously unmounted (key change).
+  //     - B's component mounts fresh with no saved origin.
+  //  4. Resolve A's deferred save late.
+  //  5. Assert:
+  //     a. The set_admin_origin call recorded expectedPubkey = pubkeyA.
+  //     b. B's input is still empty (A's late state writes discarded by React).
+  //     c. B's panel does not show A's origin as authorized.
+  //
+  // Fails if expectedPubkey is dropped from the set_admin_origin invocation path
+  // (api.ts forwarding): the recorded call has no expectedPubkey, so the Rust-level
+  // guard cannot enforce identity isolation.
+
+  const pubkeyA = "a".repeat(64);
+  const pubkeyB = "b".repeat(64);
+  const originA = "https://admin-a.example.com";
+  const newOriginA = "https://admin-a-new.example.com";
+
+  // Saved origin for A; B has none.
+  setIpcHandler("get_admin_origin", (args) => {
+    if (args?.expectedPubkey === pubkeyA) return Promise.resolve(originA);
+    return Promise.resolve(null);
+  });
+  // Initial probe for A → authorized so the panel renders.
+  setIpcHandler("admin_probe", () =>
+    Promise.resolve({ state: "nip98Authorized" }),
+  );
+  setIpcHandler("admin_list_reports", () => Promise.resolve([]));
+  setIpcHandler("admin_list_feedback", () => Promise.resolve([]));
+
+  const qc = makeQueryClient(pubkeyA);
+  const { container, doRender, unmount } = mountCard(qc);
+  await doRender();
+  await settle(30);
+
+  // A is authorized — input must show originA.
+  const inputA = container.querySelector("[data-testid='admin-origin-input']");
+  assert.ok(inputA, "input must render for pubkeyA");
+
+  // Record all set_admin_origin calls.
+  const saveRecords = [];
+  let resolveSaveA;
+  setIpcHandler("set_admin_origin", (args) => {
+    saveRecords.push({ ...args });
+    return new Promise((r) => {
+      resolveSaveA = r;
+    });
+  });
+
+  // Edit input to newOriginA and press Enter to start a deferred save.
+  await act(async () => {
+    fireEvent.change(inputA, { target: { value: newOriginA } });
+    await new Promise((r) => setTimeout(r, 5));
+  });
+  await act(async () => {
+    fireEvent.keyDown(inputA, { key: "Enter", keyCode: 13 });
+    await new Promise((r) => setTimeout(r, 5));
+  });
+
+  // A's save is now in-flight (deferred). Switch to pubkeyB.
+  // A's component is synchronously unmounted (key change).
+  setIpcHandler("get_admin_origin", (args) => {
+    if (args?.expectedPubkey === pubkeyB) return Promise.resolve(null);
+    return Promise.resolve(null);
+  });
+  // After switch, probe for B returns disabled (B has no origin to probe).
+  setIpcHandler("admin_probe", () => Promise.resolve({ state: "disabled" }));
+  await act(async () => {
+    qc.setQueryData(["identity"], { pubkey: pubkeyB });
+    await new Promise((r) => setTimeout(r, 20));
+  });
+
+  // Resolve A's deferred save late. A's component is already unmounted — any
+  // React state updates from A's continuation are discarded. B remains untouched.
+  resolveSaveA?.(newOriginA);
+  await settle(30);
+
+  // (a) The set_admin_origin IPC call must have carried expectedPubkey = pubkeyA.
+  assert.ok(
+    saveRecords.length >= 1,
+    "set_admin_origin must have been called at least once",
+  );
+  assert.equal(
+    saveRecords[0]?.expectedPubkey,
+    pubkeyA,
+    `set_admin_origin must carry expectedPubkey = pubkeyA; got: ${JSON.stringify(saveRecords[0])}`,
+  );
+
+  // (b) B's input must still be empty (A's late state writes are discarded by React
+  // on the unmounted A component; they never reach B's component tree).
+  const inputB = container.querySelector("[data-testid='admin-origin-input']");
+  assert.ok(inputB, "B's input must be present after identity switch");
+  assert.equal(
+    inputB.value,
+    "",
+    `B's input must be empty after identity switch; got: "${inputB.value}"`,
+  );
+
+  // (c) B's panel must not show A's origin as authorized — B is not authorized.
+  const panel = container.querySelector("[data-testid='admin-console-panel']");
+  assert.equal(
+    panel,
+    null,
+    "admin-console-panel must not render for B — B has no authorized origin",
+  );
+
   await unmount();
 });

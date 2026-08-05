@@ -11,13 +11,19 @@
  * container-level delegation:
  *
  * What makes these tests authoritative — they fail if:
- *   - `key={pubkeyHex}` boundary is removed (logout, identity-switch, delayed-save tests)
+ *   - `pubkeyHex ? <Session …> : null` render gate removed (authorized-logout-teardown)
+ *   - `key={pubkeyHex}` boundary is removed (identity-switch test)
  *   - `active` flag cleanup is removed from useAsyncLoad (old-list-after-new-list)
  *   - the `getAdminOrigin()` catch is changed to silent-degrade (storage-error test)
  *
- * Event-driven tests (origin-edit, detail-navigation, attachment-unmount,
- * same-session-save-race) live in adminConsolePanelEvents.jsdom-test.mjs,
- * which is run with jsdom pre-installed so React 19's event delegation works.
+ * authorized-logout-teardown lives here (MinimalDocument, not jsdom) because the jsdom
+ * React 19 global scheduler leaves pending promises when the mutation is applied, causing
+ * the jsdom runner to report CANCELLED instead of a clean AssertionError. The
+ * flushSync(render)+flushSync(unmount) approach works cleanly in MinimalDocument.
+ *
+ * Cross-identity delayed-save and all event-driven tests (origin-edit, detail-navigation,
+ * attachment-unmount, same-session-save-race) live in adminConsolePanelEvents.jsdom-test.mjs
+ * where fireEvent dispatches native events through React 19's container-level delegation.
  *
  * Also covers:
  *   - parseImetaAttachments wire contract (imported from AdminConsolePanel)
@@ -452,14 +458,14 @@ function deferred() {
 function makeQueryClient(pubkeyHex) {
   const qc = new QueryClient({
     defaultOptions: {
-      queries: { retry: false, gcTime: 0 },
+      queries: { retry: false, gcTime: 0, staleTime: Infinity },
     },
   });
-  if (pubkeyHex) {
-    qc.setQueryData(["identity"], { pubkey: pubkeyHex });
-  } else {
-    qc.setQueryData(["identity"], undefined);
-  }
+  // Always set identity to an object (even for empty pubkey) so React Query
+  // never calls queryFn = getIdentity (which would hit the unmocked IPC).
+  // Component reads pubkeyHex = identity?.pubkey ?? "" — so { pubkey: "" }
+  // gives pubkeyHex = "" (logged-out state).
+  qc.setQueryData(["identity"], { pubkey: pubkeyHex });
   return qc;
 }
 
@@ -639,23 +645,61 @@ test("parseImetaAttachments: extracts from camelCase AdminFeedback relay fixture
 // via deferred promises. These tests fail if the identity boundary or fences
 // are removed from the production code.
 
-test("logout: pubkeyHex empty renders no origin input", async () => {
-  // When no pubkey is present, the session component must not render.
-  // Removing the `pubkeyHex ? <Session key=…> : null` guard causes this to fail.
+test("authorized-logout-teardown: A's session is gone when pubkeyHex becomes empty", async () => {
+  // Verifies the `pubkeyHex ? <AdminConsoleSettingsSession key=…> : null` render
+  // gate in AdminConsoleSettingsCard. When pubkeyHex transitions to "", the gate
+  // must render null — no input, no session component.
+  //
+  // Fails if the render gate is removed: AdminConsoleSettingsSession mounts with
+  // pubkeyHex="" and the input appears in the DOM.
+  //
+  // Design: flushSync(render) + flushSync(unmount) — no async effects
+  //
+  // When the gate is absent, AdminConsoleSettingsSession mounts with pubkeyHex=""
+  // and would schedule async effects (get_admin_origin). To prevent those effects
+  // from keeping the event loop alive (which causes CANCELLED instead of FAILED),
+  // we immediately unmount via flushSync. The render commit is synchronous, so we
+  // can check the DOM between render and unmount. The unmount runs synchronously
+  // before any passive effects fire, cancelling them — no pending promises.
+
   setIpcHandler("get_admin_origin", () => Promise.resolve(null));
+  setIpcHandler("admin_probe", () => Promise.resolve({ state: "disabled" }));
 
   const qc = makeQueryClient("");
-  const { container, doRender, unmount } = mountCard(qc);
-  await doRender();
-  await settle();
+  const container = document.createElement("div");
+  document.body.appendChild(container);
+  const root = createRoot(container);
 
+  const { flushSync } = await import("react-dom");
+
+  // Render synchronously. The gate is a pure render-time conditional, so the DOM
+  // already reflects the committed tree after flushSync.
+  flushSync(() => {
+    root.render(
+      React.createElement(
+        QueryClientProvider,
+        { client: qc },
+        React.createElement(AdminConsoleSettingsCard),
+      ),
+    );
+  });
+
+  // Capture DOM state BEFORE any effects run.
   const input = container.querySelector("[data-testid='admin-origin-input']");
+
+  // Synchronously unmount before passive effects fire. This cancels any scheduled
+  // effects, preventing the event loop from staying alive with pending promises.
+  flushSync(() => {
+    root.unmount();
+  });
+  document.body.removeChild(container);
+
+  // Assert after cleanup — no async work is pending at this point.
   assert.equal(
     input,
     null,
-    "admin origin input must not render when logged out (no pubkey)",
+    "admin origin input must not render when pubkeyHex is empty — render gate missing",
   );
-  await unmount();
 });
 
 test("identity-switch: fresh session mounts with empty input on pubkey change", async () => {
@@ -739,53 +783,6 @@ test("storage-error surfaced: getAdminOrigin rejection shows error in UI", async
 // origin-edit (abortAndResetProbe wired to onChange) is covered by
 // adminConsolePanelEvents.jsdom-test.mjs where fireEvent dispatches native
 // events through React 19's container-level delegation.
-
-test("delayed-save-after-switch: save result from old session is discarded after identity switch", async () => {
-  // Verifies the key={pubkeyHex} boundary (not sessionTokenRef) protects
-  // cross-session saves: when pubkey changes, the entire session unmounts,
-  // so any pending save promise resolves against the old (now-unmounted)
-  // session component whose state no longer affects B.
-  //
-  // The sessionTokenRef fence within a single session is covered by the
-  // same-session-save-race test in adminConsolePanelEvents.jsdom-test.mjs.
-  //
-  // Fails if `key={pubkeyHex}` is removed: React reuses the component and
-  // A's session token survives the identity switch, potentially corrupting B.
-
-  const pubkeyA = "a".repeat(64);
-  const pubkeyB = "b".repeat(64);
-
-  setIpcHandler("get_admin_origin", () => Promise.resolve(null));
-  setIpcHandler("admin_probe", () => Promise.resolve({ state: "disabled" }));
-
-  const qc = makeQueryClient(pubkeyA);
-  const { container, doRender, unmount } = mountCard(qc);
-  await doRender();
-  await settle(15);
-
-  const input = container.querySelector("[data-testid='admin-origin-input']");
-  assert.ok(input, "input must be present");
-
-  // Switch to pubkeyB — key prop unmounts A's component entirely.
-  setIpcHandler("get_admin_origin", () => Promise.resolve(null));
-  await act(async () => {
-    qc.setQueryData(["identity"], { pubkey: pubkeyB });
-    await new Promise((r) => setTimeout(r, 20));
-  });
-
-  // B's input must be empty (B has no saved origin).
-  const inputB = container.querySelector("[data-testid='admin-origin-input']");
-  assert.ok(
-    inputB,
-    "B's input must be present — AdminConsoleSettingsSession must have mounted for pubkeyB",
-  );
-  assert.equal(
-    inputB.value,
-    "",
-    "B's input must be empty — key boundary ensures B mounts fresh, not with A's state",
-  );
-  await unmount();
-});
 
 // ── AdminConsolePanel race tests ──────────────────────────────────────────────
 //
