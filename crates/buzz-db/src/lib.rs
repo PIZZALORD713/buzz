@@ -71,6 +71,13 @@ pub const RUNTIME_STATEMENT_TIMEOUT: &str = "30s";
 pub const RUNTIME_LOCK_TIMEOUT: &str = "5s";
 /// Postgres spelling of "no limit", used for schema migrations.
 pub const TIMEOUT_DISABLED: &str = "0";
+/// `statement_timeout` and `lock_timeout` are `int` GUCs measured in
+/// milliseconds, so Postgres refuses anything larger regardless of the unit it
+/// is spelled with. Callers building a [`DbConfig`] from operator input must
+/// range-check against this: [`apply_runtime_connection_timeouts`] runs on every
+/// pooled connection, so an unusable value fails all database access.
+/// `pg_timeout_max_millis_matches_postgres` pins it to the live server.
+pub const PG_TIMEOUT_MAX_MILLIS: u128 = i32::MAX as u128;
 
 /// Apply the runtime safety limits shared by writer, reader, audit, and search
 /// pools. Values are Postgres interval strings (`"30s"`, `"500ms"`), with
@@ -8520,6 +8527,67 @@ mod tests {
         drop_scratch_db(&admin, seed_pool, &name).await;
         // db pool still holds connections to the dropped DB; close it.
         db.pool.close().await;
+    }
+
+    /// [`PG_TIMEOUT_MAX_MILLIS`] is the bound callers range-check operator input
+    /// against, so it must be the server's real bound: too high and an accepted
+    /// value still fails every `after_connect`; too low and we reject settings
+    /// Postgres would have taken.
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn pg_timeout_max_millis_matches_postgres() {
+        let mut conn = PgConnection::connect(&admin_url().await)
+            .await
+            .expect("connect");
+
+        let boundary = PG_TIMEOUT_MAX_MILLIS.to_string();
+        apply_runtime_connection_timeouts(&mut conn, &boundary, &boundary)
+            .await
+            .expect("PG_TIMEOUT_MAX_MILLIS must be settable");
+
+        // Same instant spelled in a coarser unit — the conversion the caller's
+        // range check performs must land inside the range too.
+        let in_seconds = (PG_TIMEOUT_MAX_MILLIS / 1_000).to_string();
+        apply_runtime_connection_timeouts(
+            &mut conn,
+            &format!("{in_seconds}s"),
+            &format!("{in_seconds}s"),
+        )
+        .await
+        .expect("the boundary in seconds must be settable");
+
+        for over in [
+            (PG_TIMEOUT_MAX_MILLIS + 1).to_string(),
+            format!("{}ms", PG_TIMEOUT_MAX_MILLIS + 1),
+            format!("{}s", PG_TIMEOUT_MAX_MILLIS / 1_000 + 1),
+            "999999999999999999999999999999999999999999d".to_string(),
+        ] {
+            let err = apply_runtime_connection_timeouts(&mut conn, &over, RUNTIME_LOCK_TIMEOUT)
+                .await
+                .expect_err(&format!("{over} must be rejected by Postgres"));
+            let code = match &err {
+                sqlx::Error::Database(db) => db.code().map(|c| c.to_string()),
+                other => panic!("expected a database error, got {other:?}"),
+            };
+            assert_eq!(
+                code.as_deref(),
+                Some("22023"),
+                "{over}: expected invalid_parameter_value"
+            );
+        }
+
+        // A rejected `set_config` leaves the session usable, so the failure mode
+        // is a poisoned pool of unbounded sessions only if the caller ignores it.
+        let statement_timeout: String = sqlx::query_scalar("SHOW statement_timeout")
+            .fetch_one(&mut conn)
+            .await
+            .expect("SHOW statement_timeout");
+        assert_ne!(
+            statement_timeout, "0",
+            "a rejected value must not silently disable the limit"
+        );
+
+        conn.close().await.expect("close");
     }
 
     /// `spawn_fence_probe` must verify the floor guard before letting the
