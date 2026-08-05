@@ -6,9 +6,18 @@
 
 use super::*;
 use crate::commands::admin::{origin::AdminOrigin, routes::AdminRoute};
+use std::sync::Arc;
 
 /// Type alias for the request inspector closure passed to `serve_sequence_inspect`.
 type RequestInspector = std::sync::Arc<dyn Fn(usize, &[u8]) + Send + Sync>;
+
+/// Parsed HTTP request data for transport-layer assertions.
+#[derive(Debug)]
+struct RequestRecord {
+    method: String,
+    path: String,
+    auth: Option<String>,
+}
 
 // ── AdminOrigin × routes integration ─────────────────────────────────────
 
@@ -372,9 +381,9 @@ async fn fake_response(status: u16, headers: &str, body: &str) -> reqwest::Respo
 /// Serve sequential HTTP responses from a background thread.
 ///
 /// For each request the listener reads the raw HTTP bytes, calls the
-/// provided inspector closure (if any) with the raw request, then sends the
-/// pre-configured response. This allows tests to assert on request headers
-/// (e.g. Authorization) at the transport layer.
+/// provided inspector closure with the raw request bytes and slot index,
+/// then sends the pre-configured response. The inspector records request
+/// details post-hoc for assertion after the probe completes.
 async fn serve_sequence_inspect(
     responses: Vec<(&'static str, &'static str, &'static str)>,
     inspect: Option<RequestInspector>,
@@ -411,6 +420,80 @@ async fn serve_sequence(
     responses: Vec<(&'static str, &'static str, &'static str)>,
 ) -> std::net::SocketAddr {
     serve_sequence_inspect(responses, None).await
+}
+
+/// Serve a two-slot NIP-98 stub where the second response is gated on the
+/// received Authorization header matching `expected_token`.
+///
+/// Slot 0: always 401 Unauthorized + `WWW-Authenticate: Nostr` (triggers retry).
+/// Slot 1: 200 OK with JSON body if the received Authorization header equals
+///         `expected_token`; plain 401 (no Nostr challenge) otherwise — a mismatch
+///         means the production header call was missing, so the probe returns
+///         Nip98Denied and the caller's `Nip98Authorized` assertion fails.
+///
+/// Both slots are recorded in the returned `Arc<Mutex<Vec<RequestRecord>>>`.
+async fn serve_gated_nip98(
+    expected_token: String,
+    authorized_body: &'static str,
+) -> (
+    std::net::SocketAddr,
+    Arc<std::sync::Mutex<Vec<RequestRecord>>>,
+) {
+    use std::io::{Read, Write};
+    client::init_admin_client();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let records: Arc<std::sync::Mutex<Vec<RequestRecord>>> =
+        Arc::new(std::sync::Mutex::new(Vec::new()));
+    let records_bg = Arc::clone(&records);
+    std::thread::spawn(move || {
+        for slot in 0..2usize {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0u8; 8192];
+                let n = stream.read(&mut buf).unwrap_or(0);
+                let text = std::str::from_utf8(&buf[..n]).unwrap_or("");
+                // Parse request line and Authorization header.
+                let first_line = text.lines().next().unwrap_or("");
+                let mut parts = first_line.splitn(3, ' ');
+                let method = parts.next().unwrap_or("").to_string();
+                let path = parts.next().unwrap_or("").to_string();
+                let auth = text
+                    .lines()
+                    .find(|l| l.to_ascii_lowercase().starts_with("authorization:"))
+                    .map(|l| l[l.find(':').unwrap() + 1..].trim().to_string());
+                records_bg.lock().unwrap().push(RequestRecord {
+                    method,
+                    path,
+                    auth: auth.clone(),
+                });
+                // Gate: slot 0 always challenges; slot 1 returns 200 only on
+                // header match, 401 (no challenge) otherwise.
+                let (status, headers, body): (&str, &str, &str) = if slot == 0 {
+                    ("401 Unauthorized", "WWW-Authenticate: Nostr\r\n", "")
+                } else if auth.as_deref() == Some(expected_token.as_str()) {
+                    (
+                        "200 OK",
+                        "Content-Type: application/json\r\n",
+                        authorized_body,
+                    )
+                } else {
+                    // Mismatch or absent header → plain 401 (no Nostr challenge).
+                    // admin_probe_inner sees a non-Nostr 401 after the retry and
+                    // returns Nip98Denied, causing the caller's Nip98Authorized
+                    // assertion to fail — which is the intended mutation catch.
+                    ("401 Unauthorized", "", "")
+                };
+                let resp = format!(
+                    "HTTP/1.1 {status}\r\nContent-Length: {}\r\n{headers}Connection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = stream.write_all(resp.as_bytes());
+                let _ = stream.write_all(body.as_bytes());
+                let _ = stream.flush();
+            }
+        }
+    });
+    (addr, records)
 }
 
 // ── is_probe_response_intercepted ────────────────────────────────────────
@@ -556,33 +639,19 @@ async fn probe_inner_persistent_401_is_nip98_denied() {
 
 #[tokio::test]
 async fn probe_inner_nip98_challenge_then_json_200_is_authorized_and_asserts_auth_header() {
-    // This test verifies that:
-    //  1. The probe state machine produces Nip98Authorized on 401→200.
-    //  2. The second request carries the Authorization header produced by the
-    //     signing closure AND no other request does — the inspector gates slot 1
-    //     so that the stub returns 200 only when the received Authorization
-    //     header equals the signing closure's token. A mismatch returns 401,
-    //     which would flip the outcome to Nip98Denied and fail the assertion.
-    //  3. The first request is a GET to the reports path without Authorization.
-    //  4. Deleting the `.header(AUTHORIZATION, ...)` line in production causes
-    //     request_idx=1 to arrive without the header; the stub returns 401;
-    //     admin_probe_inner returns Nip98Denied; the assert!(matches!(…,
-    //     Nip98Authorized)) assertion fails.
-    use std::sync::{Arc, Mutex};
+    // Verifies:
+    //  1. probe state machine produces Nip98Authorized on a Nostr 401→200 sequence.
+    //  2. The second request carries an Authorization header equal to the signing
+    //     closure's token — tested by the gated stub: slot 1 returns 200 only
+    //     when the received Authorization header matches the expected token; any
+    //     mismatch or absent header returns a plain 401, making the state machine
+    //     return Nip98Denied and failing the Nip98Authorized assertion.
+    //  3. The first request carries no Authorization header.
+    //  4. Deleting the `.header(AUTHORIZATION, …)` production line causes the
+    //     stub to receive no header on slot 1, return 401, and the test fails.
 
-    // The token the signing closure will mint.
     let expected_token = "Nostr dGVzdA==".to_string();
-    let expected_token_for_inspector = expected_token.clone();
     let expected_token_for_sign = expected_token.clone();
-
-    // Capture the parsed (method, path, auth) for each request.
-    #[derive(Debug)]
-    struct RequestRecord {
-        method: String,
-        path: String,
-        auth: Option<String>,
-    }
-    let received: Arc<Mutex<Vec<RequestRecord>>> = Arc::new(Mutex::new(Vec::new()));
 
     let valid_body = format!(
         "[{}]",
@@ -590,52 +659,11 @@ async fn probe_inner_nip98_challenge_then_json_200_is_authorized_and_asserts_aut
     );
     let valid_body_static: &'static str = Box::leak(valid_body.into_boxed_str());
 
-    // The stub parses each raw request. For slot 0 it always returns 401+Nostr.
-    // For slot 1 it returns 200 only when the Authorization header matches the
-    // expected token; otherwise 401 (no Nostr challenge — persistent 401 → Nip98Denied).
-    let inspector: RequestInspector = {
-        let received_cc = Arc::clone(&received);
-        Arc::new(move |idx, raw: &[u8]| {
-            let text = std::str::from_utf8(raw).unwrap_or("");
-            // First line: "METHOD /path HTTP/1.1"
-            let first_line = text.lines().next().unwrap_or("");
-            let mut parts = first_line.splitn(3, ' ');
-            let method = parts.next().unwrap_or("").to_string();
-            let path = parts.next().unwrap_or("").to_string();
-            let auth = text
-                .lines()
-                .find(|l| l.to_ascii_lowercase().starts_with("authorization:"))
-                .map(|l| l[l.find(':').unwrap() + 1..].trim().to_string());
-            received_cc
-                .lock()
-                .unwrap()
-                .push(RequestRecord { method, path, auth });
-            let _ = idx; // slot selection is positional in serve_sequence_inspect
-        })
-    };
-
-    // Response sequence:
-    //   slot 0 → 401 Unauthorized + WWW-Authenticate: Nostr  (triggers retry)
-    //   slot 1 → determined by serve_sequence_inspect; we pass 200 OK here and
-    //            the inspector records the header so we can assert it post-hoc.
-    //            The post-hoc assert is the correctness gate: if the production
-    //            .header(AUTHORIZATION, …) call is deleted, headers[1].auth is
-    //            None and the equality assertion below fails.
-    let addr = serve_sequence_inspect(
-        vec![
-            ("401 Unauthorized", "WWW-Authenticate: Nostr\r\n", ""),
-            (
-                "200 OK",
-                "Content-Type: application/json\r\n",
-                valid_body_static,
-            ),
-        ],
-        Some(inspector),
-    )
-    .await;
+    // serve_gated_nip98: slot 0 always challenges; slot 1 checks the Authorization
+    // header and returns 200 on match, 401 on mismatch/absent.
+    let (addr, records) = serve_gated_nip98(expected_token, valid_body_static).await;
 
     let sign = move |_url: &str| -> Result<String, String> { Ok(expected_token_for_sign.clone()) };
-
     let result = admin_probe_inner(&format!("http://{addr}"), Some(sign))
         .await
         .unwrap();
@@ -645,44 +673,43 @@ async fn probe_inner_nip98_challenge_then_json_200_is_authorized_and_asserts_aut
         "expected Nip98Authorized, got {result:?}"
     );
 
-    // Assert on the recorded request data.
-    let records = received.lock().unwrap();
+    let records = records.lock().unwrap();
     assert_eq!(records.len(), 2, "exactly two requests must have been made");
 
-    // Request 0: unauthenticated GET to the reports path — no Authorization header.
+    // Request 0: unauthenticated GET — no Authorization header.
     assert_eq!(
         records[0].method, "GET",
-        "first request must be GET; got {:?}",
+        "slot-0 must be GET; got {:?}",
         records[0].method
     );
     assert!(
         records[0].path.contains("/api/admin/v1/reports"),
-        "first request path must target the reports endpoint; got {:?}",
+        "slot-0 must target the reports endpoint; got {:?}",
         records[0].path
     );
     assert!(
         records[0].auth.is_none(),
-        "first request must not carry Authorization: {:?}",
+        "slot-0 must carry no Authorization; got {:?}",
         records[0].auth
     );
 
-    // Request 1: authenticated retry — Authorization header must equal the signing
-    // closure's token. This is the gate: if the production code does not attach
-    // the header, headers[1].auth is None and this assert fails.
+    // Request 1: authenticated retry — Authorization must equal the signing token.
+    // The stub already enforced this (returned 200 only on match), so this
+    // post-hoc assertion documents the observed value for auditability.
     assert_eq!(
         records[1].method, "GET",
-        "second request must be GET; got {:?}",
+        "slot-1 must be GET; got {:?}",
         records[1].method
     );
     assert!(
         records[1].path.contains("/api/admin/v1/reports"),
-        "second request path must target the reports endpoint; got {:?}",
+        "slot-1 must target the reports endpoint; got {:?}",
         records[1].path
     );
     assert_eq!(
         records[1].auth.as_deref(),
-        Some(expected_token_for_inspector.as_str()),
-        "second request Authorization header must equal the signing closure token"
+        Some("Nostr dGVzdA=="),
+        "slot-1 Authorization must equal the signing closure token"
     );
 }
 
