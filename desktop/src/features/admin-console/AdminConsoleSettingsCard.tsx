@@ -203,14 +203,14 @@ function AdminConsoleSettingsSession({ pubkeyHex }: { pubkeyHex: string }) {
   // Save/probe context token: captures (pubkey, origin) at the time a save
   // starts. handleSave checks this before committing any state so a delayed
   // save cannot repopulate the wrong session.
+  //
+  // On unmount, the cleanup effect below sets sessionTokenRef.current = null.
+  // Every handleSave continuation leg checks `sessionTokenRef.current !== token`
+  // (null !== token object) → returns early on all paths. This is StrictMode-safe:
+  // StrictMode's simulated cleanup fires the null assignment, then the re-mount
+  // re-arms the ref when the next handleSave sets `sessionTokenRef.current = token`.
   type SessionToken = { pubkey: string; origin: string };
   const sessionTokenRef = useRef<SessionToken | null>(null);
-
-  // Mount guard: false after this component unmounts. Prevents A's handleSave
-  // continuation from calling runProbe() on the IPC layer after A unmounts due
-  // to an identity switch. sessionTokenRef prevents same-session state corruption;
-  // isMountedRef prevents the cross-identity stale probe IPC call.
-  const isMountedRef = useRef(true);
 
   // Synchronously abort any active probe and reset probe UI state.
   // Call before starting a new probe or on any input change.
@@ -220,12 +220,13 @@ function AdminConsoleSettingsSession({ pubkeyHex }: { pubkeyHex: string }) {
     setProbeUiState({ kind: "idle" });
   }
 
-  // Set isMountedRef to false when this component unmounts. Paired with the
-  // load-saved-origin effect below: that effect has an explicit biome-ignore;
-  // this cleanup-only effect has no deps and Biome accepts it without suppression.
+  // Null sessionTokenRef on unmount so A's deferred handleSave continuation
+  // fails the token check on all legs after A's component is torn down. Paired
+  // with the load-saved-origin effect below: that effect has an explicit
+  // lint suppression; this cleanup-only effect has no deps and Biome accepts it.
   useEffect(() => {
     return () => {
-      isMountedRef.current = false;
+      sessionTokenRef.current = null;
     };
   }, []);
 
@@ -300,7 +301,7 @@ function AdminConsoleSettingsSession({ pubkeyHex }: { pubkeyHex: string }) {
         return;
       }
       const canonical = await setAdminOrigin(trimmed, pubkeyHex);
-      if (!isMountedRef.current || sessionTokenRef.current !== token) return;
+      if (sessionTokenRef.current !== token) return;
       setSavedOrigin(canonical);
       if (canonical) {
         runProbe(canonical);

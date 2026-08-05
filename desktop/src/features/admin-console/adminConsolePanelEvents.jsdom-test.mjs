@@ -17,6 +17,8 @@
  *     → detail-navigation goes red (stale detail commits)
  *   - `expectedPubkey` dropped from the set_admin_origin invocation path
  *     → cross-identity-delayed-save goes red (A's save lacks expectedPubkey)
+ *   - unmount-cleanup effect removed (sessionTokenRef not nulled on unmount)
+ *     → strict-mode-save goes red (StrictMode double-mount silently disables saves)
  *
  * What these tests also prove:
  *   - `loadGenRef.current += 1` cleanup removed from AttachmentViewer
@@ -917,4 +919,103 @@ test("cross-identity-delayed-save: A's late save carries A's expectedPubkey and 
   );
 
   await unmount();
+});
+
+// ── strict-mode-save ──────────────────────────────────────────────────────────
+
+test("strict-mode-save: probe fires after save under React.StrictMode double-mount", async () => {
+  // Verifies the StrictMode-safe unmount fence in AdminConsoleSettingsSession.
+  //
+  // React.StrictMode (used in desktop/src/main.tsx) double-invokes effects in
+  // development:  setup → cleanup → setup.  An isMountedRef-based fence
+  // (cleanup sets isMountedRef.current = false, no reset in setup body) leaves
+  // the ref permanently false after the double-mount, silently killing every
+  // save completion in dev builds.
+  //
+  // The correct fence nulls sessionTokenRef on unmount instead:
+  //   useEffect(() => () => { sessionTokenRef.current = null; }, [])
+  // StrictMode's cleanup sets sessionTokenRef.current = null, then the setup
+  // re-runs handleSave's `sessionTokenRef.current = token` when a new save
+  // starts — so the fence is re-armed per save, not per mount.
+  //
+  // Fails if the unmount-cleanup effect is removed (isMountedRef variant or no
+  // fence): after StrictMode double-mount, handleSave continuation is either
+  // permanently blocked (isMountedRef=false) or the cross-identity stale probe
+  // from assertion (d) in cross-identity-delayed-save fires.
+
+  const pubkey = "c".repeat(64);
+  const savedOrigin = "https://admin-strict.example.com";
+  const canonicalOrigin = "https://admin-strict-canonical.example.com";
+
+  setIpcHandler("get_admin_origin", () => Promise.resolve(savedOrigin));
+
+  // Track probe invocations to verify the save drives a probe.
+  const probeOrigins = [];
+  setIpcHandler("admin_probe", (args) => {
+    probeOrigins.push(args?.origin ?? "(none)");
+    return Promise.resolve({ state: "disabled" });
+  });
+  setIpcHandler("set_admin_origin", () => Promise.resolve(canonicalOrigin));
+
+  // gcTime: Infinity is critical: with gcTime: 0 StrictMode's simulated unmount
+  // GCs the seeded identity query before the component's observer re-subscribes,
+  // so the input never renders on the second mount.
+  const qc = new QueryClient({
+    defaultOptions: { queries: { retry: false, gcTime: Infinity } },
+  });
+  qc.setQueryData(["identity"], { pubkey });
+
+  const container = document.createElement("div");
+  document.body.appendChild(container);
+  const root = createRoot(container);
+
+  // Mount under React.StrictMode — triggers setup → cleanup → setup on all effects.
+  await act(async () => {
+    root.render(
+      React.createElement(
+        React.StrictMode,
+        null,
+        React.createElement(
+          QueryClientProvider,
+          { client: qc },
+          React.createElement(AdminConsoleSettingsCard),
+        ),
+      ),
+    );
+  });
+  await settle(30);
+
+  const input = container.querySelector("[data-testid='admin-origin-input']");
+  assert.ok(
+    input,
+    "origin input must render after StrictMode double-mount — identity query not GC'd",
+  );
+
+  // Clear probes from the initial mount probe.
+  probeOrigins.length = 0;
+
+  // Edit input and press Enter to trigger handleSave().
+  const newOrigin = "https://admin-strict-new.example.com";
+  await act(async () => {
+    fireEvent.change(input, { target: { value: newOrigin } });
+    await new Promise((r) => setTimeout(r, 5));
+  });
+  await act(async () => {
+    fireEvent.keyDown(input, { key: "Enter", keyCode: 13 });
+    await new Promise((r) => setTimeout(r, 5));
+  });
+  await settle(30);
+
+  // The probe must fire for the canonical origin returned by set_admin_origin.
+  // Fails if isMountedRef=false (from StrictMode cleanup) permanently blocks
+  // the handleSave continuation: probeOrigins stays empty.
+  assert.ok(
+    probeOrigins.some((o) => o === canonicalOrigin),
+    `probe must fire after save under StrictMode; probes: ${JSON.stringify(probeOrigins)}`,
+  );
+
+  await act(async () => {
+    root.unmount();
+  });
+  document.body.removeChild(container);
 });
