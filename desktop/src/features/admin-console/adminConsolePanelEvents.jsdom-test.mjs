@@ -16,10 +16,12 @@
  *   - `active = false` cleanup is removed from useAsyncLoad
  *     → detail-navigation goes red (stale detail commits)
  *
- * Note on attachment-unmount: the test proves stale blob URLs are not committed
- * when the panel context changes. The loadGenRef.current += 1 cleanup and the
- * origin/pubkey ref checks both protect against this — they cannot be isolated
- * in a test because panelGeneration only changes when origin/pubkey change.
+ * What these tests also prove:
+ *   - `loadGenRef.current += 1` cleanup removed from AttachmentViewer
+ *     → blob-leak-on-back-navigation goes red (stale blob leaks without revocation)
+ *     Note: the existing attachment-unmount test exercises the same guard but via
+ *     origin/pubkey re-render which also updates originRef/pubkeyRef. The back-
+ *     navigation test isolates loadGenRef by unmounting without context change.
  */
 import assert from "node:assert/strict";
 import { afterEach, test } from "node:test";
@@ -413,16 +415,7 @@ test("detail-navigation: stale detail result is discarded after navigating away"
     break;
   }
 
-  if (!clickedReport) {
-    // List didn't render (e.g. IPC timing). Skip gracefully.
-    detailDeferredA.resolve({ content: "skip" });
-    detailDeferredB.resolve({ content: "skip" });
-    await act(async () => {
-      await new Promise((r) => setTimeout(r, 10));
-    });
-    await unmount();
-    return;
-  }
+  assert.ok(clickedReport, "a report row button must exist and be clickable");
 
   // Detail fetch A is in-flight (active=true). Change origin/pubkey →
   // generation bumps → old effect cleanup: active=false. New effect starts
@@ -545,12 +538,7 @@ test("attachment-unmount: late blob URL is revoked and not committed after panel
   const feedbackTab = container.querySelector(
     "[data-testid='admin-tab-feedback']",
   );
-  if (!feedbackTab) {
-    attachDeferred.resolve(new ArrayBuffer(8));
-    if (origRevoke !== undefined) globalThis.URL.revokeObjectURL = origRevoke;
-    await unmount();
-    return;
-  }
+  assert.ok(feedbackTab, "Feedback tab button must be present");
   await act(async () => {
     fireEvent.click(feedbackTab);
     await new Promise((r) => setTimeout(r, 30));
@@ -592,13 +580,10 @@ test("attachment-unmount: late blob URL is revoked and not committed after panel
     break;
   }
 
-  if (!startedAttachmentLoad) {
-    // Couldn't start the attachment load — skip.
-    attachDeferred.resolve(new ArrayBuffer(8));
-    if (origRevoke !== undefined) globalThis.URL.revokeObjectURL = origRevoke;
-    await unmount();
-    return;
-  }
+  assert.ok(
+    startedAttachmentLoad,
+    '"View attachment" button must be found and clicked',
+  );
 
   // Attachment fetch is in-flight (deferred). Change origin/pubkey to bump
   // panelGeneration — triggers AttachmentViewer cleanup: loadGenRef.current += 1.
@@ -633,6 +618,148 @@ test("attachment-unmount: late blob URL is revoked and not committed after panel
     img?.getAttribute("src") ?? null,
     null,
     "stale blob URL must not be committed to an img element after panel generation change",
+  );
+
+  if (origRevoke !== undefined) globalThis.URL.revokeObjectURL = origRevoke;
+  await unmount();
+});
+
+// ── blob-leak-on-back-navigation ──────────────────────────────────────────────────────────────
+
+test("blob-leak-on-back-navigation: loadGenRef cleanup prevents orphaned blob URL", async () => {
+  // Isolates the loadGenRef.current += 1 cleanup in AttachmentViewer.
+  //
+  // Scenario: attachment fetch is in-flight, then the user navigates "Back to
+  // feedback" (onBack sets selectedId=null in FeedbackTab, unmounting
+  // FeedbackDetail and AttachmentViewer). At unmount the cleanup fires:
+  //   loadGenRef.current += 1  ← MUTATION TARGET
+  // The late fetch resolves. Since origin/pubkey are UNCHANGED (no context
+  // change happened), only the loadGenRef check catches the mismatch:
+  //   thisGen (pre-cleanup value) !== loadGenRef.current (incremented) → revoke
+  //
+  // Without the cleanup increment:
+  //   thisGen === loadGenRef.current (both remain at 1) → all three guards pass
+  //   → setBlobUrl called → blob URL committed to blobUrlRef.current with no
+  //   revocation → orphaned blob URL leak.
+  //
+  // Fails if loadGenRef.current += 1 is removed from the cleanup.
+
+  const origin = "https://admin.example.com";
+  const pubkey = "a".repeat(64);
+  const sha256 = "a".repeat(64);
+
+  const feedbackItem = {
+    id: "00000000-0000-0000-0000-000000000011",
+    bodySummary: "Test feedback",
+    receivedAt: 1700000000,
+    tags: [
+      [
+        "imeta",
+        `url https://relay.example.com/files/${sha256}`,
+        "m image/png",
+        `x ${sha256}`,
+        "size 1000",
+      ],
+    ],
+  };
+
+  setIpcHandler("admin_list_reports", () => Promise.resolve([]));
+  setIpcHandler("admin_list_feedback", () => Promise.resolve([feedbackItem]));
+  setIpcHandler("admin_get_feedback", () => Promise.resolve(feedbackItem));
+
+  const attachDeferred = deferred();
+  const revokedUrls = [];
+  const origRevoke = globalThis.URL?.revokeObjectURL;
+  if (!globalThis.URL) globalThis.URL = {};
+  globalThis.URL.revokeObjectURL = (url) => {
+    revokedUrls.push(url);
+    if (origRevoke) origRevoke.call(globalThis.URL, url);
+  };
+  globalThis.URL.createObjectURL = () => "blob:back-nav-test-url";
+  setIpcHandler(
+    "admin_fetch_feedback_attachment",
+    () => attachDeferred.promise,
+  );
+
+  const { container, doRender, unmount } = mountPanel({ origin, pubkey });
+
+  await act(async () => {
+    await doRender();
+    await new Promise((r) => setTimeout(r, 30));
+  });
+
+  // Click Feedback tab.
+  const feedbackTab = container.querySelector(
+    "[data-testid='admin-tab-feedback']",
+  );
+  assert.ok(feedbackTab, "Feedback tab must be present");
+  await act(async () => {
+    fireEvent.click(feedbackTab);
+    await new Promise((r) => setTimeout(r, 30));
+  });
+
+  // Navigate to feedback detail.
+  let navigatedToDetail = false;
+  for (const btn of container.querySelectorAll("button")) {
+    const testid = btn.getAttribute("data-testid") ?? "";
+    if (testid.startsWith("admin-tab")) continue;
+    if ((btn.textContent ?? "").includes("View attachment")) {
+      await act(async () => {
+        fireEvent.click(btn);
+        await new Promise((r) => setTimeout(r, 0));
+      });
+      navigatedToDetail = true;
+      break;
+    }
+    await act(async () => {
+      fireEvent.click(btn);
+      await new Promise((r) => setTimeout(r, 30));
+    });
+    for (const b of container.querySelectorAll("button")) {
+      if ((b.textContent ?? "").includes("View attachment")) {
+        await act(async () => {
+          fireEvent.click(b);
+          await new Promise((r) => setTimeout(r, 0));
+        });
+        navigatedToDetail = true;
+        break;
+      }
+    }
+    break;
+  }
+  assert.ok(
+    navigatedToDetail,
+    "must navigate to feedback detail and start attachment load",
+  );
+
+  // Attachment fetch is now in-flight.  Click "Back to feedback" — this
+  // unmounts FeedbackDetail (and AttachmentViewer within it) WITHOUT changing
+  // origin or pubkey.  The cleanup fires: loadGenRef.current += 1.
+  const backBtn = Array.from(container.querySelectorAll("button")).find((b) =>
+    (b.textContent ?? "").includes("Back to feedback"),
+  );
+  assert.ok(
+    backBtn,
+    "'Back to feedback' button must be present while detail is showing",
+  );
+  await act(async () => {
+    fireEvent.click(backBtn);
+    await new Promise((r) => setTimeout(r, 5));
+  });
+
+  // Resolve the attachment fetch.  With cleanup increment:
+  //   thisGen (1) !== loadGenRef.current (2) → URL.revokeObjectURL("blob:back-nav-test-url")
+  // Without cleanup increment:
+  //   thisGen (1) === loadGenRef.current (1) AND origin/pubkey unchanged
+  //   → setBlobUrl called → orphaned blob, no revocation.
+  attachDeferred.resolve(new ArrayBuffer(8));
+  await act(async () => {
+    await new Promise((r) => setTimeout(r, 30));
+  });
+
+  assert.ok(
+    revokedUrls.includes("blob:back-nav-test-url"),
+    `blob URL must be revoked on back-navigation; revokedUrls: ${JSON.stringify(revokedUrls)}`,
   );
 
   if (origRevoke !== undefined) globalThis.URL.revokeObjectURL = origRevoke;
