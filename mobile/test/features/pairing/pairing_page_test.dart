@@ -237,10 +237,7 @@ void main() {
         ),
       );
 
-      expect(
-        find.text('Use Face ID to confirm sensitive identity actions'),
-        findsOneWidget,
-      );
+      expect(find.text('Use Face ID'), findsOneWidget);
     });
 
     testWidgets('uses generic biometrics copy on Android builds', (
@@ -258,10 +255,7 @@ void main() {
         ),
       );
 
-      expect(
-        find.text('Use biometrics to confirm sensitive identity actions'),
-        findsOneWidget,
-      );
+      expect(find.text('Use biometrics'), findsOneWidget);
     });
 
     testWidgets('new identity import offers protection checked by default', (
@@ -281,7 +275,7 @@ void main() {
       );
       expect(checkbox.value, isTrue);
       expect(
-        find.textContaining('Routine Buzz use will not prompt'),
+        find.textContaining('open Buzz and approve identity transfers'),
         findsOneWidget,
       );
     });

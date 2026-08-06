@@ -157,8 +157,8 @@ class PairingNotifier extends Notifier<PairingState> {
     if (requiresAuthorization) {
       state = state.copyWith(authorizationInProgress: true);
       final result = await ref
-          .read(sensitiveActionAuthorizerProvider)
-          .authorizeIdentityAction();
+          .read(sensitiveActionAuthorizationSessionProvider)
+          .authorize();
       if (state.status != PairingStatus.confirmingSas) return;
       if (result != DeviceAuthResult.success) {
         _userConfirmedSas = false;

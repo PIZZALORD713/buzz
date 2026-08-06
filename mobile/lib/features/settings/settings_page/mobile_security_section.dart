@@ -22,11 +22,11 @@ class _MobileSecuritySection extends ConsumerWidget {
         SwitchListTile(
           key: const Key('sensitive-action-confirmation-toggle'),
           secondary: const Icon(LucideIcons.shieldCheck),
-          title: const Text('Confirm sensitive identity actions'),
+          title: Text('Use $authenticationName'),
           subtitle: Text(
             enabled
-                ? 'Device authentication is required before sending your identity to a desktop.'
-                : 'Routine Buzz use never prompts. Enable protection for identity transfers.',
+                ? 'Required to open Buzz and approve identity transfers.'
+                : 'Require $authenticationName to open Buzz and approve identity transfers.',
           ),
           value: enabled,
           onChanged: (value) => _changePolicy(context, ref, value),
@@ -58,8 +58,8 @@ class _MobileSecuritySection extends ConsumerWidget {
         ?.sensitiveActionPolicy;
     if (enabled || currentPolicy == SensitiveActionPolicy.enabled) {
       final result = await ref
-          .read(sensitiveActionAuthorizerProvider)
-          .authorizeIdentityAction();
+          .read(sensitiveActionAuthorizationSessionProvider)
+          .authorize();
       if (!context.mounted) return;
       if (result != DeviceAuthResult.success) {
         ScaffoldMessenger.of(context).showSnackBar(

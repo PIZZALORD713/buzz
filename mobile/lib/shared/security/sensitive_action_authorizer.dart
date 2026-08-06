@@ -74,3 +74,39 @@ final sensitiveActionAuthorizerProvider = Provider<SensitiveActionAuthorizer>((
 final sensitiveActionAuthSupportedProvider = FutureProvider<bool>((ref) {
   return ref.watch(sensitiveActionAuthorizerProvider).isSupported();
 });
+
+final appLockClockProvider = Provider<DateTime Function()>((ref) {
+  return DateTime.now;
+});
+
+class SensitiveActionAuthorizationSession {
+  SensitiveActionAuthorizationSession({
+    required SensitiveActionAuthorizer authorizer,
+    required DateTime Function() now,
+  }) : _authorizer = authorizer,
+       _now = now;
+
+  final SensitiveActionAuthorizer _authorizer;
+  final DateTime Function() _now;
+
+  DateTime? lastSuccessfulAt;
+
+  Future<DeviceAuthResult> authorize() async {
+    final result = await _authorizer.authorizeIdentityAction();
+    if (result == DeviceAuthResult.success) lastSuccessfulAt = _now();
+    return result;
+  }
+
+  bool wasAuthorizedWithin(Duration duration) {
+    final authorizedAt = lastSuccessfulAt;
+    return authorizedAt != null && _now().difference(authorizedAt) < duration;
+  }
+}
+
+final sensitiveActionAuthorizationSessionProvider =
+    Provider<SensitiveActionAuthorizationSession>((ref) {
+      return SensitiveActionAuthorizationSession(
+        authorizer: ref.watch(sensitiveActionAuthorizerProvider),
+        now: ref.watch(appLockClockProvider),
+      );
+    });

@@ -293,11 +293,9 @@ class _SasVerificationView extends StatelessWidget {
                 : (value) => onProtectionChanged(value ?? false),
             controlAffinity: ListTileControlAffinity.leading,
             contentPadding: EdgeInsets.zero,
-            title: Text(
-              'Use $authenticationName to confirm sensitive identity actions',
-            ),
-            subtitle: const Text(
-              'Routine Buzz use will not prompt. This protects identity transfer and reveal actions.',
+            title: Text('Use $authenticationName'),
+            subtitle: Text(
+              'Require $authenticationName to open Buzz and approve identity transfers.',
             ),
           ),
 

@@ -20,6 +20,7 @@ import 'shared/deeplink/pending_deep_link_provider.dart';
 import 'shared/emoji/emoji_burst.dart';
 import 'shared/relay/relay.dart';
 import 'shared/read_state/read_state_provider.dart';
+import 'shared/security/sensitive_action_authorizer.dart';
 import 'shared/theme/theme.dart';
 import 'shared/widgets/buzz_loading_indicator.dart';
 
@@ -131,10 +132,15 @@ class App extends HookConsumerWidget {
         loading: () => const _SplashScreen(),
         error: (_, _) => const PairingPage(),
         data: (state) => switch (state.status) {
-          AuthStatus.authenticated => DeepLinkDispatcher(
-            child: HomePage(
-              settingsPageBuilder: _buildSettingsPage,
-              hasUnreadInbox: hasUnreadInbox,
+          AuthStatus.authenticated => AppLockGate(
+            enabled:
+                state.community?.sensitiveActionPolicy ==
+                SensitiveActionPolicy.enabled,
+            child: DeepLinkDispatcher(
+              child: HomePage(
+                settingsPageBuilder: _buildSettingsPage,
+                hasUnreadInbox: hasUnreadInbox,
+              ),
             ),
           ),
           _ => const DeepLinkDispatcher(
@@ -161,6 +167,148 @@ class _SplashScreen extends StatelessWidget {
     return const Scaffold(
       body: Center(
         child: BuzzLoadingIndicator(size: 56, semanticLabel: 'Starting Buzz'),
+      ),
+    );
+  }
+}
+
+const appLockTimeout = Duration(minutes: 5);
+
+class AppLockGate extends ConsumerStatefulWidget {
+  const AppLockGate({super.key, required this.enabled, required this.child});
+
+  final bool enabled;
+  final Widget child;
+
+  @override
+  ConsumerState<AppLockGate> createState() => _AppLockGateState();
+}
+
+class _AppLockGateState extends ConsumerState<AppLockGate>
+    with WidgetsBindingObserver {
+  bool _locked = true;
+  bool _authenticating = false;
+  String? _error;
+  DateTime? _backgroundedAt;
+
+  @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addObserver(this);
+    if (!widget.enabled) _locked = false;
+    WidgetsBinding.instance.addPostFrameCallback((_) => _unlockIfNeeded());
+  }
+
+  @override
+  void didUpdateWidget(AppLockGate oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (!widget.enabled) {
+      setState(() {
+        _locked = false;
+        _error = null;
+      });
+    } else if (!oldWidget.enabled) {
+      setState(() => _locked = true);
+      WidgetsBinding.instance.addPostFrameCallback((_) => _unlockIfNeeded());
+    }
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (!widget.enabled || _authenticating) return;
+    switch (state) {
+      case AppLifecycleState.inactive:
+      case AppLifecycleState.paused:
+      case AppLifecycleState.hidden:
+      case AppLifecycleState.detached:
+        _backgroundedAt ??= ref.read(appLockClockProvider)();
+        setState(() => _locked = true);
+      case AppLifecycleState.resumed:
+        final backgroundedAt = _backgroundedAt;
+        _backgroundedAt = null;
+        if (backgroundedAt != null) {
+          final timedOut =
+              ref.read(appLockClockProvider)().difference(backgroundedAt) >=
+              appLockTimeout;
+          _unlockIfNeeded(forceFresh: timedOut);
+        }
+    }
+  }
+
+  Future<void> _unlockIfNeeded({bool forceFresh = false}) async {
+    if (!mounted || !widget.enabled || !_locked || _authenticating) return;
+    final session = ref.read(sensitiveActionAuthorizationSessionProvider);
+    if (!forceFresh && session.wasAuthorizedWithin(appLockTimeout)) {
+      setState(() {
+        _locked = false;
+        _error = null;
+      });
+      return;
+    }
+
+    setState(() {
+      _authenticating = true;
+      _error = null;
+    });
+    final result = await session.authorize();
+    if (!mounted || !widget.enabled) return;
+    setState(() {
+      _authenticating = false;
+      _locked = result != DeviceAuthResult.success;
+      _error = result == DeviceAuthResult.success
+          ? null
+          : 'Buzz is locked. Authenticate to continue.';
+    });
+  }
+
+  @override
+  void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    if (!widget.enabled || !_locked) return widget.child;
+    final authenticationName = sensitiveActionAuthenticationName(
+      Theme.of(context).platform,
+    );
+    return Scaffold(
+      key: const Key('app-lock-screen'),
+      body: SafeArea(
+        child: Center(
+          child: Padding(
+            padding: const EdgeInsets.all(32),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Icon(
+                  Icons.lock_outline,
+                  size: 56,
+                  color: Theme.of(context).colorScheme.primary,
+                ),
+                const SizedBox(height: 16),
+                Text(
+                  'Buzz is locked',
+                  style: Theme.of(context).textTheme.headlineSmall,
+                ),
+                if (_error != null) ...[
+                  const SizedBox(height: 8),
+                  Text(_error!, textAlign: TextAlign.center),
+                ],
+                const SizedBox(height: 24),
+                FilledButton(
+                  onPressed: _authenticating ? null : _unlockIfNeeded,
+                  child: Text(
+                    _authenticating
+                        ? 'Authenticating…'
+                        : 'Unlock with $authenticationName',
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
       ),
     );
   }
