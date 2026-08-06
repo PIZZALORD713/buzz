@@ -25,9 +25,25 @@ class _ConnectionSection extends ConsumerWidget {
             title: 'Send identity to desktop',
             subtitle: 'Scan a recovery code shown by Buzz Desktop',
             trailing: const _RowChevron(),
-            onTap: () => Navigator.of(context).push(
-              MaterialPageRoute<void>(builder: identityRecoveryPageBuilder),
-            ),
+            onTap: () async {
+              final authorized = await ref
+                  .read(pairingProvider.notifier)
+                  .authorizeIdentityExport();
+              if (!context.mounted) return;
+              if (!authorized) {
+                final message = ref.read(pairingProvider).errorMessage;
+                if (message != null) {
+                  ScaffoldMessenger.of(
+                    context,
+                  ).showSnackBar(SnackBar(content: Text(message)));
+                }
+                return;
+              }
+              await Navigator.of(context).push(
+                MaterialPageRoute<void>(builder: identityRecoveryPageBuilder),
+              );
+              ref.read(pairingProvider.notifier).reset();
+            },
           ),
         ],
       ],

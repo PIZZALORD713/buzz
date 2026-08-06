@@ -233,7 +233,10 @@ void main() {
         await container.read(authProvider.future);
       });
 
-      test('recovery URI enables phone-to-desktop transfer', () async {
+      test('recovery authorization happens before pairing starts', () async {
+        expect(await notifier.authorizeIdentityExport(), isTrue);
+        expect(authorizer.calls, 1);
+
         await notifier.pair(recoveryCode);
 
         final state = container.read(pairingProvider);
@@ -245,6 +248,7 @@ void main() {
       test(
         'matching SAS sends nsec and successful completion finishes',
         () async {
+          expect(await notifier.authorizeIdentityExport(), isTrue);
           await notifier.pair(recoveryCode);
           notifier.confirmSas();
           expect(container.read(pairingProvider).userConfirmedSas, isTrue);
@@ -262,6 +266,7 @@ void main() {
             container.read(pairingProvider).status,
             PairingStatus.transferring,
           );
+          expect(authorizer.calls, 1);
           final sentMessages = socket.decryptedPublishedMessages(sourceSecret);
           expect(
             sentMessages.any(
@@ -282,38 +287,21 @@ void main() {
         },
       );
 
-      test(
-        'protected recovery emits no payload when authentication is cancelled',
-        () async {
-          authorizer.result = DeviceAuthResult.cancelled;
-          await notifier.pair(recoveryCode);
-          notifier.confirmSas();
-          socket.sendSourceMessage(
-            sourceSecret: sourceSecret,
-            sessionSecretHex: sessionSecretHex,
-            message: {'type': 'sas-confirm'},
-            includeTranscriptHash: true,
-          );
-          await Future<void>.delayed(Duration.zero);
+      test('cancelled authorization prevents pairing from starting', () async {
+        authorizer.result = DeviceAuthResult.cancelled;
 
-          final messages = socket.decryptedPublishedMessages(sourceSecret);
-          expect(authorizer.calls, 1);
-          expect(
-            messages.where((message) => message['type'] == 'payload'),
-            isEmpty,
-          );
-          expect(
-            container.read(pairingProvider).status,
-            PairingStatus.confirmingSas,
-          );
-          expect(
-            container.read(pairingProvider).errorMessage,
-            contains('cancelled'),
-          );
-        },
-      );
+        expect(await notifier.authorizeIdentityExport(), isFalse);
+
+        expect(authorizer.calls, 1);
+        expect(container.read(pairingProvider).status, PairingStatus.idle);
+        expect(
+          container.read(pairingProvider).errorMessage,
+          contains('cancelled'),
+        );
+      });
 
       test('desktop storage failure surfaces an error', () async {
+        expect(await notifier.authorizeIdentityExport(), isTrue);
         await notifier.pair(recoveryCode);
         notifier.confirmSas();
         socket.sendSourceMessage(

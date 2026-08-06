@@ -59,9 +59,10 @@ class PairingState {
     bool? sendsIdentityToDesktop,
     bool? protectImportedIdentity,
     bool? authorizationInProgress,
+    bool clearErrorMessage = false,
   }) => PairingState(
     status: status ?? this.status,
-    errorMessage: errorMessage ?? this.errorMessage,
+    errorMessage: clearErrorMessage ? null : errorMessage ?? this.errorMessage,
     sasCode: sasCode ?? this.sasCode,
     userConfirmedSas: userConfirmedSas ?? this.userConfirmedSas,
     sendsIdentityToDesktop:
@@ -119,6 +120,40 @@ class PairingNotifier extends Notifier<PairingState> {
     return _pairLegacy(trimmed);
   }
 
+  Future<bool> authorizeIdentityExport() async {
+    if (state.authorizationInProgress) return false;
+
+    final activePolicy = (await ref.read(
+      authProvider.future,
+    )).community?.sensitiveActionPolicy;
+    if (activePolicy != SensitiveActionPolicy.enabled) {
+      state = state.copyWith(
+        errorMessage:
+            'Turn on biometric protection before sending your identity.',
+      );
+      return false;
+    }
+
+    state = state.copyWith(
+      authorizationInProgress: true,
+      clearErrorMessage: true,
+    );
+    final result = await ref
+        .read(sensitiveActionAuthorizationSessionProvider)
+        .authorize();
+    if (result != DeviceAuthResult.success) {
+      state = state.copyWith(
+        authorizationInProgress: false,
+        errorMessage: _authorizationError(result),
+      );
+      return false;
+    }
+
+    _identityExportAuthorized = true;
+    state = state.copyWith(authorizationInProgress: false);
+    return true;
+  }
+
   /// Confirm that the SAS code matches. Called by the UI after user approval.
   void confirmSas() {
     if (state.status != PairingStatus.confirmingSas ||
@@ -147,11 +182,8 @@ class PairingNotifier extends Notifier<PairingState> {
       return;
     }
 
-    final activePolicy = (await ref.read(
-      authProvider.future,
-    )).community?.sensitiveActionPolicy;
     final requiresAuthorization = _sendIdentityToSource
-        ? activePolicy == SensitiveActionPolicy.enabled
+        ? !_identityExportAuthorized
         : state.protectImportedIdentity;
 
     if (requiresAuthorization) {
@@ -226,6 +258,7 @@ class PairingNotifier extends Notifier<PairingState> {
     _userConfirmedSas = false;
     _pendingPayload = null;
     _sendIdentityToSource = false;
+    _identityExportAuthorized = false;
   }
 
   // ── NIP-AB pairing flow ─────────────────────────────────────────────────
@@ -241,6 +274,7 @@ class PairingNotifier extends Notifier<PairingState> {
   bool _sasConfirmReceived = false;
   bool _userConfirmedSas = false;
   bool _sendIdentityToSource = false;
+  bool _identityExportAuthorized = false;
   Map<String, dynamic>? _pendingPayload; // buffered until user confirms SAS
   final Set<String> _processedEventIds = {}; // NIP-AB §Duplicate Event Handling
 

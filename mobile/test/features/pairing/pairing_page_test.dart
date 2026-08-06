@@ -336,6 +336,9 @@ class _ErrorPairingNotifier extends Notifier<PairingState>
       PairingState(status: PairingStatus.error, errorMessage: error);
 
   @override
+  Future<bool> authorizeIdentityExport() async => true;
+
+  @override
   Future<void> pair(String rawInput) async {}
 
   @override
@@ -355,6 +358,9 @@ class _ConnectingPairingNotifier extends Notifier<PairingState>
     implements PairingNotifier {
   @override
   PairingState build() => const PairingState(status: PairingStatus.connecting);
+
+  @override
+  Future<bool> authorizeIdentityExport() async => true;
 
   @override
   Future<void> pair(String rawInput) async {}
@@ -378,6 +384,9 @@ class _RecordingPairingNotifier extends Notifier<PairingState>
 
   @override
   PairingState build() => const PairingState();
+
+  @override
+  Future<bool> authorizeIdentityExport() async => true;
 
   @override
   Future<void> pair(String rawInput) async => pairedCodes.add(rawInput);
@@ -407,6 +416,9 @@ class _ConfirmingSasPairingNotifier extends Notifier<PairingState>
     sasCode: '123456',
     sendsIdentityToDesktop: sendsIdentityToDesktop,
   );
+
+  @override
+  Future<bool> authorizeIdentityExport() async => true;
 
   @override
   Future<void> pair(String rawInput) async {}
