@@ -124,19 +124,16 @@ impl MediaStorage {
             .map_err(|e| MediaError::StorageError(e.to_string()))?;
         let sharded = crate::keys::sharded_blob_key(ctx.community(), sha256, ext)
             .map_err(|e| MediaError::StorageError(e.to_string()))?;
-        match self.migration_phase {
-            MediaMigrationPhase::DualReadLegacyWrite => {
-                self.put(&legacy, bytes, content_type).await?
-            }
-            MediaMigrationPhase::DualReadDualWrite => {
-                self.put(&sharded, bytes, content_type).await?;
-                self.put(&legacy, bytes, content_type).await?;
-            }
-            MediaMigrationPhase::ShardedOnly => self.put(&sharded, bytes, content_type).await?,
+        if self.migration_phase.writes_sharded() {
+            self.put(&sharded, bytes, content_type).await?;
         }
-        Ok(match self.migration_phase {
-            MediaMigrationPhase::DualReadLegacyWrite => legacy,
-            MediaMigrationPhase::DualReadDualWrite | MediaMigrationPhase::ShardedOnly => sharded,
+        if self.migration_phase.writes_legacy() {
+            self.put(&legacy, bytes, content_type).await?;
+        }
+        Ok(if self.migration_phase.writes_sharded() {
+            sharded
+        } else {
+            legacy
         })
     }
 
@@ -153,19 +150,16 @@ impl MediaStorage {
             .map_err(|e| MediaError::StorageError(e.to_string()))?;
         let sharded = crate::keys::sharded_blob_key(ctx.community(), sha256, ext)
             .map_err(|e| MediaError::StorageError(e.to_string()))?;
-        match self.migration_phase {
-            MediaMigrationPhase::DualReadLegacyWrite => {
-                self.put_file(&legacy, path, content_type).await?
-            }
-            MediaMigrationPhase::DualReadDualWrite => {
-                self.put_file(&sharded, path, content_type).await?;
-                self.put_file(&legacy, path, content_type).await?;
-            }
-            MediaMigrationPhase::ShardedOnly => self.put_file(&sharded, path, content_type).await?,
+        if self.migration_phase.writes_sharded() {
+            self.put_file(&sharded, path, content_type).await?;
         }
-        Ok(match self.migration_phase {
-            MediaMigrationPhase::DualReadLegacyWrite => legacy,
-            MediaMigrationPhase::DualReadDualWrite | MediaMigrationPhase::ShardedOnly => sharded,
+        if self.migration_phase.writes_legacy() {
+            self.put_file(&legacy, path, content_type).await?;
+        }
+        Ok(if self.migration_phase.writes_sharded() {
+            sharded
+        } else {
+            legacy
         })
     }
 
@@ -180,19 +174,16 @@ impl MediaStorage {
             .map_err(|e| MediaError::StorageError(e.to_string()))?;
         let sharded = crate::keys::sharded_thumb_key(ctx.community(), sha256)
             .map_err(|e| MediaError::StorageError(e.to_string()))?;
-        match self.migration_phase {
-            MediaMigrationPhase::DualReadLegacyWrite => {
-                self.put(&legacy, bytes, "image/jpeg").await?
-            }
-            MediaMigrationPhase::DualReadDualWrite => {
-                self.put(&sharded, bytes, "image/jpeg").await?;
-                self.put(&legacy, bytes, "image/jpeg").await?;
-            }
-            MediaMigrationPhase::ShardedOnly => self.put(&sharded, bytes, "image/jpeg").await?,
+        if self.migration_phase.writes_sharded() {
+            self.put(&sharded, bytes, "image/jpeg").await?;
         }
-        Ok(match self.migration_phase {
-            MediaMigrationPhase::DualReadLegacyWrite => legacy,
-            MediaMigrationPhase::DualReadDualWrite | MediaMigrationPhase::ShardedOnly => sharded,
+        if self.migration_phase.writes_legacy() {
+            self.put(&legacy, bytes, "image/jpeg").await?;
+        }
+        Ok(if self.migration_phase.writes_sharded() {
+            sharded
+        } else {
+            legacy
         })
     }
 
@@ -206,23 +197,25 @@ impl MediaStorage {
     ) -> Result<Option<String>, MediaError> {
         let candidates =
             crate::keys::read_candidates(ctx, payload_name).map_err(|_| MediaError::NotFound)?;
-        match self.migration_phase {
-            MediaMigrationPhase::DualReadLegacyWrite => self
-                .head(&candidates.legacy)
-                .await
-                .map(|exists| exists.then_some(candidates.legacy)),
-            MediaMigrationPhase::DualReadDualWrite => {
-                if self.head(&candidates.sharded).await? && self.head(&candidates.legacy).await? {
-                    Ok(Some(candidates.sharded))
-                } else {
-                    Ok(None)
-                }
-            }
-            MediaMigrationPhase::ShardedOnly => self
-                .head(&candidates.sharded)
-                .await
-                .map(|exists| exists.then_some(candidates.sharded)),
+        let sharded_exists = if self.migration_phase.writes_sharded() {
+            self.head(&candidates.sharded).await?
+        } else {
+            true
+        };
+        let legacy_exists = if self.migration_phase.writes_legacy() {
+            self.head(&candidates.legacy).await?
+        } else {
+            true
+        };
+
+        if !sharded_exists || !legacy_exists {
+            return Ok(None);
         }
+        Ok(Some(if self.migration_phase.writes_sharded() {
+            candidates.sharded
+        } else {
+            candidates.legacy
+        }))
     }
 
     /// Retrieve an object's bytes.
@@ -298,11 +291,11 @@ impl MediaStorage {
         }
     }
 
-    /// Resolve a media payload to its new-first, legacy-fallback object key.
+    /// Resolve a media payload according to the configured read layout.
     ///
-    /// Only an actual not-found result advances to the legacy candidate. Any
-    /// authorization, transport, throttling, or service error is returned so
-    /// the compatibility path cannot mask an unhealthy object store.
+    /// Dual-read phases prefer the sharded key and fall back to legacy only on
+    /// an actual not-found result. Authorization, transport, throttling, and
+    /// service errors are returned so fallback cannot mask an unhealthy store.
     pub async fn resolve_read_key(
         &self,
         ctx: &TenantContext,
@@ -319,6 +312,35 @@ impl MediaStorage {
                 return Err(MediaError::NotFound);
             }
         };
+
+        if !self.migration_phase.reads_sharded() {
+            return match self.head_with_metadata(&candidates.legacy).await {
+                Ok(Some(_)) => {
+                    metrics::counter!(
+                        "buzz_media_s3_read_resolutions_total",
+                        "result" => "legacy"
+                    )
+                    .increment(1);
+                    Ok(candidates.legacy)
+                }
+                Ok(None) => {
+                    metrics::counter!(
+                        "buzz_media_s3_read_resolutions_total",
+                        "result" => "missing"
+                    )
+                    .increment(1);
+                    Err(MediaError::NotFound)
+                }
+                Err(error) => {
+                    metrics::counter!(
+                        "buzz_media_s3_read_resolutions_total",
+                        "result" => "storage_error"
+                    )
+                    .increment(1);
+                    Err(error)
+                }
+            };
+        }
 
         match self.head_with_metadata(&candidates.sharded).await {
             Ok(Some(_)) => {
@@ -527,7 +549,7 @@ mod tests {
             s3_bucket: "buzz-media".to_string(),
             s3_region: "us-west-2".to_string(),
             s3_addressing_style: S3AddressingStyle::Path,
-            migration_phase: crate::config::MediaMigrationPhase::DualReadLegacyWrite,
+            migration_phase: crate::config::MediaMigrationPhase::LegacyOnly,
             max_image_bytes: 50 * 1024 * 1024,
             max_gif_bytes: 10 * 1024 * 1024,
             max_video_bytes: 524_288_000,

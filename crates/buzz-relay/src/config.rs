@@ -1053,6 +1053,11 @@ mod tests {
             buzz_media::config::S3AddressingStyle::Path,
             "S3 addressing must default to path style for bundled MinIO compatibility"
         );
+        assert_eq!(
+            config.media.migration_phase,
+            buzz_media::MediaMigrationPhase::LegacyOnly,
+            "media layout must default to behavior-preserving legacy reads and writes"
+        );
         assert!(
             config.join_policy.is_none(),
             "join_policy should default to None so policy prompts and acceptance receipts are opt-in"
@@ -1088,6 +1093,34 @@ mod tests {
             invalid,
             Err(ConfigError::InvalidValue(ref message))
                 if message.contains("BUZZ_S3_ADDRESSING_STYLE must be 'path' or 'virtual'")
+        ));
+    }
+
+    #[test]
+    fn media_migration_phase_env_accepts_sharded_only_and_rejects_invalid_values() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        let previous = std::env::var_os("BUZZ_MEDIA_MIGRATION_PHASE");
+
+        std::env::set_var("BUZZ_MEDIA_MIGRATION_PHASE", "sharded-only");
+        let configured = Config::from_env()
+            .expect("sharded-only media config")
+            .media
+            .migration_phase;
+
+        std::env::set_var("BUZZ_MEDIA_MIGRATION_PHASE", "auto");
+        let invalid = Config::from_env();
+
+        if let Some(value) = previous {
+            std::env::set_var("BUZZ_MEDIA_MIGRATION_PHASE", value);
+        } else {
+            std::env::remove_var("BUZZ_MEDIA_MIGRATION_PHASE");
+        }
+
+        assert_eq!(configured, buzz_media::MediaMigrationPhase::ShardedOnly);
+        assert!(matches!(
+            invalid,
+            Err(ConfigError::InvalidValue(ref message))
+                if message.contains("BUZZ_MEDIA_MIGRATION_PHASE must be 'legacy-only'")
         ));
     }
 

@@ -45,7 +45,7 @@ impl CommonArgs {
             s3_bucket: self.s3_bucket.clone(),
             s3_region: self.s3_region.clone(),
             s3_addressing_style: self.s3_addressing_style,
-            migration_phase: MediaMigrationPhase::DualReadLegacyWrite,
+            migration_phase: MediaMigrationPhase::LegacyOnly,
             max_image_bytes: 1,
             max_gif_bytes: 1,
             max_video_bytes: 1,
