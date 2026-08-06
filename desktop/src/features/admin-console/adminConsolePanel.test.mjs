@@ -905,3 +905,118 @@ test("old-list-after-new-list: stale list result does not replace new list after
 // AttachmentViewer loadGenRef cleanup) are covered by
 // adminConsolePanelEvents.jsdom-test.mjs where fireEvent dispatches native
 // events through React 19's container-level delegation.
+
+// ── disabled-mode mounts panel ────────────────────────────────────────────
+
+test("disabled-probe-mounts-panel: admin-console-panel renders when probe state is disabled", async () => {
+  // Pinning test for item 1 render-gate fix.
+  //
+  // Verifies that a `disabled` probe result (relay serves admin API without
+  // credential) causes AdminConsolePanel to mount, with the disabled badge
+  // still visible alongside the panel.
+  //
+  // Fails if the render gate is reverted to `authorized`-only:
+  //   isPanelVisible = probeUiState.kind === "authorized" && savedOrigin !== null
+  // → disabled state never mounts the panel and this test goes red.
+
+  const pubkey = "f".repeat(64);
+  const savedOrigin = "https://admin.example.com";
+
+  setIpcHandler("get_admin_origin", () => Promise.resolve(savedOrigin));
+  setIpcHandler("admin_probe", () => Promise.resolve({ state: "disabled" }));
+  setIpcHandler("admin_list_reports", () => Promise.resolve([]));
+  setIpcHandler("admin_list_feedback", () => Promise.resolve([]));
+
+  const qc = makeQueryClient(pubkey);
+  const { container, doRender, unmount } = mountCard(qc);
+  await doRender();
+  await settle(50);
+
+  const panel = container.querySelector("[data-testid='admin-console-panel']");
+  assert.ok(
+    panel !== null,
+    "admin-console-panel must mount when probe state is disabled — render gate missing",
+  );
+
+  // The disabled badge must still appear above the panel.
+  const text = container.textContent ?? "";
+  assert.ok(
+    text.includes("Auth is disabled"),
+    `disabled badge must remain visible; got: ${text.slice(0, 300)}`,
+  );
+
+  await unmount();
+});
+
+test("authorized-probe-mounts-panel: admin-console-panel still renders when probe state is authorized", async () => {
+  // Regression guard: changing the render gate must not break the authorized case.
+
+  const pubkey = "9".repeat(64);
+  const savedOrigin = "https://admin-auth.example.com";
+
+  setIpcHandler("get_admin_origin", () => Promise.resolve(savedOrigin));
+  setIpcHandler("admin_probe", () =>
+    Promise.resolve({ state: "nip98Authorized" }),
+  );
+  setIpcHandler("admin_list_reports", () => Promise.resolve([]));
+  setIpcHandler("admin_list_feedback", () => Promise.resolve([]));
+
+  const qc = makeQueryClient(pubkey);
+  const { container, doRender, unmount } = mountCard(qc);
+  await doRender();
+  await settle(50);
+
+  const panel = container.querySelector("[data-testid='admin-console-panel']");
+  assert.ok(
+    panel !== null,
+    "admin-console-panel must still mount when probe state is authorized",
+  );
+
+  await unmount();
+});
+
+// ── denied badge copy button ──────────────────────────────────────────────
+
+test("denied-badge-copy-button: copy button is present next to the denied pubkey", async () => {
+  // Verifies item 2: the pubkey in the denied state is displayed alongside
+  // a copy button (data-testid="admin-denied-pubkey-copy"), not just a
+  // cursor-pointer select-all code block.
+
+  const pubkey = "4".repeat(64);
+  const savedOrigin = "https://admin-denied.example.com";
+
+  setIpcHandler("get_admin_origin", () => Promise.resolve(savedOrigin));
+  setIpcHandler("admin_probe", () => Promise.resolve({ state: "nip98Denied" }));
+
+  const qc = makeQueryClient(pubkey);
+  const { container, doRender, unmount } = mountCard(qc);
+  await doRender();
+  await settle(30);
+
+  const pubkeyEl = container.querySelector(
+    "[data-testid='admin-denied-pubkey']",
+  );
+  assert.ok(pubkeyEl !== null, "admin-denied-pubkey element must be present");
+  assert.ok(
+    pubkeyEl.textContent?.includes(pubkey),
+    `denied pubkey element must contain the pubkey; got: ${pubkeyEl.textContent}`,
+  );
+
+  const copyBtn = container.querySelector(
+    "[data-testid='admin-denied-pubkey-copy']",
+  );
+  assert.ok(
+    copyBtn !== null,
+    "admin-denied-pubkey-copy button must be present — copy-icon pattern missing",
+  );
+
+  await unmount();
+});
+
+// ── structured detail layouts ─────────────────────────────────────────────
+//
+// Tests for report-detail-renders-structured-fields and
+// feedback-detail-renders-structured-fields live in
+// adminConsolePanelEvents.jsdom-test.mjs — they require fireEvent.click
+// (React 19's container-level event delegation) which is only available
+// in the jsdom suite.

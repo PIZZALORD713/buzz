@@ -11,16 +11,26 @@
  * (pubkeyHex → empty string) renders nothing, so A's probe state, saved
  * origin, and panel are torn down at the render level — not in a passive effect.
  *
- * Renders the full admin panel only when probe state is `nip98Authorized`.
+ * Renders the full admin panel when probe state is `nip98Authorized` or
+ * `disabled`. The `disabled` state means the relay serves the admin API without
+ * any credential — the panel works the same way, just without NIP-98 signing.
  * All other states surface honest, actionable copy without false hope.
  */
 
 import { useEffect, useRef, useState } from "react";
-import { AlertCircle, CheckCircle2, Info, LoaderCircle } from "lucide-react";
+import {
+  AlertCircle,
+  Check,
+  CheckCircle2,
+  Copy,
+  Info,
+  LoaderCircle,
+} from "lucide-react";
 import { Button } from "@/shared/ui/button";
 import { Input } from "@/shared/ui/input";
 import { SettingsSectionHeader } from "@/features/settings/ui/SettingsSectionHeader";
 import { cn } from "@/shared/lib/cn";
+import { copyTextToClipboard } from "@/shared/lib/clipboard";
 import {
   getAdminOrigin,
   probeAdminOrigin,
@@ -31,6 +41,64 @@ import { AdminConsolePanel } from "./AdminConsolePanel";
 import { useIdentityQuery } from "@/shared/api/hooks";
 
 // ── Probe state → UI copy ─────────────────────────────────────────────────
+
+// ── DeniedBadge — copy-icon button for the pubkey ─────────────────────────
+
+function DeniedBadge({ pubkeyHex }: { pubkeyHex: string }) {
+  const [copied, setCopied] = useState(false);
+  const resetTimer = useRef<number | undefined>(undefined);
+  useEffect(() => () => window.clearTimeout(resetTimer.current), []);
+
+  return (
+    <span className="flex flex-col gap-1 text-xs text-destructive">
+      <span className="flex items-center gap-1.5">
+        <AlertCircle className="h-3.5 w-3.5 shrink-0" />
+        Access denied
+      </span>
+      <span className="text-muted-foreground">
+        Your pubkey is not in{" "}
+        <code className="font-mono">BUZZ_ADMIN_PUBKEYS</code>. Ask your relay
+        operator to add:
+      </span>
+      <span className="flex min-w-0 items-center gap-1.5 rounded bg-muted px-1.5 py-0.5">
+        <code
+          className="min-w-0 flex-1 break-all font-mono text-xs"
+          data-testid="admin-denied-pubkey"
+        >
+          {pubkeyHex}
+        </code>
+        <Button
+          aria-label="Copy pubkey"
+          data-testid="admin-denied-pubkey-copy"
+          onClick={() => {
+            copyTextToClipboard(pubkeyHex, "Pubkey copied");
+            setCopied(true);
+            window.clearTimeout(resetTimer.current);
+            resetTimer.current = window.setTimeout(
+              () => setCopied(false),
+              1500,
+            );
+          }}
+          size="icon-xs"
+          type="button"
+          variant="ghost"
+        >
+          {copied ? (
+            <Check className="h-3.5 w-3.5" />
+          ) : (
+            <Copy className="h-3.5 w-3.5" />
+          )}
+        </Button>
+      </span>
+      <span className="text-muted-foreground">
+        Other possible causes: clock skew &gt; 60 s, relay config mismatch, or
+        the relay is running{" "}
+        <code className="font-mono">BUZZ_ADMIN_AUTH=token</code> instead of{" "}
+        <code className="font-mono">nip98</code>.
+      </span>
+    </span>
+  );
+}
 
 type ProbeUiState =
   | { kind: "idle" }
@@ -62,31 +130,7 @@ function ProbeStatusBadge({ uiState }: { uiState: ProbeUiState }) {
     );
   }
   if (uiState.kind === "denied") {
-    return (
-      <span className="flex flex-col gap-1 text-xs text-destructive">
-        <span className="flex items-center gap-1.5">
-          <AlertCircle className="h-3.5 w-3.5 shrink-0" />
-          Access denied
-        </span>
-        <span className="text-muted-foreground">
-          Your pubkey is not in{" "}
-          <code className="font-mono">BUZZ_ADMIN_PUBKEYS</code>. Ask your relay
-          operator to add:
-        </span>
-        <code
-          className="cursor-pointer select-all break-all rounded bg-muted px-1.5 py-0.5 font-mono text-xs hover:bg-muted/80"
-          title="Click to select all"
-        >
-          {uiState.pubkeyHex}
-        </code>
-        <span className="text-muted-foreground">
-          Other possible causes: clock skew &gt; 60 s, relay config mismatch, or
-          the relay is running{" "}
-          <code className="font-mono">BUZZ_ADMIN_AUTH=token</code> instead of{" "}
-          <code className="font-mono">nip98</code>.
-        </span>
-      </span>
-    );
+    return <DeniedBadge pubkeyHex={uiState.pubkeyHex} />;
   }
   if (uiState.kind === "tokenMode") {
     return (
@@ -320,8 +364,9 @@ function AdminConsoleSettingsSession({ pubkeyHex }: { pubkeyHex: string }) {
   }
 
   const inputChanged = originInput.trim() !== (savedOrigin ?? "");
-  const isAuthorized =
-    probeUiState.kind === "authorized" && savedOrigin !== null;
+  const isPanelVisible =
+    (probeUiState.kind === "authorized" || probeUiState.kind === "disabled") &&
+    savedOrigin !== null;
 
   return (
     <>
@@ -384,7 +429,7 @@ function AdminConsoleSettingsSession({ pubkeyHex }: { pubkeyHex: string }) {
         </div>
       </div>
 
-      {isAuthorized && savedOrigin && (
+      {isPanelVisible && savedOrigin && (
         <AdminConsolePanel origin={savedOrigin} pubkey={pubkeyHex} />
       )}
     </>

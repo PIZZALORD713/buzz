@@ -469,35 +469,20 @@ test("detail-navigation: stale detail result is discarded after navigating away"
 test("attachment-unmount: late blob URL is revoked and not committed after panel generation changes", async () => {
   // Verifies AttachmentViewer's loadGenRef cleanup and per-load generation guard.
   //
-  // Scenario:
+  // Scenario comments updated for auto-load behavior:
   //  1. Panel renders; Feedback tab clicked; list+detail resolve immediately.
-  //  2. "View attachment" button appears; user clicks it — load starts:
-  //     thisGen = ++loadGenRef.current = 1.  Fetch is deferred (pending).
+  //  2. "View attachment" button appears (non-image mime, no auto-load); user
+  //     clicks it — load starts: thisGen = ++loadGenRef.current = 1. Fetch deferred.
   //  3. Re-render with new origin/pubkey bumps panelGeneration →
-  //     AttachmentViewer cleanup: loadGenRef.current += 1 = 2.  originRef and
+  //     AttachmentViewer cleanup: loadGenRef.current += 1 = 2. originRef and
   //     pubkeyRef also update to the new values.
   //  4. Attachment resolves: thisGen(1) !== loadGenRef.current(2) (and also
   //     thisOrigin !== originRef.current) — URL.revokeObjectURL called,
   //     setBlobUrl NOT called.
   //
-  // Fails if loadGenRef.current is NOT incremented in the cleanup: loadGenRef
-  // stays at 1 after cleanup; the new load increments to 2 (thisGen2=2).  The
-  // stale load still has thisGen(1) !== loadGenRef(2) — caught by the new-load
-  // counter.  BUT: if there is NO new load (i.e. the new panel renders without
-  // loading the attachment), loadGenRef stays at 1 after cleanup; the stale
-  // load sees thisGen(1) == loadGenRef(1) — NOT caught without the mutation!
-  //
-  // Key: after the re-render, the new AttachmentViewer is freshly mounted
-  // (new origin/pubkey = new key or props); it has NOT started a load yet
-  // because the user hasn't clicked "View attachment" in the new context.
-  // So loadGenRef resets to 0 on the new instance.  The stale load uses a
-  // SEPARATE instance's loadGenRef via ref capture — but actually, since
-  // AttachmentViewer unmounts on re-render (origin/pubkey change), its ref
-  // is gone.  The check uses the ref captured in the closure:
-  //   if (thisGen !== loadGenRef.current ...)
-  // loadGenRef.current is 1 (incremented in cleanup) and thisGen is 1 (pre-
-  // cleanup), so without the cleanup increment: 1 !== 1 is FALSE → blob committed.
-  // With the cleanup increment: loadGenRef.current becomes 2, so 1 !== 2 → revoke.
+  // Uses application/pdf (non-image) so the attachment doesn't auto-load on
+  // mount — the load is triggered by the "View attachment" button click, keeping
+  // the scenario identical to the original test design.
 
   const origin = "https://admin.example.com";
   const pubkey = "a".repeat(64);
@@ -511,7 +496,7 @@ test("attachment-unmount: late blob URL is revoked and not committed after panel
       [
         "imeta",
         `url https://relay.example.com/files/${sha256}`,
-        "m image/png",
+        "m application/pdf",
         `x ${sha256}`,
         "size 1000",
       ],
@@ -553,30 +538,23 @@ test("attachment-unmount: late blob URL is revoked and not committed after panel
     await new Promise((r) => setTimeout(r, 30));
   });
 
-  // Navigate to feedback detail, then click "View attachment" to start the load.
+  // Navigate to feedback detail, then wait for the auto-load to start.
+  // Image attachments now auto-load on AttachmentViewer mount — no "View
+  // attachment" click required; the load kicks off as soon as FeedbackDetail
+  // renders the AttachmentViewer.
   let startedAttachmentLoad = false;
   const allBtns = container.querySelectorAll("button");
   for (const btn of allBtns) {
     const testid = btn.getAttribute("data-testid") ?? "";
     if (testid.startsWith("admin-tab")) continue;
-    const btnText = btn.textContent ?? "";
-    if (btnText.includes("View attachment")) {
-      // Already at attachment button — start the load.
-      await act(async () => {
-        fireEvent.click(btn);
-        await new Promise((r) => setTimeout(r, 0));
-      });
-      startedAttachmentLoad = true;
-      break;
-    }
     // Click feedback item to navigate to detail.
     await act(async () => {
       fireEvent.click(btn);
       await new Promise((r) => setTimeout(r, 30));
     });
-    // Find "View attachment" in detail and click it.
-    const btnsAfterNav = container.querySelectorAll("button");
-    for (const b of btnsAfterNav) {
+    // For non-image MIME (application/pdf), a "View attachment" button appears.
+    // Click it to start the load.
+    for (const b of container.querySelectorAll("button")) {
       if ((b.textContent ?? "").includes("View attachment")) {
         await act(async () => {
           fireEvent.click(b);
@@ -591,7 +569,7 @@ test("attachment-unmount: late blob URL is revoked and not committed after panel
 
   assert.ok(
     startedAttachmentLoad,
-    '"View attachment" button must be found and clicked',
+    '"View attachment" button must be found and clicked for non-image attachment',
   );
 
   // Attachment fetch is in-flight (deferred). Change origin/pubkey to bump
@@ -707,33 +685,18 @@ test("blob-leak-on-back-navigation: loadGenRef cleanup prevents orphaned blob UR
     await new Promise((r) => setTimeout(r, 30));
   });
 
-  // Navigate to feedback detail.
+  // Navigate to feedback detail. Image attachments auto-load on mount,
+  // so navigating to the detail starts the load immediately — no "View
+  // attachment" click needed.
   let navigatedToDetail = false;
   for (const btn of container.querySelectorAll("button")) {
     const testid = btn.getAttribute("data-testid") ?? "";
     if (testid.startsWith("admin-tab")) continue;
-    if ((btn.textContent ?? "").includes("View attachment")) {
-      await act(async () => {
-        fireEvent.click(btn);
-        await new Promise((r) => setTimeout(r, 0));
-      });
-      navigatedToDetail = true;
-      break;
-    }
     await act(async () => {
       fireEvent.click(btn);
       await new Promise((r) => setTimeout(r, 30));
     });
-    for (const b of container.querySelectorAll("button")) {
-      if ((b.textContent ?? "").includes("View attachment")) {
-        await act(async () => {
-          fireEvent.click(b);
-          await new Promise((r) => setTimeout(r, 0));
-        });
-        navigatedToDetail = true;
-        break;
-      }
-    }
+    navigatedToDetail = true;
     break;
   }
   assert.ok(
@@ -939,9 +902,8 @@ test("strict-mode-save: probe fires after save under React.StrictMode double-mou
   // starts — so the fence is re-armed per save, not per mount.
   //
   // Fails if the unmount-cleanup effect is removed (isMountedRef variant or no
-  // fence): after StrictMode double-mount, handleSave continuation is either
-  // permanently blocked (isMountedRef=false) or the cross-identity stale probe
-  // from assertion (d) in cross-identity-delayed-save fires.
+  // fence): after StrictMode double-mount, handleSave continuation is
+  // permanently blocked (isMountedRef=false), so probeOrigins stays empty.
 
   const pubkey = "c".repeat(64);
   const savedOrigin = "https://admin-strict.example.com";
@@ -1018,4 +980,148 @@ test("strict-mode-save: probe fires after save under React.StrictMode double-mou
     root.unmount();
   });
   document.body.removeChild(container);
+});
+
+// ── structured detail layouts ────────────────────────────────────────────────
+
+test("report-detail-renders-structured-fields: ReportDetail shows field layout, not raw JSON", async () => {
+  // Verifies item 3: the report detail view renders data-testid='report-detail-fields'
+  // and the status value, not a raw JSON <pre>.
+  // Lives here (jsdom) because navigating into a detail requires fireEvent.click
+  // for React 19's container-level event delegation.
+  //
+  // Mutation evidence: revert ReportFields → <pre>{JSON.stringify(...)}</pre>
+  // → this test goes red ("report-detail-fields element must render").
+
+  const origin = "https://admin.example.com";
+  const pubkey = "5".repeat(64);
+
+  const reportItem = {
+    id: "00000000-0000-0000-0000-000000000099",
+    communityId: "00000000-0000-0000-0000-000000000002",
+    communityHost: "relay.example.com",
+    reportEventId: "aabb",
+    reporterPubkey: "ccdd",
+    targetKind: "message",
+    target: "eeff",
+    reportType: "spam",
+    status: "open",
+    createdAt: "2024-06-01T12:00:00Z",
+  };
+
+  setIpcHandler("admin_list_reports", () => Promise.resolve([reportItem]));
+  setIpcHandler("admin_get_report", () => Promise.resolve(reportItem));
+  setIpcHandler("admin_list_feedback", () => Promise.resolve([]));
+
+  const { container, doRender, unmount } = mountPanel({ origin, pubkey });
+  await doRender();
+  await settle(30);
+
+  // Navigate into the report detail — click the first non-tab button.
+  const allButtons = container.querySelectorAll("button");
+  for (const btn of allButtons) {
+    const testid = btn.getAttribute("data-testid") ?? "";
+    if (testid.startsWith("admin-tab")) continue;
+    await act(async () => {
+      fireEvent.click(btn);
+      await new Promise((r) => setTimeout(r, 30));
+    });
+    break;
+  }
+
+  await settle(30);
+
+  const fields = container.querySelector(
+    "[data-testid='report-detail-fields']",
+  );
+  assert.ok(
+    fields !== null,
+    "report-detail-fields element must render — JSON dump not replaced",
+  );
+
+  // The status value should be visible, not buried in raw JSON.
+  const text = container.textContent ?? "";
+  assert.ok(
+    text.includes("open"),
+    `report status 'open' must appear in structured layout; got: ${text.slice(0, 400)}`,
+  );
+
+  // Must NOT be rendering JSON.stringify output (e.g. key-colon pairs).
+  assert.ok(
+    !text.includes('"status": "open"'),
+    `raw JSON must not be rendered in report detail; got: ${text.slice(0, 400)}`,
+  );
+
+  await unmount();
+});
+
+test("feedback-detail-renders-structured-fields: FeedbackDetail shows field layout, not raw JSON", async () => {
+  // Verifies item 3: the feedback detail view renders data-testid='feedback-detail-fields'.
+  // Lives here (jsdom) because tab switching and item navigation require fireEvent.click.
+  //
+  // Mutation evidence: revert FeedbackFields → <pre>{JSON.stringify(...)}</pre>
+  // → this test goes red ("feedback-detail-fields element must render").
+
+  const origin = "https://admin.example.com";
+  const pubkey = "6".repeat(64);
+
+  const feedbackItem = {
+    id: "00000000-0000-0000-0000-000000000011",
+    bodySummary: "App crashes on startup",
+    body: "App crashes on startup",
+    receivedAt: 1700000000,
+    appVersion: "1.2.3",
+    platform: "macOS",
+    tags: [],
+  };
+
+  setIpcHandler("admin_list_reports", () => Promise.resolve([]));
+  setIpcHandler("admin_list_feedback", () => Promise.resolve([feedbackItem]));
+  setIpcHandler("admin_get_feedback", () => Promise.resolve(feedbackItem));
+
+  const { container, doRender, unmount } = mountPanel({ origin, pubkey });
+  await doRender();
+  await settle(30);
+
+  // Click the Feedback tab.
+  const feedbackTab = container.querySelector(
+    "[data-testid='admin-tab-feedback']",
+  );
+  assert.ok(feedbackTab, "Feedback tab must be present");
+  await act(async () => {
+    fireEvent.click(feedbackTab);
+    await new Promise((r) => setTimeout(r, 30));
+  });
+
+  await settle(30);
+
+  // Navigate into the feedback detail — click the first non-tab button.
+  const allButtons = container.querySelectorAll("button");
+  for (const btn of allButtons) {
+    const testid = btn.getAttribute("data-testid") ?? "";
+    if (testid.startsWith("admin-tab")) continue;
+    await act(async () => {
+      fireEvent.click(btn);
+      await new Promise((r) => setTimeout(r, 30));
+    });
+    break;
+  }
+
+  await settle(30);
+
+  const fields = container.querySelector(
+    "[data-testid='feedback-detail-fields']",
+  );
+  assert.ok(
+    fields !== null,
+    "feedback-detail-fields element must render — JSON dump not replaced",
+  );
+
+  const text = container.textContent ?? "";
+  assert.ok(
+    !text.includes('"body":'),
+    `raw JSON must not be rendered in feedback detail; got: ${text.slice(0, 400)}`,
+  );
+
+  await unmount();
 });

@@ -1,5 +1,6 @@
 /**
- * Main admin console panel — renders when probe state is `nip98Authorized`.
+ * Main admin console panel — renders when probe state is `nip98Authorized` or
+ * `disabled`.
  *
  * Shows two tabs: Reports (deployment-wide moderation reports) and Feedback
  * (product feedback with optional image attachments).
@@ -23,6 +24,7 @@ import {
   ShieldAlert,
 } from "lucide-react";
 import { Button } from "@/shared/ui/button";
+import { Badge } from "@/shared/ui/badge";
 import { cn } from "@/shared/lib/cn";
 import {
   fetchAdminAttachmentBlobUrl,
@@ -84,6 +86,57 @@ function useAsyncLoad<T>(
   }, [...deps, generation]);
 
   return state;
+}
+
+// ── Structured detail helpers ────────────────────────────────────────────
+
+/** One label/value row in a detail view. Null/empty values render as "—". */
+function DetailRow({
+  label,
+  value,
+  mono = false,
+}: {
+  label: string;
+  value: string | null | undefined;
+  mono?: boolean;
+}) {
+  const display = value != null && value !== "" ? value : "—";
+  return (
+    <div className="grid grid-cols-[9rem_1fr] gap-x-3 gap-y-0.5 text-xs">
+      <span className="font-medium text-muted-foreground">{label}</span>
+      <span className={cn("break-all", mono && "font-mono")}>{display}</span>
+    </div>
+  );
+}
+
+function formatTimestamp(raw: string | number | null | undefined): string {
+  if (raw == null) return "—";
+  // Unix epoch (number or numeric string) → ms; ISO string → Date directly.
+  const n = typeof raw === "number" ? raw : Number(raw);
+  const date =
+    Number.isFinite(n) && n > 1e9 ? new Date(n * 1000) : new Date(String(raw));
+  if (Number.isNaN(date.getTime())) return String(raw);
+  return date.toLocaleString(undefined, {
+    month: "short",
+    day: "numeric",
+    year: "numeric",
+    hour: "numeric",
+    minute: "2-digit",
+  });
+}
+
+function statusVariant(
+  status: string,
+): "success" | "warning" | "secondary" | "outline" {
+  switch (status.toLowerCase()) {
+    case "open":
+      return "warning";
+    case "resolved":
+    case "dismissed":
+      return "success";
+    default:
+      return "secondary";
+  }
 }
 
 // ── imeta attachment parsing ──────────────────────────────────────────────
@@ -214,6 +267,50 @@ function ReportsTab({
   );
 }
 
+function ReportFields({ data }: { data: Record<string, unknown> }) {
+  const str = (k: string) => {
+    const v = data[k];
+    return v != null && v !== "" ? String(v) : null;
+  };
+  const status = str("status") ?? "";
+  return (
+    <div
+      className="space-y-1.5 rounded-md border border-border/60 px-3 py-2.5"
+      data-testid="report-detail-fields"
+    >
+      <div className="mb-2 flex flex-wrap items-center gap-2">
+        {status && <Badge variant={statusVariant(status)}>{status}</Badge>}
+        {str("reportType") && (
+          <Badge variant="outline">{str("reportType")}</Badge>
+        )}
+      </div>
+      <DetailRow label="ID" value={str("id")} mono />
+      <DetailRow label="Community" value={str("communityId")} mono />
+      <DetailRow label="Host" value={str("communityHost")} />
+      <DetailRow label="Event ID" value={str("reportEventId")} mono />
+      <DetailRow label="Reporter" value={str("reporterPubkey")} mono />
+      <DetailRow label="Target kind" value={str("targetKind")} />
+      <DetailRow label="Target" value={str("target")} mono />
+      <DetailRow label="Reason" value={str("reason")} />
+      <DetailRow label="Moderator" value={str("moderatorPubkey")} mono />
+      <DetailRow label="Action" value={str("moderationAction")} />
+      <DetailRow label="Note" value={str("moderationNote")} />
+      <DetailRow
+        label="Created"
+        value={formatTimestamp(
+          data.createdAt as string | number | null | undefined,
+        )}
+      />
+      <DetailRow
+        label="Updated"
+        value={formatTimestamp(
+          data.updatedAt as string | number | null | undefined,
+        )}
+      />
+    </div>
+  );
+}
+
 function ReportDetail({
   origin,
   pubkey,
@@ -248,9 +345,7 @@ function ReportDetail({
         <ErrorMessage message={detailState.message} />
       )}
       {detailState.status === "ok" && (
-        <pre className="overflow-x-auto rounded-md bg-muted p-3 text-xs">
-          {JSON.stringify(detailState.data, null, 2)}
-        </pre>
+        <ReportFields data={detailState.data as Record<string, unknown>} />
       )}
     </div>
   );
@@ -420,6 +515,17 @@ function AttachmentViewer({
     attachment.size,
   ]);
 
+  // Auto-load image/* attachments immediately on mount — no button click needed.
+  // Routes through the same `load` callback (generation fence, SSRF guard,
+  // revoke-on-cleanup), so the existing blob-leak tests remain valid and cover
+  // the auto-load path.
+  // biome-ignore lint/correctness/useExhaustiveDependencies: load is a stable useCallback; attachment.mime is a mount-time constant — auto-load fires once per mount
+  useEffect(() => {
+    if (attachment.mime.startsWith("image/")) {
+      void load();
+    }
+  }, []); // Empty: fires once on mount; identity boundary and generation fence handle context changes.
+
   if (error) {
     const friendlyError: Record<string, string> = {
       admin_attachment_too_large: "Attachment exceeds the 10 MiB desktop cap.",
@@ -438,6 +544,17 @@ function AttachmentViewer({
   }
 
   if (!blobUrl) {
+    // For image/* types the load is triggered automatically on mount.
+    // Show only a spinner while in-flight; the "View attachment" button is
+    // for non-image MIME types where the user opts in to loading.
+    if (attachment.mime.startsWith("image/") || loading) {
+      return (
+        <div className="flex items-center gap-1.5 text-xs text-muted-foreground">
+          <LoaderCircle className="h-3.5 w-3.5 animate-spin" />
+          Loading…
+        </div>
+      );
+    }
     return (
       <Button
         className="gap-1.5"
@@ -447,12 +564,8 @@ function AttachmentViewer({
         type="button"
         variant="outline"
       >
-        {loading ? (
-          <LoaderCircle className="h-3.5 w-3.5 animate-spin" />
-        ) : (
-          <Download className="h-3.5 w-3.5" />
-        )}
-        {loading ? "Loading…" : `View attachment (${attachment.mime})`}
+        <Download className="h-3.5 w-3.5" />
+        {`View attachment (${attachment.mime})`}
       </Button>
     );
   }
@@ -476,6 +589,37 @@ function AttachmentViewer({
       <Download className="h-3.5 w-3.5" />
       Download attachment ({attachment.mime})
     </a>
+  );
+}
+
+function FeedbackFields({ data }: { data: Record<string, unknown> }) {
+  const str = (k: string) => {
+    const v = data[k];
+    return v != null && v !== "" ? String(v) : null;
+  };
+  return (
+    <div
+      className="space-y-1.5 rounded-md border border-border/60 px-3 py-2.5"
+      data-testid="feedback-detail-fields"
+    >
+      <DetailRow label="ID" value={str("id")} mono />
+      <DetailRow label="Body" value={str("body") ?? str("bodySummary")} />
+      <DetailRow label="App version" value={str("appVersion")} />
+      <DetailRow label="Platform" value={str("platform")} />
+      <DetailRow label="Author" value={str("authorPubkey")} mono />
+      <DetailRow
+        label="Received"
+        value={formatTimestamp(
+          data.receivedAt as string | number | null | undefined,
+        )}
+      />
+      <DetailRow
+        label="Event created"
+        value={formatTimestamp(
+          data.eventCreatedAt as string | number | null | undefined,
+        )}
+      />
+    </div>
   );
 }
 
@@ -523,9 +667,7 @@ function FeedbackDetail({
       )}
       {detailState.status === "ok" && (
         <>
-          <pre className="overflow-x-auto rounded-md bg-muted p-3 text-xs">
-            {JSON.stringify(detailState.data, null, 2)}
-          </pre>
+          <FeedbackFields data={detailState.data as Record<string, unknown>} />
           {attachments.length > 0 && (
             <div className="space-y-3">
               <h4 className="text-sm font-medium">Attachments</h4>
