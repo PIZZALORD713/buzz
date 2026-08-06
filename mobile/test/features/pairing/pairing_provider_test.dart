@@ -196,6 +196,7 @@ void main() {
       late PairingNotifier notifier;
       late String recoveryCode;
       late _FakeSensitiveActionAuthorizer authorizer;
+      late DateTime now;
 
       setUp(() async {
         final source = nostr.Keys(sourceSecret);
@@ -204,6 +205,7 @@ void main() {
             '?secret=$sessionSecretHex'
             '&relay=wss%3A%2F%2Fpairing.buzz.xyz&v=1&mode=recover';
         authorizer = _FakeSensitiveActionAuthorizer();
+        now = DateTime.utc(2026, 8, 6);
         notifier = PairingNotifier(
           socketFactory:
               ({
@@ -226,6 +228,7 @@ void main() {
             relayConfigProvider.overrideWith(_RecoveryRelayConfig.new),
             authProvider.overrideWith(_ProtectedRecoveryAuthNotifier.new),
             sensitiveActionAuthorizerProvider.overrideWithValue(authorizer),
+            appLockClockProvider.overrideWithValue(() => now),
           ],
         );
         container.read(pairingProvider);
@@ -284,6 +287,29 @@ void main() {
             message: {'type': 'complete', 'success': true},
           );
           expect(container.read(pairingProvider).status, PairingStatus.success);
+        },
+      );
+
+      test(
+        'expired recovery authorization reauthenticates before transfer',
+        () async {
+          expect(await notifier.authorizeIdentityExport(), isTrue);
+          await notifier.pair(recoveryCode);
+          now = now.add(identityExportAuthorizationTtl);
+          notifier.confirmSas();
+          socket.sendSourceMessage(
+            sourceSecret: sourceSecret,
+            sessionSecretHex: sessionSecretHex,
+            message: {'type': 'sas-confirm'},
+            includeTranscriptHash: true,
+          );
+          await Future<void>.delayed(Duration.zero);
+
+          expect(authorizer.calls, 2);
+          expect(
+            container.read(pairingProvider).status,
+            PairingStatus.transferring,
+          );
         },
       );
 

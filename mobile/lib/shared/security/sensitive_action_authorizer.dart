@@ -90,11 +90,25 @@ class SensitiveActionAuthorizationSession {
   final DateTime Function() _now;
 
   DateTime? lastSuccessfulAt;
+  Future<DeviceAuthResult>? _authorizationInFlight;
+
+  bool get isAuthorizing => _authorizationInFlight != null;
 
   Future<DeviceAuthResult> authorize() async {
-    final result = await _authorizer.authorizeIdentityAction();
-    if (result == DeviceAuthResult.success) lastSuccessfulAt = _now();
-    return result;
+    final inFlight = _authorizationInFlight;
+    if (inFlight != null) return inFlight;
+
+    final authorization = _authorizer.authorizeIdentityAction();
+    _authorizationInFlight = authorization;
+    try {
+      final result = await authorization;
+      if (result == DeviceAuthResult.success) lastSuccessfulAt = _now();
+      return result;
+    } finally {
+      if (identical(_authorizationInFlight, authorization)) {
+        _authorizationInFlight = null;
+      }
+    }
   }
 
   bool wasAuthorizedWithin(Duration duration) {

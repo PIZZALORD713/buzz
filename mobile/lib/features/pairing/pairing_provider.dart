@@ -82,6 +82,8 @@ typedef PairingSocketFactory =
       required void Function(Object? error) onDisconnected,
     });
 
+const identityExportAuthorizationTtl = Duration(minutes: 2);
+
 class PairingNotifier extends Notifier<PairingState> {
   final PairingSocketFactory _socketFactory;
   PairingSocket? _socket;
@@ -123,17 +125,6 @@ class PairingNotifier extends Notifier<PairingState> {
   Future<bool> authorizeIdentityExport() async {
     if (state.authorizationInProgress) return false;
 
-    final activePolicy = (await ref.read(
-      authProvider.future,
-    )).community?.sensitiveActionPolicy;
-    if (activePolicy != SensitiveActionPolicy.enabled) {
-      state = state.copyWith(
-        errorMessage:
-            'Turn on biometric protection before sending your identity.',
-      );
-      return false;
-    }
-
     state = state.copyWith(
       authorizationInProgress: true,
       clearErrorMessage: true,
@@ -149,7 +140,7 @@ class PairingNotifier extends Notifier<PairingState> {
       return false;
     }
 
-    _identityExportAuthorized = true;
+    _identityExportAuthorizedAt = ref.read(appLockClockProvider)();
     state = state.copyWith(authorizationInProgress: false);
     return true;
   }
@@ -182,8 +173,13 @@ class PairingNotifier extends Notifier<PairingState> {
       return;
     }
 
+    final authorizedAt = _identityExportAuthorizedAt;
+    final hasFreshExportAuthorization =
+        authorizedAt != null &&
+        ref.read(appLockClockProvider)().difference(authorizedAt) <
+            identityExportAuthorizationTtl;
     final requiresAuthorization = _sendIdentityToSource
-        ? !_identityExportAuthorized
+        ? !hasFreshExportAuthorization
         : state.protectImportedIdentity;
 
     if (requiresAuthorization) {
@@ -258,7 +254,7 @@ class PairingNotifier extends Notifier<PairingState> {
     _userConfirmedSas = false;
     _pendingPayload = null;
     _sendIdentityToSource = false;
-    _identityExportAuthorized = false;
+    _identityExportAuthorizedAt = null;
   }
 
   // ── NIP-AB pairing flow ─────────────────────────────────────────────────
@@ -274,7 +270,7 @@ class PairingNotifier extends Notifier<PairingState> {
   bool _sasConfirmReceived = false;
   bool _userConfirmedSas = false;
   bool _sendIdentityToSource = false;
-  bool _identityExportAuthorized = false;
+  DateTime? _identityExportAuthorizedAt;
   Map<String, dynamic>? _pendingPayload; // buffered until user confirms SAS
   final Set<String> _processedEventIds = {}; // NIP-AB §Duplicate Event Handling
 
@@ -721,6 +717,19 @@ class PairingNotifier extends Notifier<PairingState> {
 
     try {
       final community = _parseLegacyInput(rawInput);
+      if (community.nsec == null || community.nsec!.isEmpty) {
+        throw const FormatException('Pairing payload missing nsec');
+      }
+      final authorization = await ref
+          .read(sensitiveActionAuthorizationSessionProvider)
+          .authorize();
+      if (authorization != DeviceAuthResult.success) {
+        state = PairingState(
+          status: PairingStatus.error,
+          errorMessage: _authorizationError(authorization),
+        );
+        return;
+      }
 
       await _validateCredentials(
         relayUrl: community.relayUrl,
@@ -804,6 +813,7 @@ class PairingNotifier extends Notifier<PairingState> {
       relayUrl: relayUrl,
       pubkey: decoded['pubkey'] as String?,
       nsec: decoded['nsec'] as String?,
+      sensitiveActionPolicy: SensitiveActionPolicy.enabled,
     );
   }
 
