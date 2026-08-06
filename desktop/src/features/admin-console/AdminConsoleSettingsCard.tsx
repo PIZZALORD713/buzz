@@ -12,9 +12,10 @@
  * origin, and panel are torn down at the render level — not in a passive effect.
  *
  * Renders the full admin panel when probe state is `nip98Authorized` or
- * `disabled`. The `disabled` state means the relay serves the admin API without
- * any credential — the panel works the same way, just without NIP-98 signing.
- * All other states surface honest, actionable copy without false hope.
+ * `disabled`. The `disabled` state means the relay does not require or
+ * validate a credential on the admin API — the desktop still signs outgoing
+ * requests, but the relay accepts them unconditionally. The panel works the
+ * same way in both states.
  */
 
 import { useEffect, useRef, useState } from "react";

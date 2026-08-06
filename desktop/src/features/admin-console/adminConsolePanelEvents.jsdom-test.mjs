@@ -490,8 +490,12 @@ test("attachment-unmount: late blob URL is revoked and not committed after panel
 
   const feedbackItem = {
     id: "00000000-0000-0000-0000-000000000011",
-    bodySummary: "Test feedback",
-    receivedAt: 1700000000,
+    communityId: "00000000-0000-0000-0000-000000000022",
+    communityHost: "relay.example.com",
+    eventId: "attachtest001",
+    submitterPubkey: "submitterattach001",
+    category: null,
+    body: "Test feedback",
     tags: [
       [
         "imeta",
@@ -501,6 +505,8 @@ test("attachment-unmount: late blob URL is revoked and not committed after panel
         "size 1000",
       ],
     ],
+    eventCreatedAt: "2024-01-01T00:00:00Z",
+    receivedAt: "2024-01-01T00:00:01Z",
   };
 
   setIpcHandler("admin_list_reports", () => Promise.resolve([]));
@@ -637,8 +643,12 @@ test("blob-leak-on-back-navigation: loadGenRef cleanup prevents orphaned blob UR
 
   const feedbackItem = {
     id: "00000000-0000-0000-0000-000000000011",
-    bodySummary: "Test feedback",
-    receivedAt: 1700000000,
+    communityId: "00000000-0000-0000-0000-000000000022",
+    communityHost: "relay.example.com",
+    eventId: "blobtest001",
+    submitterPubkey: "submitterblobtest001",
+    category: null,
+    body: "Test feedback",
     tags: [
       [
         "imeta",
@@ -648,6 +658,8 @@ test("blob-leak-on-back-navigation: loadGenRef cleanup prevents orphaned blob UR
         "size 1000",
       ],
     ],
+    eventCreatedAt: "2024-01-01T00:00:00Z",
+    receivedAt: "2024-01-01T00:00:01Z",
   };
 
   setIpcHandler("admin_list_reports", () => Promise.resolve([]));
@@ -1009,8 +1021,24 @@ test("report-detail-renders-structured-fields: ReportDetail shows field layout, 
     createdAt: "2024-06-01T12:00:00Z",
   };
 
+  // Full AdminReportDetailDto: includes note, resolvedBy, and a nested message.
+  const reportDetail = {
+    ...reportItem,
+    channelId: "00000000-0000-0000-0000-000000000003",
+    note: "private moderator note",
+    resolvedBy: null,
+    resolvedAt: null,
+    actionId: null,
+    message: {
+      authorPubkey: "aabbccdd",
+      content: "offensive message text",
+      createdAt: "2024-05-31T10:00:00Z",
+      deletedAt: null,
+    },
+  };
+
   setIpcHandler("admin_list_reports", () => Promise.resolve([reportItem]));
-  setIpcHandler("admin_get_report", () => Promise.resolve(reportItem));
+  setIpcHandler("admin_get_report", () => Promise.resolve(reportDetail));
   setIpcHandler("admin_list_feedback", () => Promise.resolve([]));
 
   const { container, doRender, unmount } = mountPanel({ origin, pubkey });
@@ -1039,7 +1067,6 @@ test("report-detail-renders-structured-fields: ReportDetail shows field layout, 
     "report-detail-fields element must render — JSON dump not replaced",
   );
 
-  // The status value should be visible, not buried in raw JSON.
   const text = container.textContent ?? "";
   assert.ok(
     text.includes("open"),
@@ -1050,6 +1077,30 @@ test("report-detail-renders-structured-fields: ReportDetail shows field layout, 
   assert.ok(
     !text.includes('"status": "open"'),
     `raw JSON must not be rendered in report detail; got: ${text.slice(0, 400)}`,
+  );
+
+  // Real DTO fields: note and nested message content must appear.
+  assert.ok(
+    text.includes("private moderator note"),
+    `report note must render; got: ${text.slice(0, 600)}`,
+  );
+  assert.ok(
+    text.includes("offensive message text"),
+    `nested message content must render; got: ${text.slice(0, 600)}`,
+  );
+  assert.ok(
+    text.includes("aabbccdd"),
+    `nested message authorPubkey must render; got: ${text.slice(0, 600)}`,
+  );
+
+  // Fake fields must NOT appear.
+  assert.ok(
+    !text.includes("reason"),
+    `invented 'reason' field must not render; got: ${text.slice(0, 400)}`,
+  );
+  assert.ok(
+    !text.includes("moderationNote"),
+    `invented 'moderationNote' field must not render; got: ${text.slice(0, 400)}`,
   );
 
   await unmount();
@@ -1065,14 +1116,18 @@ test("feedback-detail-renders-structured-fields: FeedbackDetail shows field layo
   const origin = "https://admin.example.com";
   const pubkey = "6".repeat(64);
 
+  // Full AdminFeedbackDto shape — contract-accurate field names.
   const feedbackItem = {
     id: "00000000-0000-0000-0000-000000000011",
-    bodySummary: "App crashes on startup",
+    communityId: "00000000-0000-0000-0000-000000000022",
+    communityHost: "relay.example.com",
+    eventId: "feedevent001",
+    submitterPubkey: "submitter001pubkey",
+    category: "bug",
     body: "App crashes on startup",
-    receivedAt: 1700000000,
-    appVersion: "1.2.3",
-    platform: "macOS",
     tags: [],
+    eventCreatedAt: "2024-05-01T09:00:00Z",
+    receivedAt: "2024-05-01T09:00:05Z",
   };
 
   setIpcHandler("admin_list_reports", () => Promise.resolve([]));
@@ -1121,6 +1176,260 @@ test("feedback-detail-renders-structured-fields: FeedbackDetail shows field layo
   assert.ok(
     !text.includes('"body":'),
     `raw JSON must not be rendered in feedback detail; got: ${text.slice(0, 400)}`,
+  );
+
+  // Real DTO fields must render.
+  assert.ok(
+    text.includes("submitter001pubkey"),
+    `submitterPubkey must render; got: ${text.slice(0, 600)}`,
+  );
+  assert.ok(
+    text.includes("bug"),
+    `category must render; got: ${text.slice(0, 600)}`,
+  );
+  assert.ok(
+    text.includes("App crashes on startup"),
+    `body must render; got: ${text.slice(0, 600)}`,
+  );
+
+  // Fake fields must NOT appear.
+  assert.ok(
+    !text.includes("appVersion"),
+    `invented 'appVersion' field must not render; got: ${text.slice(0, 400)}`,
+  );
+  assert.ok(
+    !text.includes("authorPubkey"),
+    `invented 'authorPubkey' field must not render; got: ${text.slice(0, 400)}`,
+  );
+
+  await unmount();
+});
+
+// ── contract-dto-nullable-graceful-degradation ────────────────────────────────
+
+test("contract-dto-nullable-graceful-degradation: report detail renders em-dash for absent nullable fields", async () => {
+  // Pins graceful degradation when nullable DTO fields are absent.
+  // Asserts that fields that are null/absent render as "—" not as empty or crashing.
+  //
+  // Mutation evidence: remove the null-guard in DetailRow (change `value != null`
+  // to `value !== null`) → the em-dash logic breaks for undefined → test goes red.
+
+  const origin = "https://admin.example.com";
+  const pubkey = "7".repeat(64);
+
+  const reportItem = {
+    id: "00000000-0000-0000-0000-000000000077",
+    communityId: "00000000-0000-0000-0000-000000000002",
+    communityHost: "relay.example.com",
+    reportEventId: "aabb",
+    reporterPubkey: "ccdd",
+    targetKind: "pubkey",
+    target: "eeff",
+    reportType: "nudity",
+    status: "open",
+    createdAt: "2024-06-01T12:00:00Z",
+  };
+
+  // Detail has no optional fields set and no nested message.
+  const reportDetail = {
+    ...reportItem,
+    channelId: null,
+    note: null,
+    resolvedBy: null,
+    resolvedAt: null,
+    actionId: null,
+    message: null,
+  };
+
+  setIpcHandler("admin_list_reports", () => Promise.resolve([reportItem]));
+  setIpcHandler("admin_get_report", () => Promise.resolve(reportDetail));
+  setIpcHandler("admin_list_feedback", () => Promise.resolve([]));
+
+  const { container, doRender, unmount } = mountPanel({ origin, pubkey });
+  await doRender();
+  await settle(30);
+
+  // Navigate into report detail.
+  const allButtons = container.querySelectorAll("button");
+  for (const btn of allButtons) {
+    const testid = btn.getAttribute("data-testid") ?? "";
+    if (testid.startsWith("admin-tab")) continue;
+    await act(async () => {
+      fireEvent.click(btn);
+      await new Promise((r) => setTimeout(r, 30));
+    });
+    break;
+  }
+  await settle(30);
+
+  const fields = container.querySelector(
+    "[data-testid='report-detail-fields']",
+  );
+  assert.ok(fields !== null, "report-detail-fields must render");
+
+  const text = container.textContent ?? "";
+  // Em-dash appears for null fields (Note, Channel, Resolved by, etc.).
+  assert.ok(
+    text.includes("—"),
+    `em-dash must appear for null nullable fields; got: ${text.slice(0, 600)}`,
+  );
+  // Nested message block must NOT render when message is null.
+  assert.ok(
+    !text.includes("Reported message"),
+    `nested message block must not render when message is null; got: ${text.slice(0, 600)}`,
+  );
+
+  await unmount();
+});
+
+// ── contract-dto-mutation-evidence ────────────────────────────────────────────
+
+test("contract-dto-mutation-evidence-resolvedBy: wrong key lookup makes resolvedBy invisible", async () => {
+  // Mutation evidence (a): if ReportFields reads data["resolvedBy"] via a wrong
+  // key — or if the key in the DTO type is renamed — the resolvedBy value
+  // disappears from the rendered output.
+  //
+  // This test asserts the CORRECT behaviour: resolvedBy IS rendered.
+  // To produce the red output, rename `resolvedBy` → `resolvedByX` in ReportFields.
+
+  const origin = "https://admin.example.com";
+  const pubkey = "8".repeat(64);
+
+  const reportItem = {
+    id: "00000000-0000-0000-0000-000000000088",
+    communityId: "00000000-0000-0000-0000-000000000002",
+    communityHost: "relay.example.com",
+    reportEventId: "rr01",
+    reporterPubkey: "pp01",
+    targetKind: "message",
+    target: "tt01",
+    reportType: "harassment",
+    status: "resolved",
+    createdAt: "2024-06-01T12:00:00Z",
+  };
+
+  const reportDetail = {
+    ...reportItem,
+    channelId: null,
+    note: "case closed",
+    resolvedBy: "moderator_pubkey_hex",
+    resolvedAt: "2024-06-02T08:00:00Z",
+    actionId: null,
+    message: null,
+  };
+
+  setIpcHandler("admin_list_reports", () => Promise.resolve([reportItem]));
+  setIpcHandler("admin_get_report", () => Promise.resolve(reportDetail));
+  setIpcHandler("admin_list_feedback", () => Promise.resolve([]));
+
+  const { container, doRender, unmount } = mountPanel({ origin, pubkey });
+  await doRender();
+  await settle(30);
+
+  const allButtons = container.querySelectorAll("button");
+  for (const btn of allButtons) {
+    const testid = btn.getAttribute("data-testid") ?? "";
+    if (testid.startsWith("admin-tab")) continue;
+    await act(async () => {
+      fireEvent.click(btn);
+      await new Promise((r) => setTimeout(r, 30));
+    });
+    break;
+  }
+  await settle(30);
+
+  const text = container.textContent ?? "";
+
+  // The resolvedBy pubkey must appear.
+  // Seam: asserting `data.resolvedBy` reaches the rendered DetailRow value.
+  // Mutation: rename `resolvedBy` → `resolvedByX` in ReportFields → "moderator_pubkey_hex" absent → red.
+  assert.ok(
+    text.includes("moderator_pubkey_hex"),
+    `resolvedBy value must render via data.resolvedBy; got: ${text.slice(0, 600)}`,
+  );
+
+  // The note must also render.
+  assert.ok(
+    text.includes("case closed"),
+    `note value must render via data.note; got: ${text.slice(0, 600)}`,
+  );
+
+  await unmount();
+});
+
+test("contract-dto-mutation-evidence-nested-message: removing message block hides content", async () => {
+  // Mutation evidence (b): removing the nested message block from ReportFields
+  // makes the reported message content invisible.
+  //
+  // This test asserts the CORRECT behaviour: the nested message IS rendered.
+  // To produce the red output, remove the `{data.message != null && ...}` block.
+
+  const origin = "https://admin.example.com";
+  const pubkey = "9".repeat(64);
+
+  const reportItem = {
+    id: "00000000-0000-0000-0000-000000000099",
+    communityId: "00000000-0000-0000-0000-000000000002",
+    communityHost: "relay.example.com",
+    reportEventId: "rr02",
+    reporterPubkey: "pp02",
+    targetKind: "message",
+    target: "tt02",
+    reportType: "spam",
+    status: "open",
+    createdAt: "2024-06-01T12:00:00Z",
+  };
+
+  const reportDetail = {
+    ...reportItem,
+    channelId: null,
+    note: null,
+    resolvedBy: null,
+    resolvedAt: null,
+    actionId: null,
+    message: {
+      authorPubkey: "msg_author_pubkey",
+      content: "buy cheap meds at spamsite.example",
+      createdAt: "2024-06-01T11:55:00Z",
+      deletedAt: null,
+    },
+  };
+
+  setIpcHandler("admin_list_reports", () => Promise.resolve([reportItem]));
+  setIpcHandler("admin_get_report", () => Promise.resolve(reportDetail));
+  setIpcHandler("admin_list_feedback", () => Promise.resolve([]));
+
+  const { container, doRender, unmount } = mountPanel({ origin, pubkey });
+  await doRender();
+  await settle(30);
+
+  const allButtons = container.querySelectorAll("button");
+  for (const btn of allButtons) {
+    const testid = btn.getAttribute("data-testid") ?? "";
+    if (testid.startsWith("admin-tab")) continue;
+    await act(async () => {
+      fireEvent.click(btn);
+      await new Promise((r) => setTimeout(r, 30));
+    });
+    break;
+  }
+  await settle(30);
+
+  const text = container.textContent ?? "";
+
+  // Seam: asserting the nested message block renders its content field.
+  // Mutation: remove `{data.message != null && ...}` → message content absent → red.
+  assert.ok(
+    text.includes("buy cheap meds at spamsite.example"),
+    `nested message content must render; got: ${text.slice(0, 600)}`,
+  );
+  assert.ok(
+    text.includes("msg_author_pubkey"),
+    `nested message authorPubkey must render; got: ${text.slice(0, 600)}`,
+  );
+  assert.ok(
+    text.includes("Reported message"),
+    `"Reported message" heading must render; got: ${text.slice(0, 600)}`,
   );
 
   await unmount();

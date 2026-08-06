@@ -78,6 +78,62 @@ export async function setAdminOrigin(
   });
 }
 
+// ── Wire DTO types ────────────────────────────────────────────────────────
+//
+// Mirror `crates/buzz-db/src/admin_moderation.rs` field-for-field.
+// Rust structs use `#[serde(rename_all = "camelCase")]`; DateTime<Utc>
+// serialises to an ISO-8601 string; Option<T> serialises to null / absent.
+
+/** Deployment-global moderation report (list and detail base). */
+export type AdminReportDto = {
+  id: string;
+  communityId: string;
+  communityHost: string;
+  reportEventId: string;
+  reporterPubkey: string;
+  targetKind: string;
+  target: string;
+  channelId?: string | null;
+  reportType: string;
+  note?: string | null;
+  status: string;
+  resolvedBy?: string | null;
+  resolvedAt?: string | null;
+  actionId?: string | null;
+  createdAt: string;
+};
+
+/** Reported message snapshot attached to an AdminReportDetail. */
+export type AdminReportedMessageDto = {
+  authorPubkey: string;
+  content: string;
+  createdAt: string;
+  deletedAt?: string | null;
+};
+
+/**
+ * Full report detail — AdminReport fields flattened with an optional
+ * nested message (present when the report targets a stored event).
+ */
+export type AdminReportDetailDto = AdminReportDto & {
+  message?: AdminReportedMessageDto | null;
+};
+
+/** Deployment-global product feedback entry. */
+export type AdminFeedbackDto = {
+  id: string;
+  communityId: string;
+  communityHost: string;
+  eventId: string;
+  submitterPubkey: string;
+  category?: string | null;
+  body: string;
+  /** Full source tags — consumed as imeta attachment metadata. */
+  tags: unknown;
+  eventCreatedAt: string;
+  receivedAt: string;
+};
+
 // ── Data commands ─────────────────────────────────────────────────────────
 
 export type AdminReportsQuery = {
@@ -94,29 +150,31 @@ export type AdminReportsQuery = {
 export async function listAdminReports(
   origin: string,
   query: AdminReportsQuery = {},
-): Promise<unknown> {
-  return invokeTauri<unknown>("admin_list_reports", { origin, query });
+): Promise<AdminReportDto[]> {
+  return invokeTauri<AdminReportDto[]>("admin_list_reports", { origin, query });
 }
 
 /** Fetch a single report's detail by ID. */
 export async function getAdminReport(
   origin: string,
   id: string,
-): Promise<unknown> {
-  return invokeTauri<unknown>("admin_get_report", { origin, id });
+): Promise<AdminReportDetailDto> {
+  return invokeTauri<AdminReportDetailDto>("admin_get_report", { origin, id });
 }
 
 /** Fetch the deployment-wide product feedback list. */
-export async function listAdminFeedback(origin: string): Promise<unknown> {
-  return invokeTauri<unknown>("admin_list_feedback", { origin });
+export async function listAdminFeedback(
+  origin: string,
+): Promise<AdminFeedbackDto[]> {
+  return invokeTauri<AdminFeedbackDto[]>("admin_list_feedback", { origin });
 }
 
 /** Fetch a single feedback entry's detail (includes imeta attachment metadata). */
 export async function getAdminFeedback(
   origin: string,
   id: string,
-): Promise<unknown> {
-  return invokeTauri<unknown>("admin_get_feedback", { origin, id });
+): Promise<AdminFeedbackDto> {
+  return invokeTauri<AdminFeedbackDto>("admin_get_feedback", { origin, id });
 }
 
 // ── Attachment ────────────────────────────────────────────────────────────

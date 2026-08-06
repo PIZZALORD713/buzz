@@ -33,7 +33,11 @@ import {
   listAdminFeedback,
   listAdminReports,
   type AdminAttachmentErrorCode,
+  type AdminFeedbackDto,
+  type AdminReportDetailDto,
+  type AdminReportDto,
 } from "./api";
+import { formatRelativeTime } from "../forum/lib/time";
 
 // ── Generic async state ───────────────────────────────────────────────────
 
@@ -109,20 +113,22 @@ function DetailRow({
   );
 }
 
-function formatTimestamp(raw: string | number | null | undefined): string {
-  if (raw == null) return "—";
-  // Unix epoch (number or numeric string) → ms; ISO string → Date directly.
-  const n = typeof raw === "number" ? raw : Number(raw);
-  const date =
-    Number.isFinite(n) && n > 1e9 ? new Date(n * 1000) : new Date(String(raw));
-  if (Number.isNaN(date.getTime())) return String(raw);
-  return date.toLocaleString(undefined, {
+function formatTimestamp(raw: string | null | undefined): string {
+  if (raw == null || raw === "") return "—";
+  // DTO timestamps are ISO-8601 strings (DateTime<Utc> via serde).
+  // Parse to a Date, convert to unix seconds, then format relatively.
+  const date = new Date(raw);
+  if (Number.isNaN(date.getTime())) return raw;
+  const absolute = date.toLocaleString(undefined, {
     month: "short",
     day: "numeric",
     year: "numeric",
     hour: "numeric",
     minute: "2-digit",
   });
+  const rel = formatRelativeTime(Math.floor(date.getTime() / 1000));
+  // Render relative label with the absolute value as a tooltip.
+  return `${rel} (${absolute})`;
 }
 
 function statusVariant(
@@ -236,20 +242,19 @@ function ReportsTab({
   }
   if (listState.status !== "ok") return null;
 
-  const reports = listState.data as Array<Record<string, unknown>>;
+  const reports = listState.data;
   if (!Array.isArray(reports) || reports.length === 0) {
     return <p className="text-sm text-muted-foreground">No reports found.</p>;
   }
 
   return (
     <ul className="space-y-1">
-      {reports.map((report) => {
-        const id = String(report.id ?? report.reportId ?? "");
-        const summary =
-          String(report.summary ?? report.reportType ?? "") || "Report";
-        const status = String(report.status ?? "");
+      {reports.map((report: AdminReportDto) => {
+        const id = report.id;
+        const summary = report.reportType || "Report";
+        const status = report.status;
         return (
-          <li key={id || summary}>
+          <li key={id}>
             <button
               className="w-full rounded-md border border-border/60 px-3 py-2.5 text-left text-sm hover:bg-muted/40 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
               onClick={() => setSelectedId(id)}
@@ -267,12 +272,8 @@ function ReportsTab({
   );
 }
 
-function ReportFields({ data }: { data: Record<string, unknown> }) {
-  const str = (k: string) => {
-    const v = data[k];
-    return v != null && v !== "" ? String(v) : null;
-  };
-  const status = str("status") ?? "";
+function ReportFields({ data }: { data: AdminReportDetailDto }) {
+  const status = data.status ?? "";
   return (
     <div
       className="space-y-1.5 rounded-md border border-border/60 px-3 py-2.5"
@@ -280,33 +281,37 @@ function ReportFields({ data }: { data: Record<string, unknown> }) {
     >
       <div className="mb-2 flex flex-wrap items-center gap-2">
         {status && <Badge variant={statusVariant(status)}>{status}</Badge>}
-        {str("reportType") && (
-          <Badge variant="outline">{str("reportType")}</Badge>
-        )}
+        {data.reportType && <Badge variant="outline">{data.reportType}</Badge>}
       </div>
-      <DetailRow label="ID" value={str("id")} mono />
-      <DetailRow label="Community" value={str("communityId")} mono />
-      <DetailRow label="Host" value={str("communityHost")} />
-      <DetailRow label="Event ID" value={str("reportEventId")} mono />
-      <DetailRow label="Reporter" value={str("reporterPubkey")} mono />
-      <DetailRow label="Target kind" value={str("targetKind")} />
-      <DetailRow label="Target" value={str("target")} mono />
-      <DetailRow label="Reason" value={str("reason")} />
-      <DetailRow label="Moderator" value={str("moderatorPubkey")} mono />
-      <DetailRow label="Action" value={str("moderationAction")} />
-      <DetailRow label="Note" value={str("moderationNote")} />
-      <DetailRow
-        label="Created"
-        value={formatTimestamp(
-          data.createdAt as string | number | null | undefined,
-        )}
-      />
-      <DetailRow
-        label="Updated"
-        value={formatTimestamp(
-          data.updatedAt as string | number | null | undefined,
-        )}
-      />
+      <DetailRow label="ID" value={data.id} mono />
+      <DetailRow label="Community" value={data.communityId} mono />
+      <DetailRow label="Host" value={data.communityHost} />
+      <DetailRow label="Event ID" value={data.reportEventId} mono />
+      <DetailRow label="Reporter" value={data.reporterPubkey} mono />
+      <DetailRow label="Target kind" value={data.targetKind} />
+      <DetailRow label="Target" value={data.target} mono />
+      <DetailRow label="Channel" value={data.channelId ?? null} mono />
+      <DetailRow label="Note" value={data.note ?? null} />
+      <DetailRow label="Resolved by" value={data.resolvedBy ?? null} mono />
+      <DetailRow label="Resolved at" value={formatTimestamp(data.resolvedAt)} />
+      <DetailRow label="Action ID" value={data.actionId ?? null} mono />
+      <DetailRow label="Created" value={formatTimestamp(data.createdAt)} />
+      {data.message != null && (
+        <div className="mt-3 space-y-1.5 rounded-md border border-border/40 px-3 py-2.5">
+          <p className="mb-1 text-xs font-semibold text-muted-foreground">
+            Reported message
+            {data.message.deletedAt != null && (
+              <span className="ml-1.5 text-destructive">(deleted)</span>
+            )}
+          </p>
+          <DetailRow label="Author" value={data.message.authorPubkey} mono />
+          <DetailRow label="Content" value={data.message.content} />
+          <DetailRow
+            label="Msg created"
+            value={formatTimestamp(data.message.createdAt)}
+          />
+        </div>
+      )}
     </div>
   );
 }
@@ -344,9 +349,7 @@ function ReportDetail({
       {detailState.status === "error" && (
         <ErrorMessage message={detailState.message} />
       )}
-      {detailState.status === "ok" && (
-        <ReportFields data={detailState.data as Record<string, unknown>} />
-      )}
+      {detailState.status === "ok" && <ReportFields data={detailState.data} />}
     </div>
   );
 }
@@ -388,29 +391,28 @@ function FeedbackTab({
   }
   if (listState.status !== "ok") return null;
 
-  const items = listState.data as Array<Record<string, unknown>>;
+  const items = listState.data;
   if (!Array.isArray(items) || items.length === 0) {
     return <p className="text-sm text-muted-foreground">No feedback found.</p>;
   }
 
   return (
     <ul className="space-y-1">
-      {items.map((item) => {
-        const id = String(item.id ?? item.feedbackId ?? "");
-        // FeedbackSummary wire shape: bodySummary, receivedAt (camelCase via serde).
-        const text = String(item.bodySummary ?? item.body ?? "").slice(0, 120);
-        const createdAt = String(item.receivedAt ?? item.eventCreatedAt ?? "");
+      {items.map((item: AdminFeedbackDto) => {
+        const id = item.id;
+        const text = String(item.body ?? "").slice(0, 120);
+        const receivedAt = item.receivedAt;
         return (
-          <li key={id || text}>
+          <li key={id}>
             <button
               className="w-full rounded-md border border-border/60 px-3 py-2.5 text-left text-sm hover:bg-muted/40 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
               onClick={() => setSelectedId(id)}
               type="button"
             >
               <span className="block font-medium line-clamp-2">{text}</span>
-              {createdAt && (
+              {receivedAt && (
                 <span className="text-xs text-muted-foreground">
-                  {new Date(Number(createdAt) * 1000).toLocaleString()}
+                  {formatTimestamp(receivedAt)}
                 </span>
               )}
             </button>
@@ -592,33 +594,24 @@ function AttachmentViewer({
   );
 }
 
-function FeedbackFields({ data }: { data: Record<string, unknown> }) {
-  const str = (k: string) => {
-    const v = data[k];
-    return v != null && v !== "" ? String(v) : null;
-  };
+function FeedbackFields({ data }: { data: AdminFeedbackDto }) {
   return (
     <div
       className="space-y-1.5 rounded-md border border-border/60 px-3 py-2.5"
       data-testid="feedback-detail-fields"
     >
-      <DetailRow label="ID" value={str("id")} mono />
-      <DetailRow label="Body" value={str("body") ?? str("bodySummary")} />
-      <DetailRow label="App version" value={str("appVersion")} />
-      <DetailRow label="Platform" value={str("platform")} />
-      <DetailRow label="Author" value={str("authorPubkey")} mono />
-      <DetailRow
-        label="Received"
-        value={formatTimestamp(
-          data.receivedAt as string | number | null | undefined,
-        )}
-      />
+      <DetailRow label="ID" value={data.id} mono />
+      <DetailRow label="Body" value={data.body} />
+      <DetailRow label="Submitter" value={data.submitterPubkey} mono />
+      <DetailRow label="Category" value={data.category ?? null} />
+      <DetailRow label="Community" value={data.communityId} mono />
+      <DetailRow label="Host" value={data.communityHost} />
+      <DetailRow label="Event ID" value={data.eventId} mono />
       <DetailRow
         label="Event created"
-        value={formatTimestamp(
-          data.eventCreatedAt as string | number | null | undefined,
-        )}
+        value={formatTimestamp(data.eventCreatedAt)}
       />
+      <DetailRow label="Received" value={formatTimestamp(data.receivedAt)} />
     </div>
   );
 }
@@ -646,9 +639,7 @@ function FeedbackDetail({
   // AdminFeedback is serialised camelCase by the relay (serde rename_all).
   const attachments: AttachmentMeta[] =
     detailState.status === "ok"
-      ? parseImetaAttachments(
-          (detailState.data as Record<string, unknown>).tags,
-        )
+      ? parseImetaAttachments(detailState.data.tags)
       : [];
 
   return (
@@ -667,7 +658,7 @@ function FeedbackDetail({
       )}
       {detailState.status === "ok" && (
         <>
-          <FeedbackFields data={detailState.data as Record<string, unknown>} />
+          <FeedbackFields data={detailState.data} />
           {attachments.length > 0 && (
             <div className="space-y-3">
               <h4 className="text-sm font-medium">Attachments</h4>
