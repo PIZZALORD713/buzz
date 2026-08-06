@@ -253,6 +253,7 @@ function AgentPersonaCard({
   const modelLabel = resolveAgentCardModelLabel({
     agent,
     personaModel: persona.model,
+    provider: persona.provider,
     defaultModel,
   });
   const isActive = agent ? isManagedAgentActive(agent) : false;
