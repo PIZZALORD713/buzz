@@ -188,7 +188,6 @@ class _AppLockGateState extends ConsumerState<AppLockGate>
     with WidgetsBindingObserver {
   bool _locked = true;
   bool _authenticating = false;
-  String? _error;
   DateTime? _backgroundedAt;
 
   @override
@@ -203,10 +202,7 @@ class _AppLockGateState extends ConsumerState<AppLockGate>
   void didUpdateWidget(AppLockGate oldWidget) {
     super.didUpdateWidget(oldWidget);
     if (!widget.enabled) {
-      setState(() {
-        _locked = false;
-        _error = null;
-      });
+      setState(() => _locked = false);
     } else if (!oldWidget.enabled) {
       setState(() => _locked = true);
       WidgetsBinding.instance.addPostFrameCallback((_) => _unlockIfNeeded());
@@ -239,25 +235,16 @@ class _AppLockGateState extends ConsumerState<AppLockGate>
     if (!mounted || !widget.enabled || !_locked || _authenticating) return;
     final session = ref.read(sensitiveActionAuthorizationSessionProvider);
     if (!forceFresh && session.wasAuthorizedWithin(appLockTimeout)) {
-      setState(() {
-        _locked = false;
-        _error = null;
-      });
+      setState(() => _locked = false);
       return;
     }
 
-    setState(() {
-      _authenticating = true;
-      _error = null;
-    });
+    setState(() => _authenticating = true);
     final result = await session.authorize();
     if (!mounted || !widget.enabled) return;
     setState(() {
       _authenticating = false;
       _locked = result != DeviceAuthResult.success;
-      _error = result == DeviceAuthResult.success
-          ? null
-          : 'Buzz is locked. Authenticate to continue.';
     });
   }
 
@@ -275,6 +262,7 @@ class _AppLockGateState extends ConsumerState<AppLockGate>
     );
     return Scaffold(
       key: const Key('app-lock-screen'),
+      backgroundColor: Colors.black,
       body: SafeArea(
         child: Center(
           child: Padding(
@@ -282,22 +270,21 @@ class _AppLockGateState extends ConsumerState<AppLockGate>
             child: Column(
               mainAxisSize: MainAxisSize.min,
               children: [
-                Icon(
-                  Icons.lock_outline,
-                  size: 56,
-                  color: Theme.of(context).colorScheme.primary,
+                Image.asset(
+                  'assets/images/buzz-icon.png',
+                  key: const Key('app-lock-logo'),
+                  width: 112,
+                  semanticLabel: 'Buzz',
                 ),
-                const SizedBox(height: 16),
-                Text(
-                  'Buzz is locked',
-                  style: Theme.of(context).textTheme.headlineSmall,
-                ),
-                if (_error != null) ...[
-                  const SizedBox(height: 8),
-                  Text(_error!, textAlign: TextAlign.center),
-                ],
-                const SizedBox(height: 24),
+                const SizedBox(height: 32),
                 FilledButton(
+                  key: const Key('app-lock-unlock-button'),
+                  style: FilledButton.styleFrom(
+                    backgroundColor: Colors.white,
+                    foregroundColor: Colors.black,
+                    disabledBackgroundColor: Colors.white54,
+                    disabledForegroundColor: Colors.black54,
+                  ),
                   onPressed: _authenticating ? null : _unlockIfNeeded,
                   child: Text(
                     _authenticating

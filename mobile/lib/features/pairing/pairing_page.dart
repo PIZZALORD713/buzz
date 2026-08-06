@@ -295,7 +295,7 @@ class _SasVerificationView extends StatelessWidget {
             contentPadding: EdgeInsets.zero,
             title: Text('Use $authenticationName'),
             subtitle: Text(
-              'Require $authenticationName to open Buzz and approve identity transfers.',
+              'Require $authenticationName to open Buzz and approve protected actions.',
             ),
           ),
 

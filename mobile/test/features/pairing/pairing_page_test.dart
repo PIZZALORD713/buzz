@@ -275,7 +275,7 @@ void main() {
       );
       expect(checkbox.value, isTrue);
       expect(
-        find.textContaining('open Buzz and approve identity transfers'),
+        find.textContaining('open Buzz and approve protected actions'),
         findsOneWidget,
       );
     });

@@ -12,6 +12,7 @@ class _MobileSecuritySection extends ConsumerWidget {
     final enabled =
         community.sensitiveActionPolicy == SensitiveActionPolicy.enabled;
     final capability = ref.watch(sensitiveActionAuthSupportedProvider);
+    if (!enabled && capability.value != true) return const SizedBox.shrink();
     final authenticationName = sensitiveActionAuthenticationName(
       Theme.of(context).platform,
     );
@@ -25,22 +26,11 @@ class _MobileSecuritySection extends ConsumerWidget {
           title: Text('Use $authenticationName'),
           subtitle: Text(
             enabled
-                ? 'Required to open Buzz and approve identity transfers.'
-                : 'Require $authenticationName to open Buzz and approve identity transfers.',
+                ? 'Required to open Buzz and approve protected actions.'
+                : 'Require $authenticationName to open Buzz and approve protected actions.',
           ),
           value: enabled,
           onChanged: (value) => _changePolicy(context, ref, value),
-        ),
-        AppListRow(
-          icon: LucideIcons.fingerprint,
-          title: 'Device authentication',
-          subtitle: capability.when(
-            data: (supported) => supported
-                ? '${authenticationName[0].toUpperCase()}${authenticationName.substring(1)} or device passcode available'
-                : 'Unavailable or not configured',
-            loading: () => 'Checking…',
-            error: (_, _) => 'Unavailable',
-          ),
         ),
       ],
     );

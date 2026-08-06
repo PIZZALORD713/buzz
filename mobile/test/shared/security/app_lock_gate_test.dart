@@ -25,8 +25,26 @@ void main() {
     await tester.pump();
 
     expect(find.byKey(const Key('app-lock-screen')), findsOneWidget);
+    expect(find.byKey(const Key('app-lock-logo')), findsOneWidget);
     expect(find.text('Private content'), findsNothing);
+    expect(find.text('Buzz is locked'), findsNothing);
     expect(find.text('Unlock with Face ID'), findsOneWidget);
+
+    final scaffold = tester.widget<Scaffold>(
+      find.byKey(const Key('app-lock-screen')),
+    );
+    expect(scaffold.backgroundColor, Colors.black);
+    final button = tester.widget<FilledButton>(
+      find.byKey(const Key('app-lock-unlock-button')),
+    );
+    expect(
+      button.style?.backgroundColor?.resolve(<WidgetState>{}),
+      Colors.white,
+    );
+    expect(
+      button.style?.foregroundColor?.resolve(<WidgetState>{}),
+      Colors.black,
+    );
   });
 
   testWidgets('resume inside five minutes remains unlocked', (tester) async {
