@@ -275,7 +275,10 @@ class _AppLockGateState extends ConsumerState<AppLockGate>
   Future<void> _setAndroidRecentsProtection(bool enabled) async {
     if (defaultTargetPlatform != TargetPlatform.android) return;
     try {
-      await _appPrivacyChannel.invokeMethod<void>('setSecure', enabled);
+      await _appPrivacyChannel.invokeMethod<void>(
+        'setRecentsProtection',
+        enabled,
+      );
     } on MissingPluginException {
       // Widget tests and unsupported embedders do not register this channel.
     }
