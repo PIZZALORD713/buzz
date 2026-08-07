@@ -185,10 +185,11 @@ export const MessageRow = React.memo(
       },
       [channelId, openReminder],
     );
-    const { mentionNames, mentionPubkeysByName } = React.useMemo(
-      () => resolveMentionProps(message.tags, profiles),
-      [profiles, message.tags],
-    );
+    const { agentMentionNames, mentionNames, mentionPubkeysByName } =
+      React.useMemo(
+        () => resolveMentionProps(message.tags, profiles),
+        [profiles, message.tags],
+      );
     // "Is this pubkey an agent" = the community-scoped baseline every surface
     // shares (managed ∪ relay) plus the pubkey's own profile `isAgent` flag from this surface's lookup. Both are per-pubkey
     // O(1) checks — no per-row rescan of `profiles` (that duplicated parent
@@ -374,6 +375,7 @@ export const MessageRow = React.memo(
               content={message.body}
               customEmoji={customEmoji}
               imetaByUrl={imetaByUrl}
+              agentMentionNames={agentMentionNames}
               agentMentionPubkeysByName={agentMentionPubkeysByName}
               mentionNames={mentionNames}
               mentionPubkeysByName={mentionPubkeysByName}
