@@ -3016,7 +3016,17 @@ mod tests {
 
         // Re-drive: finalize from persisted state (step_marker present → skip mutation).
         let finalized = buzz_db::relay_admin_actions::finalize_success(
-            &pool, action_id, cid, report_id, "resolved", &actor,
+            &pool,
+            action_id,
+            cid,
+            report_id,
+            "resolved",
+            &actor,
+            "ban",
+            Some(&actor),
+            None,
+            None,
+            None,
         )
         .await
         .expect("finalize_success");
@@ -3024,7 +3034,17 @@ mod tests {
 
         // Second finalize call must be idempotent (CAS fails but action is succeeded).
         let second_finalize = buzz_db::relay_admin_actions::finalize_success(
-            &pool, action_id, cid, report_id, "resolved", &actor,
+            &pool,
+            action_id,
+            cid,
+            report_id,
+            "resolved",
+            &actor,
+            "ban",
+            Some(&actor),
+            None,
+            None,
+            None,
         )
         .await
         .expect("second finalize_success");
@@ -3042,7 +3062,7 @@ mod tests {
                 .expect("fetch report");
         assert_eq!(status.as_deref(), Some("resolved"));
 
-        // Outbox rows were written in the claim transaction.
+        // Outbox rows are written in the finalize_success transaction (success-gated delivery).
         let outbox_rows = buzz_db::relay_admin_actions::list_pending_outbox(&pool, action_id)
             .await
             .expect("list outbox");
@@ -3071,5 +3091,1008 @@ mod tests {
                 .await
                 .expect("count audit");
         assert_eq!(audit_count, 1, "exactly one audit row after re-drive");
+    }
+
+    // ── E2E state-machine tests through the production driver/workers ─────────
+    //
+    // These tests drive through the actual production code paths:
+    // `resolve_report_with_enforcement` (claim + drive_enforcement + finalize),
+    // `drive_enforcement_pub` (action recovery worker re-drive path), and the
+    // outbox retry mechanics. They require a live Postgres instance.
+
+    /// Build an AppState wired to the given pool. Used by the e2e driver tests so
+    /// they share the same DB connection the test fixtures wrote to.
+    async fn state_from_pool(pool: sqlx::PgPool) -> Arc<crate::state::AppState> {
+        let mut config = crate::config::Config::from_env().expect("default config loads");
+        config.require_relay_membership = false;
+        config.redis_url = "redis://127.0.0.1:1".to_string();
+        let mut token = [0u8; 32];
+        hex::decode_to_slice(TOKEN, &mut token).expect("test token is hex");
+        config.admin = Some(crate::config::AdminConfig {
+            host: "admin.example".to_string(),
+            auth: crate::config::AdminAuth::Token(crate::config::AdminToken::from_bytes(token)),
+            web_dir: None,
+        });
+        let db = buzz_db::Db::from_pool(pool.clone());
+        let redis_pool = deadpool_redis::Config::from_url(&config.redis_url)
+            .create_pool(Some(deadpool_redis::Runtime::Tokio1))
+            .expect("redis pool");
+        let pubsub = Arc::new(
+            buzz_pubsub::PubSubManager::new(&config.redis_url, redis_pool.clone())
+                .await
+                .expect("pubsub manager"),
+        );
+        let audit = buzz_audit::AuditService::new(pool.clone());
+        let auth = buzz_auth::AuthService::new(config.auth.clone());
+        let search = buzz_search::SearchService::new(pool.clone());
+        let workflow_engine = Arc::new(buzz_workflow::WorkflowEngine::new(
+            db.clone(),
+            buzz_workflow::WorkflowConfig::default(),
+        ));
+        let media_storage = buzz_media::MediaStorage::new(&config.media).expect("media storage");
+        let (state, _audit_shutdown) = crate::state::AppState::new(
+            config,
+            db,
+            redis_pool,
+            audit,
+            pubsub,
+            auth,
+            search,
+            workflow_engine,
+            nostr::Keys::generate(),
+            media_storage,
+        );
+        Arc::new(state)
+    }
+
+    async fn e2e_pool() -> sqlx::PgPool {
+        let url = std::env::var("BUZZ_TEST_DATABASE_URL")
+            .unwrap_or_else(|_| "postgres://buzz:buzz_dev@localhost:5432/buzz".to_string());
+        sqlx::PgPool::connect(&url)
+            .await
+            .expect("connect to test DB")
+    }
+
+    async fn e2e_community(pool: &sqlx::PgPool, label: &str) -> (uuid::Uuid, String) {
+        let id = uuid::Uuid::new_v4();
+        let host = format!("e2e-{label}-{}.example", id.simple());
+        sqlx::query("INSERT INTO communities (id, host) VALUES ($1, $2)")
+            .bind(id)
+            .bind(&host)
+            .execute(pool)
+            .await
+            .expect("insert community");
+        (id, host)
+    }
+
+    async fn e2e_report_pubkey(
+        pool: &sqlx::PgPool,
+        community_id: uuid::Uuid,
+        target: &[u8],
+    ) -> uuid::Uuid {
+        let reporter = vec![0u8; 32];
+        let uid = uuid::Uuid::new_v4();
+        let event_id: Vec<u8> = uid
+            .as_bytes()
+            .iter()
+            .chain(uid.as_bytes().iter())
+            .copied()
+            .collect();
+        sqlx::query_scalar(
+            r#"
+            INSERT INTO moderation_reports (
+                community_id, report_event_id, reporter_pubkey, target_kind,
+                target_pubkey, report_type
+            ) VALUES ($1, $2, $3, 'pubkey', $4, 'harassment')
+            RETURNING id
+            "#,
+        )
+        .bind(community_id)
+        .bind(event_id)
+        .bind(&reporter)
+        .bind(target)
+        .fetch_one(pool)
+        .await
+        .expect("insert report")
+    }
+
+    fn e2e_tenant(community_id: uuid::Uuid, host: &str) -> buzz_core::tenant::TenantContext {
+        buzz_core::tenant::TenantContext::resolved(
+            buzz_core::CommunityId::from_uuid(community_id),
+            host.to_string(),
+        )
+    }
+
+    fn e2e_admin_report(
+        report_id: uuid::Uuid,
+        community_id: uuid::Uuid,
+        target: &[u8],
+    ) -> buzz_db::admin_moderation::AdminReportDetail {
+        // Minimal AdminReportDetail sufficient to drive enforcement (ban action).
+        // target_kind = "pubkey", target = hex of target bytes.
+        buzz_db::admin_moderation::AdminReportDetail {
+            report: buzz_db::admin_moderation::AdminReport {
+                id: report_id,
+                community_id,
+                community_host: "e2e.example".to_string(),
+                report_event_id: "0".repeat(64),
+                reporter_pubkey: "0".repeat(64),
+                target_kind: "pubkey".to_string(),
+                target: hex::encode(target),
+                channel_id: None,
+                report_type: "harassment".to_string(),
+                note: None,
+                status: "open".to_string(),
+                resolved_by: None,
+                resolved_at: None,
+                action_id: None,
+                created_at: chrono::Utc::now(),
+            },
+            message: None,
+        }
+    }
+
+    // ── 1. delete-then-crash-before-tombstone re-drive ────────────────────────
+
+    #[tokio::test]
+    #[ignore = "requires Postgres — delete crash-before-tombstone re-drive"]
+    async fn delete_then_crash_before_tombstone_redrive() {
+        // Simulate: ban action, atomic mutation+marker committed, crash before
+        // finalization. Re-drive via drive_enforcement_pub (action recovery worker
+        // path) must finalize and create the reporter_notice outbox row.
+        let pool = e2e_pool().await;
+        let (community_id, host) = e2e_community(&pool, "crash-before-tombstone").await;
+        let target = vec![4u8; 32];
+        let actor = vec![5u8; 32];
+        let report_id = e2e_report_pubkey(&pool, community_id, &target).await;
+        let state = state_from_pool(pool.clone()).await;
+        let tenant = e2e_tenant(community_id, &host);
+        let _report = e2e_admin_report(report_id, community_id, &target);
+        let cid = buzz_core::CommunityId::from_uuid(community_id);
+        let request_id = uuid::Uuid::new_v4();
+
+        // Step 1: claim and atomically commit mutation+marker (simulates the
+        // mutation half of a ban completing before a crash).
+        let action_id = match buzz_db::relay_admin_actions::claim_report(
+            &pool,
+            cid,
+            report_id,
+            request_id,
+            &actor,
+            "operator",
+            "ban",
+            Some("e2e test"),
+            None,
+            "resolve:ban",
+            "relay_operator",
+            Some(&target),
+            None,
+            None,
+        )
+        .await
+        .expect("claim")
+        {
+            buzz_db::relay_admin_actions::ClaimResult::Claimed(a) => a.id,
+            other => panic!("expected Claimed, got {other:?}"),
+        };
+
+        // Advance to enforcing, then atomically commit ban + step_marker (no crash yet).
+        let _ = buzz_db::relay_admin_actions::begin_enforcing(&pool, action_id)
+            .await
+            .expect("begin_enforcing");
+        let committed = buzz_db::relay_admin_actions::execute_ban_with_marker(
+            &pool,
+            action_id,
+            cid,
+            &target,
+            &actor,
+            Some("e2e test"),
+        )
+        .await
+        .expect("execute_ban_with_marker");
+        assert!(committed, "mutation+marker must commit");
+
+        // Verify: step_marker set, but action not yet finalized (simulates crash here).
+        let rec = buzz_db::relay_admin_actions::get_action(&pool, action_id)
+            .await
+            .expect("get_action")
+            .expect("action exists");
+        assert_eq!(rec.step_marker.as_deref(), Some("mutation_committed"));
+        assert_eq!(
+            rec.state, "enforcing",
+            "action must still be in enforcing (not yet finalized)"
+        );
+
+        // Verify: no outbox rows yet (success-gated delivery).
+        let outbox_before: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM relay_admin_outbox WHERE action_id = $1")
+                .bind(action_id)
+                .fetch_one(&pool)
+                .await
+                .expect("count outbox before re-drive");
+        assert_eq!(outbox_before, 0, "no outbox rows before finalization");
+
+        // Step 2: re-drive via drive_enforcement_pub (the action recovery worker
+        // path). It sees step_marker='mutation_committed', skips mutation,
+        // goes straight to finalize_success.
+        let result = crate::handlers::report_resolution::drive_enforcement_pub(
+            &state,
+            &tenant,
+            cid,
+            report_id,
+            "ban",
+            Some("e2e test"),
+            None,
+            &actor,
+            Some(&target),
+            None,
+            None,
+            &rec,
+            None,
+        )
+        .await;
+        assert!(result.is_ok(), "re-drive must succeed: {result:?}");
+
+        // Verify: action succeeded, report resolved, outbox rows created.
+        let final_rec = buzz_db::relay_admin_actions::get_action(&pool, action_id)
+            .await
+            .expect("get_action after re-drive")
+            .expect("action still exists");
+        assert_eq!(
+            final_rec.state, "succeeded",
+            "action must be succeeded after re-drive"
+        );
+
+        let report_status: Option<String> =
+            sqlx::query_scalar("SELECT status FROM moderation_reports WHERE id = $1")
+                .bind(report_id)
+                .fetch_optional(&pool)
+                .await
+                .expect("fetch report status");
+        assert_eq!(
+            report_status.as_deref(),
+            Some("resolved"),
+            "report must be resolved"
+        );
+
+        let outbox_after: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM relay_admin_outbox WHERE action_id = $1")
+                .bind(action_id)
+                .fetch_one(&pool)
+                .await
+                .expect("count outbox after re-drive");
+        assert!(
+            outbox_after > 0,
+            "reporter_notice outbox row must exist after finalization"
+        );
+
+        // Idempotent re-drive: second call must converge, not double-finalize.
+        let reloaded = buzz_db::relay_admin_actions::get_action(&pool, action_id)
+            .await
+            .expect("reload after first finalize")
+            .expect("action exists");
+        let result2 = crate::handlers::report_resolution::drive_enforcement_pub(
+            &state,
+            &tenant,
+            cid,
+            report_id,
+            "ban",
+            Some("e2e test"),
+            None,
+            &actor,
+            Some(&target),
+            None,
+            None,
+            &reloaded,
+            None,
+        )
+        .await;
+        assert!(
+            result2.is_ok(),
+            "idempotent re-drive must not error: {result2:?}"
+        );
+
+        let outbox_count_stable: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM relay_admin_outbox WHERE action_id = $1")
+                .bind(action_id)
+                .fetch_one(&pool)
+                .await
+                .expect("count outbox stable");
+        assert_eq!(
+            outbox_count_stable, outbox_after,
+            "idempotent re-drive must not create duplicate outbox rows"
+        );
+    }
+
+    // ── 2. kick retry after this action removed the member ────────────────────
+
+    #[tokio::test]
+    #[ignore = "requires Postgres — kick retry provenance: Removed vs AlreadyGone"]
+    async fn kick_retry_after_this_action_removed_member() {
+        // Action 1 kicks a member (Removed + marker committed). A re-drive of
+        // action 1 must see AlreadyMarked (skip mutation) and succeed via finalize.
+        // A second kick action (new report) must see AlreadyGone (enforcement failure).
+        let pool = e2e_pool().await;
+        let actor = vec![6u8; 32];
+        let target = vec![7u8; 32];
+
+        // Create community and channel.
+        let (community_id, host) = e2e_community(&pool, "kick-provenance").await;
+        let cid = buzz_core::CommunityId::from_uuid(community_id);
+        let channel_id = uuid::Uuid::new_v4();
+        sqlx::query(
+            r#"INSERT INTO channels (id, community_id, name, channel_type, visibility, created_by)
+               VALUES ($1, $2, 'test-kick-e2e', 'stream', 'open', $3)"#,
+        )
+        .bind(channel_id)
+        .bind(community_id)
+        .bind(&actor)
+        .execute(&pool)
+        .await
+        .expect("create channel");
+        sqlx::query(
+            "INSERT INTO channel_members (community_id, channel_id, pubkey, role) VALUES ($1, $2, $3, 'member')",
+        )
+        .bind(community_id).bind(channel_id).bind(&target)
+        .execute(&pool).await.expect("add member");
+
+        // Create report1 with channel_id.
+        let report_event1: Vec<u8> = {
+            let u = uuid::Uuid::new_v4();
+            u.as_bytes()
+                .iter()
+                .chain(u.as_bytes().iter())
+                .copied()
+                .collect()
+        };
+        let report_id1: uuid::Uuid = sqlx::query_scalar(
+            r#"INSERT INTO moderation_reports
+               (community_id, report_event_id, reporter_pubkey, target_kind, target_pubkey, channel_id, report_type)
+               VALUES ($1, $2, $3, 'pubkey', $4, $5, 'harassment') RETURNING id"#,
+        )
+        .bind(community_id).bind(&report_event1).bind(vec![0u8; 32])
+        .bind(&target).bind(channel_id)
+        .fetch_one(&pool).await.expect("insert report1");
+
+        // Claim action1 for kick.
+        let action_id1 = match buzz_db::relay_admin_actions::claim_report(
+            &pool,
+            cid,
+            report_id1,
+            uuid::Uuid::new_v4(),
+            &actor,
+            "operator",
+            "kick",
+            None,
+            None,
+            "resolve:kick",
+            "relay_operator",
+            Some(&target),
+            None,
+            Some(channel_id),
+        )
+        .await
+        .expect("claim1")
+        {
+            buzz_db::relay_admin_actions::ClaimResult::Claimed(a) => a.id,
+            other => panic!("expected Claimed, got {other:?}"),
+        };
+        let _ = buzz_db::relay_admin_actions::begin_enforcing(&pool, action_id1)
+            .await
+            .expect("begin_enforcing1");
+
+        // Kick: member is present → Removed + step_marker committed.
+        let r1 = buzz_db::relay_admin_actions::execute_kick_with_marker(
+            &pool, action_id1, cid, channel_id, &target, &actor,
+        )
+        .await
+        .expect("kick1");
+        assert!(
+            matches!(
+                r1,
+                buzz_db::relay_admin_actions::KickWithMarkerResult::Removed
+            ),
+            "first kick must be Removed"
+        );
+
+        // Re-drive action1 via drive_enforcement_pub: sees marker set, skips kick,
+        // goes to finalize → succeeded.
+        let rec1 = buzz_db::relay_admin_actions::get_action(&pool, action_id1)
+            .await
+            .expect("get_action1")
+            .expect("exists");
+        let state = state_from_pool(pool.clone()).await;
+        let tenant = e2e_tenant(community_id, &host);
+        let result1 = crate::handlers::report_resolution::drive_enforcement_pub(
+            &state,
+            &tenant,
+            cid,
+            report_id1,
+            "kick",
+            None,
+            None,
+            &actor,
+            Some(&target),
+            None,
+            Some(channel_id),
+            &rec1,
+            None,
+        )
+        .await;
+        assert!(
+            result1.is_ok(),
+            "re-drive of action1 must succeed: {result1:?}"
+        );
+
+        let final_rec1 = buzz_db::relay_admin_actions::get_action(&pool, action_id1)
+            .await
+            .expect("get_action1 final")
+            .expect("exists");
+        assert_eq!(final_rec1.state, "succeeded", "action1 must succeed");
+
+        // Create report2 and action2 for the same target (now absent).
+        let report_event2: Vec<u8> = {
+            let u = uuid::Uuid::new_v4();
+            u.as_bytes()
+                .iter()
+                .chain(u.as_bytes().iter())
+                .copied()
+                .collect()
+        };
+        let report_id2: uuid::Uuid = sqlx::query_scalar(
+            r#"INSERT INTO moderation_reports
+               (community_id, report_event_id, reporter_pubkey, target_kind, target_pubkey, channel_id, report_type)
+               VALUES ($1, $2, $3, 'pubkey', $4, $5, 'harassment') RETURNING id"#,
+        )
+        .bind(community_id).bind(&report_event2).bind(vec![0u8; 32])
+        .bind(&target).bind(channel_id)
+        .fetch_one(&pool).await.expect("insert report2");
+
+        let action_id2 = match buzz_db::relay_admin_actions::claim_report(
+            &pool,
+            cid,
+            report_id2,
+            uuid::Uuid::new_v4(),
+            &actor,
+            "operator",
+            "kick",
+            None,
+            None,
+            "resolve:kick",
+            "relay_operator",
+            Some(&target),
+            None,
+            Some(channel_id),
+        )
+        .await
+        .expect("claim2")
+        {
+            buzz_db::relay_admin_actions::ClaimResult::Claimed(a) => a.id,
+            other => panic!("expected Claimed, got {other:?}"),
+        };
+        let _ = buzz_db::relay_admin_actions::begin_enforcing(&pool, action_id2)
+            .await
+            .expect("begin_enforcing2");
+
+        // Second kick: target already gone → AlreadyGone; step_marker NOT committed.
+        let r2 = buzz_db::relay_admin_actions::execute_kick_with_marker(
+            &pool, action_id2, cid, channel_id, &target, &actor,
+        )
+        .await
+        .expect("kick2");
+        assert!(
+            matches!(
+                r2,
+                buzz_db::relay_admin_actions::KickWithMarkerResult::AlreadyGone
+            ),
+            "second kick must return AlreadyGone (pre-existing absence)"
+        );
+
+        // step_marker must NOT be set on action2 — the marker-fence prevented commit.
+        let rec2 = buzz_db::relay_admin_actions::get_action(&pool, action_id2)
+            .await
+            .expect("get_action2")
+            .expect("exists");
+        assert!(
+            rec2.step_marker.is_none(),
+            "AlreadyGone must not commit step_marker; got: {:?}",
+            rec2.step_marker
+        );
+
+        // Drive enforcement via production driver: AlreadyGone → enforcement failure.
+        let result2 = crate::handlers::report_resolution::drive_enforcement_pub(
+            &state,
+            &tenant,
+            cid,
+            report_id2,
+            "kick",
+            None,
+            None,
+            &actor,
+            Some(&target),
+            None,
+            Some(channel_id),
+            &rec2,
+            None,
+        )
+        .await;
+        assert!(
+            matches!(
+                result2,
+                Err(crate::handlers::report_resolution::ResolutionError::EnforcementFailed { .. })
+            ),
+            "AlreadyGone kick via driver must return EnforcementFailed: {result2:?}"
+        );
+    }
+
+    // ── 3. delivery failure: report resolved but delivery retryable ───────────
+
+    #[tokio::test]
+    #[ignore = "requires Postgres — delivery failure leaves report resolved with retryable delivery"]
+    async fn delivery_failure_leaves_report_resolved_with_retryable_delivery_state() {
+        // Fully finalize a ban, then simulate delivery failures on the outbox row.
+        // Verify: report stays resolved, outbox retries with backoff, terminal
+        // failure only after exhausting attempt limit.
+        let pool = e2e_pool().await;
+        let (community_id, _host) = e2e_community(&pool, "delivery-failure").await;
+        let target = vec![8u8; 32];
+        let actor = vec![9u8; 32];
+        let report_id = e2e_report_pubkey(&pool, community_id, &target).await;
+        let cid = buzz_core::CommunityId::from_uuid(community_id);
+
+        // Full enforcement cycle: claim → enforcing → ban+marker → finalize.
+        let action_id = match buzz_db::relay_admin_actions::claim_report(
+            &pool,
+            cid,
+            report_id,
+            uuid::Uuid::new_v4(),
+            &actor,
+            "operator",
+            "ban",
+            None,
+            None,
+            "resolve:ban",
+            "relay_operator",
+            Some(&target),
+            None,
+            None,
+        )
+        .await
+        .expect("claim")
+        {
+            buzz_db::relay_admin_actions::ClaimResult::Claimed(a) => a.id,
+            other => panic!("expected Claimed, got {other:?}"),
+        };
+        let _ = buzz_db::relay_admin_actions::begin_enforcing(&pool, action_id)
+            .await
+            .expect("begin_enforcing");
+        let _ = buzz_db::relay_admin_actions::execute_ban_with_marker(
+            &pool, action_id, cid, &target, &actor, None,
+        )
+        .await
+        .expect("execute_ban_with_marker");
+        let finalized = buzz_db::relay_admin_actions::finalize_success(
+            &pool,
+            action_id,
+            cid,
+            report_id,
+            "resolved",
+            &actor,
+            "ban",
+            Some(&target),
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("finalize_success");
+        assert!(finalized, "finalize must succeed");
+
+        // Report is resolved.
+        let status: Option<String> =
+            sqlx::query_scalar("SELECT status FROM moderation_reports WHERE id = $1")
+                .bind(report_id)
+                .fetch_optional(&pool)
+                .await
+                .expect("status");
+        assert_eq!(status.as_deref(), Some("resolved"));
+
+        // Find the reporter_notice outbox row.
+        let outbox_rows = buzz_db::relay_admin_actions::list_pending_outbox(&pool, action_id)
+            .await
+            .expect("list_pending_outbox");
+        assert!(
+            !outbox_rows.is_empty(),
+            "outbox rows must exist after finalization"
+        );
+        let outbox_id = outbox_rows[0].id;
+
+        // Fail once: row should stay pending (backoff).
+        buzz_db::relay_admin_actions::fail_outbox_row(&pool, outbox_id, "transient error")
+            .await
+            .expect("fail1");
+        let row1: (String, i32) =
+            sqlx::query_as("SELECT state, attempt_count FROM relay_admin_outbox WHERE id = $1")
+                .bind(outbox_id)
+                .fetch_one(&pool)
+                .await
+                .expect("fetch1");
+        assert_eq!(
+            row1.0, "pending",
+            "after 1 failure, row must remain pending (retryable)"
+        );
+        assert_eq!(row1.1, 1, "attempt_count must be 1");
+
+        // Fail until exhaustion.
+        for _ in 1..(buzz_db::relay_admin_actions::OUTBOX_MAX_ATTEMPTS - 1) {
+            buzz_db::relay_admin_actions::fail_outbox_row(&pool, outbox_id, "transient error")
+                .await
+                .expect("fail n");
+        }
+        // Final failure → terminal.
+        buzz_db::relay_admin_actions::fail_outbox_row(&pool, outbox_id, "final error")
+            .await
+            .expect("fail final");
+        let row_final: (String, i32) =
+            sqlx::query_as("SELECT state, attempt_count FROM relay_admin_outbox WHERE id = $1")
+                .bind(outbox_id)
+                .fetch_one(&pool)
+                .await
+                .expect("fetch final");
+        assert_eq!(
+            row_final.0,
+            "failed",
+            "after {} failures, row must be terminal failed",
+            buzz_db::relay_admin_actions::OUTBOX_MAX_ATTEMPTS
+        );
+        assert_eq!(
+            row_final.1,
+            buzz_db::relay_admin_actions::OUTBOX_MAX_ATTEMPTS
+        );
+
+        // Report stays resolved even though delivery is exhausted.
+        let final_status: Option<String> =
+            sqlx::query_scalar("SELECT status FROM moderation_reports WHERE id = $1")
+                .bind(report_id)
+                .fetch_optional(&pool)
+                .await
+                .expect("final status");
+        assert_eq!(
+            final_status.as_deref(),
+            Some("resolved"),
+            "report must remain resolved even when delivery is exhausted"
+        );
+    }
+
+    // ── 4. lease-expiry action takeover by the worker ─────────────────────────
+
+    #[tokio::test]
+    #[ignore = "requires Postgres — lease-expiry action takeover"]
+    async fn lease_expiry_action_takeover_by_worker() {
+        // A stranded action (pending, lease expired) must be claimed and re-driven
+        // by the action recovery worker path (claim_stranded_admin_action_batch +
+        // drive_enforcement_pub).
+        let pool = e2e_pool().await;
+        let (community_id, host) = e2e_community(&pool, "lease-expiry").await;
+        let target = vec![10u8; 32];
+        let actor = vec![11u8; 32];
+        let report_id = e2e_report_pubkey(&pool, community_id, &target).await;
+        let cid = buzz_core::CommunityId::from_uuid(community_id);
+
+        // Claim: creates pending action with no lease (stranded from birth).
+        let action_id = match buzz_db::relay_admin_actions::claim_report(
+            &pool,
+            cid,
+            report_id,
+            uuid::Uuid::new_v4(),
+            &actor,
+            "operator",
+            "ban",
+            None,
+            None,
+            "resolve:ban",
+            "relay_operator",
+            Some(&target),
+            None,
+            None,
+        )
+        .await
+        .expect("claim")
+        {
+            buzz_db::relay_admin_actions::ClaimResult::Claimed(a) => a.id,
+            other => panic!("expected Claimed, got {other:?}"),
+        };
+
+        // Set a fake expired lease so it appears stranded.
+        let expired_at = chrono::Utc::now() - chrono::Duration::seconds(300);
+        sqlx::query(
+            "UPDATE relay_admin_actions SET action_lease_token = $2, action_lease_expires_at = $3 WHERE id = $1",
+        )
+        .bind(action_id)
+        .bind(uuid::Uuid::new_v4())
+        .bind(expired_at)
+        .execute(&pool)
+        .await
+        .expect("set expired lease");
+
+        // Worker claim: action is stranded (pending with expired lease).
+        let lease_until = chrono::Utc::now() + chrono::Duration::seconds(120);
+        let batch = buzz_db::relay_admin_actions::claim_stranded_action_batch(
+            &pool,
+            "e2e-worker",
+            lease_until,
+            1000,
+        )
+        .await
+        .expect("claim_stranded_action_batch");
+        let claim = batch
+            .into_iter()
+            .find(|c| c.record.id == action_id)
+            .expect("stranded action must appear in batch");
+
+        // Re-drive via drive_enforcement_pub (the actual worker re-drive path).
+        let state = state_from_pool(pool.clone()).await;
+        let tenant = e2e_tenant(community_id, &host);
+        let result = crate::handlers::report_resolution::drive_enforcement_pub(
+            &state,
+            &tenant,
+            cid,
+            report_id,
+            "ban",
+            None,
+            None,
+            &actor,
+            Some(&target),
+            None,
+            None,
+            &claim.record,
+            Some(claim.lease_token), // hold the batch-claim lease
+        )
+        .await;
+        assert!(result.is_ok(), "worker re-drive must succeed: {result:?}");
+
+        // Action must be succeeded and report resolved.
+        let final_rec = buzz_db::relay_admin_actions::get_action(&pool, action_id)
+            .await
+            .expect("final get_action")
+            .expect("exists");
+        assert_eq!(final_rec.state, "succeeded");
+
+        let report_status: Option<String> =
+            sqlx::query_scalar("SELECT status FROM moderation_reports WHERE id = $1")
+                .bind(report_id)
+                .fetch_optional(&pool)
+                .await
+                .expect("report status");
+        assert_eq!(report_status.as_deref(), Some("resolved"));
+
+        // Second claim attempt must find nothing (action is now succeeded).
+        let batch2 = buzz_db::relay_admin_actions::claim_stranded_action_batch(
+            &pool,
+            "e2e-worker-2",
+            lease_until,
+            10,
+        )
+        .await
+        .expect("second claim_stranded");
+        assert!(
+            !batch2.iter().any(|c| c.record.id == action_id),
+            "succeeded action must not appear in stranded batch"
+        );
+    }
+
+    // ── 5. success-gated artifacts: nothing published before enforcement ───────
+
+    #[tokio::test]
+    #[ignore = "requires Postgres — success-gated delivery: no artifacts before enforcement"]
+    async fn success_gated_artifacts_nothing_published_before_enforcement_succeeds() {
+        // Verify the key invariant: no outbox rows exist until finalize_success
+        // commits. Steps: claim → (check no outbox) → advance+marker → (check no
+        // outbox) → finalize → (check outbox rows exist).
+        let pool = e2e_pool().await;
+        let (community_id, _host) = e2e_community(&pool, "success-gated").await;
+        let target = vec![12u8; 32];
+        let actor = vec![13u8; 32];
+        let report_id = e2e_report_pubkey(&pool, community_id, &target).await;
+        let cid = buzz_core::CommunityId::from_uuid(community_id);
+
+        let action_id = match buzz_db::relay_admin_actions::claim_report(
+            &pool,
+            cid,
+            report_id,
+            uuid::Uuid::new_v4(),
+            &actor,
+            "operator",
+            "ban",
+            None,
+            None,
+            "resolve:ban",
+            "relay_operator",
+            Some(&target),
+            None,
+            None,
+        )
+        .await
+        .expect("claim")
+        {
+            buzz_db::relay_admin_actions::ClaimResult::Claimed(a) => a.id,
+            other => panic!("expected Claimed, got {other:?}"),
+        };
+
+        // After claim: no outbox rows.
+        let after_claim: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM relay_admin_outbox WHERE action_id = $1")
+                .bind(action_id)
+                .fetch_one(&pool)
+                .await
+                .expect("count after claim");
+        assert_eq!(after_claim, 0, "no outbox rows after claim (success-gated)");
+
+        // After begin_enforcing + execute_ban_with_marker: still no outbox rows.
+        let _ = buzz_db::relay_admin_actions::begin_enforcing(&pool, action_id)
+            .await
+            .expect("begin_enforcing");
+        let _ = buzz_db::relay_admin_actions::execute_ban_with_marker(
+            &pool, action_id, cid, &target, &actor, None,
+        )
+        .await
+        .expect("execute_ban_with_marker");
+
+        let after_mutation: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM relay_admin_outbox WHERE action_id = $1")
+                .bind(action_id)
+                .fetch_one(&pool)
+                .await
+                .expect("count after mutation");
+        assert_eq!(
+            after_mutation, 0,
+            "no outbox rows after mutation (before finalize)"
+        );
+
+        // After finalize_success: outbox rows must exist.
+        let finalized = buzz_db::relay_admin_actions::finalize_success(
+            &pool,
+            action_id,
+            cid,
+            report_id,
+            "resolved",
+            &actor,
+            "ban",
+            Some(&target),
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("finalize_success");
+        assert!(finalized);
+
+        let after_finalize: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM relay_admin_outbox WHERE action_id = $1")
+                .bind(action_id)
+                .fetch_one(&pool)
+                .await
+                .expect("count after finalize");
+        assert!(
+            after_finalize > 0,
+            "outbox rows must exist only after finalization (success-gated)"
+        );
+
+        // Full e2e via resolve_report_with_enforcement: same invariant through the
+        // production driver entry point.
+        let (community_id2, host2) = e2e_community(&pool, "success-gated-e2e").await;
+        let target2 = vec![14u8; 32];
+        let report_id2 = e2e_report_pubkey(&pool, community_id2, &target2).await;
+        let report2 = e2e_admin_report(report_id2, community_id2, &target2);
+        let state = state_from_pool(pool.clone()).await;
+        let tenant2 = e2e_tenant(community_id2, &host2);
+
+        let result = crate::handlers::report_resolution::resolve_report_with_enforcement(
+            &state,
+            &tenant2,
+            &report2,
+            "ban",
+            None,
+            None,
+            uuid::Uuid::new_v4(),
+            &actor,
+            "operator",
+            "relay_operator",
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "full enforcement via production driver must succeed: {result:?}"
+        );
+
+        let action_id2 = result.unwrap().action_id;
+        let outbox_e2e: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM relay_admin_outbox WHERE action_id = $1")
+                .bind(action_id2)
+                .fetch_one(&pool)
+                .await
+                .expect("e2e outbox count");
+        assert!(
+            outbox_e2e > 0,
+            "production driver must create outbox rows on success"
+        );
+    }
+
+    // ── 6. 9044 vs processing through the actual 9044 adapter ─────────────────
+
+    #[tokio::test]
+    #[ignore = "requires Postgres — 9044 adapter against processing report fails cleanly"]
+    async fn community_9044_through_actual_adapter_against_processing_report() {
+        // Drive through resolve_report_decision_only (the actual function that
+        // handle_resolve calls via its 9044 path) against a report already in
+        // 'processing'. The CAS must fail cleanly — no orphan audit row.
+        let pool = e2e_pool().await;
+        let (community_id, host) = e2e_community(&pool, "9044-adapter").await;
+        let target = vec![15u8; 32];
+        let actor = vec![16u8; 32];
+        let reporter = vec![0u8; 32];
+        let report_id = e2e_report_pubkey(&pool, community_id, &target).await;
+        let cid = buzz_core::CommunityId::from_uuid(community_id);
+        let state = state_from_pool(pool.clone()).await;
+        let tenant = e2e_tenant(community_id, &host);
+
+        // HTTP enforcement: move report to 'processing'.
+        let _ = buzz_db::relay_admin_actions::claim_report(
+            &pool,
+            cid,
+            report_id,
+            uuid::Uuid::new_v4(),
+            &actor,
+            "operator",
+            "ban",
+            None,
+            None,
+            "resolve:ban",
+            "relay_operator",
+            Some(&target),
+            None,
+            None,
+        )
+        .await
+        .expect("enforcement claim");
+
+        // Community 9044 path — calls resolve_report_decision_only which calls
+        // state.db.resolve_report_decision_atomic internally.
+        let result = crate::handlers::report_resolution::resolve_report_decision_only(
+            &state,
+            &tenant,
+            report_id,
+            "dismissed",
+            "dismiss_report",
+            &actor,
+            "community",
+            Some(&target),
+            None,
+            None,
+            None,
+            &reporter,
+        )
+        .await;
+
+        assert!(
+            matches!(
+                result,
+                Err(crate::handlers::report_resolution::ResolutionError::NotOpen(_))
+            ),
+            "9044 adapter against processing report must return NotOpen: {result:?}"
+        );
+
+        // Exactly one audit row (from the enforcement claim); the 9044 attempt
+        // must not have inserted an orphan.
+        let audit_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM moderation_actions WHERE community_id = $1")
+                .bind(community_id)
+                .fetch_one(&pool)
+                .await
+                .expect("audit count");
+        assert_eq!(
+            audit_count, 1,
+            "no orphan audit row from failed 9044 adapter call"
+        );
     }
 }

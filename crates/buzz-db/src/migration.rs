@@ -564,7 +564,7 @@ mod tests {
         let mut migrations: Vec<_> = MIGRATOR.iter().collect();
         migrations.sort_by_key(|migration| migration.version);
 
-        assert_eq!(migrations.len(), 30);
+        assert_eq!(migrations.len(), 31);
         assert_eq!(migrations[0].version, 1);
         assert_eq!(&*migrations[0].description, "initial schema");
         assert!(migrations[0]
@@ -986,6 +986,25 @@ mod tests {
         assert!(
             relay_admin_actions.contains("step_marker"),
             "migration 30 relay_admin_actions must include step_marker for crash recovery"
+        );
+
+        assert_eq!(migrations[30].version, 31);
+        let action_lease = migrations[30].sql.as_str();
+        assert!(
+            action_lease.contains("action_lease_token"),
+            "migration 31 must add action_lease_token to relay_admin_actions"
+        );
+        assert!(
+            action_lease.contains("action_lease_expires_at"),
+            "migration 31 must add action_lease_expires_at to relay_admin_actions"
+        );
+        assert!(
+            action_lease.contains("attempt_count"),
+            "migration 31 must add attempt_count to relay_admin_outbox"
+        );
+        assert!(
+            action_lease.contains("retry_after"),
+            "migration 31 must add retry_after to relay_admin_outbox"
         );
     }
 

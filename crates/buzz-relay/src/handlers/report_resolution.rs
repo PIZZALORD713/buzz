@@ -7,18 +7,31 @@
 //!   a linked decision audit row in **one transaction**.
 //!
 //! - [`resolve_report_with_enforcement`] — HTTP `delete`/`kick`/`ban`/`timeout`.
-//!   Claims the report (`open → processing`) in one transaction, runs the
-//!   durable enforcement mutation, commits the step marker, then enqueues
-//!   artifact delivery into `relay_admin_outbox`. Delivery is driven by the
-//!   outbox worker ([`crate::handlers::admin_outbox_worker`]) — **never from
-//!   this request path**.
+//!   Claims the report (`open → processing`) in one transaction, acquires an
+//!   action lease to prevent concurrent double-mutation, executes the durable
+//!   enforcement mutation and step marker in **one atomic DB transaction**
+//!   (via `execute_*_with_marker`), then finalizes (action → succeeded, report →
+//!   resolved, outbox rows enqueued) in a third transaction.  Delivery is driven
+//!   by the outbox worker ([`crate::handlers::admin_outbox_worker`]) and the
+//!   action recovery worker ([`crate::handlers::admin_action_worker`]) — **never
+//!   from this request path**.
 //!
 //! ## Crash safety
 //!
-//! A crash after `mutation_committed` is committed re-drives by checking
-//! `step_marker` and skipping the already-idempotent mutation. The finalization
-//! transaction requires both `step_marker = 'mutation_committed'` and the
-//! matching `active_action_id` on the report row.
+//! Each enforcement mutation and its `step_marker = 'mutation_committed'` are
+//! written in a single PG transaction (`execute_*_with_marker`). A crash between
+//! claim and the mutation transaction leaves the action in `pending`/`enforcing`
+//! with no step marker — the action recovery worker re-drives it via
+//! `claim_stranded_action_batch`. A crash after `mutation_committed` re-drives
+//! directly to `finalize_success` (marker already set → skip mutation). A crash
+//! after finalization leaves outbox rows pending for the outbox worker.
+//!
+//! ## Action lease
+//!
+//! An action lease token prevents two concurrent drivers (two HTTP retries with
+//! the same `request_id`) from both running the mutation branch. The loser of
+//! `acquire_action_lease` gets `Contended`, reloads, and loops — seeing the
+//! updated step state rather than re-running the mutation.
 //!
 //! ## Action matrix (frozen per Plan v3/v4 §7)
 //!
@@ -36,7 +49,7 @@ use uuid::Uuid;
 
 use buzz_core::tenant::TenantContext;
 use buzz_db::admin_moderation::AdminReportDetail;
-use buzz_db::relay_admin_actions::{AdminActionRecord, ClaimResult, KickResult};
+use buzz_db::relay_admin_actions::{AdminActionRecord, ClaimResult};
 
 use crate::state::AppState;
 
@@ -226,9 +239,9 @@ pub async fn resolve_report_decision_only(
 
 /// Resolve a report with server-side enforcement.
 ///
-/// Claims report via CAS (`open → processing`) in one transaction, runs the
-/// durable enforcement mutation, commits the step marker, then enqueues
-/// outbox delivery commands. Artifact delivery never runs from this path.
+/// Claims report via CAS (`open → processing`) in one transaction, acquires an
+/// action lease, runs the durable enforcement mutation + step marker in one atomic
+/// DB transaction, then finalizes. Delivery never runs from this path.
 #[allow(clippy::too_many_arguments)]
 pub async fn resolve_report_with_enforcement(
     state: &Arc<AppState>,
@@ -289,8 +302,8 @@ pub async fn resolve_report_with_enforcement(
         target_pubkey_opt.as_deref(),
         target_event_id_opt.as_deref(),
         channel_id,
-        &report.report.reporter_pubkey,
         &action_record,
+        None, // HTTP path: no pre-held lease
     )
     .await
 }
@@ -308,16 +321,22 @@ struct EnforcementCtx<'a> {
 }
 
 /// Drive the enforcement state machine from the given action record forward to
-/// completion, then enqueue outbox delivery tasks.
+/// completion.
 ///
-/// Uses a loop rather than recursion to advance through CAS contention without
-/// boxing async futures. The loop terminates because each iteration either
-/// returns or advances the action to a strictly later state (pending →
-/// enforcing → succeeded/failed).
+/// Uses a loop (not recursion) to advance through CAS contention and lease
+/// contention without boxing async futures. The loop terminates because each
+/// iteration either returns or advances the action to a strictly later state
+/// (pending → enforcing → mutation_committed → succeeded/failed).
+///
+/// Each enforcement mutation and its `step_marker = 'mutation_committed'` are
+/// committed in a **single DB transaction** (`execute_*_with_marker`), guarded
+/// by an action lease to prevent two concurrent drivers from both running the
+/// mutation. Delivery rows are created atomically in `finalize_success` — never
+/// before enforcement succeeds.
 #[allow(clippy::too_many_arguments)]
 async fn drive_enforcement(
     state: &Arc<AppState>,
-    tenant: &TenantContext,
+    _tenant: &TenantContext,
     community_id: buzz_core::tenant::CommunityId,
     report_id: Uuid,
     action: &str,
@@ -327,8 +346,11 @@ async fn drive_enforcement(
     target_pubkey: Option<&[u8]>,
     target_event_id: Option<&[u8]>,
     channel_id: Option<Uuid>,
-    reporter_pubkey_hex: &str,
     initial_record: &AdminActionRecord,
+    // Pre-held lease token from a batch claim (e.g. stranded action worker).
+    // When present, skip the acquire_action_lease call — the caller already
+    // holds an exclusive lease on this action row.
+    held_lease: Option<Uuid>,
 ) -> Result<EnforcementResolved, ResolutionError> {
     // Work on an owned copy so we can replace it when reloading.
     let mut rec = initial_record.clone();
@@ -380,11 +402,58 @@ async fn drive_enforcement(
                 })?;
         }
 
-        // Run mutation only if step marker is not yet committed. After a crash that
-        // lands here on re-drive, step_marker is still None so the mutation runs
-        // again — all mutations are idempotent (ban/timeout: upsert; kick/delete:
-        // no-op if already done, except kick-AlreadyGone which is surfaced distinctly).
+        // Run mutation only if step marker is not yet committed.
         if rec.step_marker.is_none() {
+            // Acquire exclusive action lease before running the mutation. Two
+            // concurrent HTTP retries with the same request_id would both reach
+            // this branch; the lease ensures only one runs the mutation.
+            // When the caller already holds a lease (e.g. the stranded-action
+            // recovery worker after a batch claim), skip re-acquisition.
+            let lease_token = if let Some(token) = held_lease {
+                token
+            } else {
+                let lease_until = chrono::Utc::now() + chrono::Duration::seconds(60);
+                let lease = state
+                    .db
+                    .acquire_admin_action_lease(action_id, lease_until)
+                    .await
+                    .map_err(ResolutionError::from)?;
+
+                match lease {
+                    buzz_db::relay_admin_actions::LeaseResult::Acquired(token) => token,
+                    buzz_db::relay_admin_actions::LeaseResult::Contended => {
+                        // Another driver holds the lease. Wait briefly, reload, and loop.
+                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                        rec = state
+                            .db
+                            .get_admin_action(action_id)
+                            .await
+                            .map_err(ResolutionError::from)?
+                            .ok_or_else(|| {
+                                ResolutionError::Internal(
+                                    "action disappeared while waiting for lease".to_string(),
+                                )
+                            })?;
+                        continue;
+                    }
+                    buzz_db::relay_admin_actions::LeaseResult::NotLeasable => {
+                        // Action reached a terminal state concurrently. Reload.
+                        rec = state
+                            .db
+                            .get_admin_action(action_id)
+                            .await
+                            .map_err(ResolutionError::from)?
+                            .ok_or_else(|| {
+                                ResolutionError::Internal(
+                                    "action disappeared (not leasable)".to_string(),
+                                )
+                            })?;
+                        continue;
+                    }
+                }
+            };
+
+            // We hold the lease — run the atomic mutation + marker.
             let ctx = EnforcementCtx {
                 community_id,
                 action,
@@ -395,29 +464,36 @@ async fn drive_enforcement(
                 target_event_id,
                 channel_id,
             };
-            match run_enforcement_mutation(state, &ctx).await {
-                Ok(()) => {
-                    // Commit step marker. A crash before this commit restarts here
-                    // and re-runs the idempotent mutation.
-                    let committed = state
+            let mutation_result = run_atomic_mutation(state, action_id, &ctx).await;
+
+            // Release lease regardless of outcome so the action worker
+            // can pick up a failed action. Skip if we were given the lease
+            // from a batch claim (caller manages its own lease lifecycle).
+            if held_lease.is_none() {
+                let _ = state
+                    .db
+                    .release_admin_action_lease(action_id, lease_token)
+                    .await;
+            }
+
+            match mutation_result {
+                Ok(false) => {
+                    // step_marker already set by a concurrent driver;
+                    // reload and advance to finalization.
+                    rec = state
                         .db
-                        .commit_action_mutation_step(action_id)
+                        .get_admin_action(action_id)
                         .await
-                        .map_err(ResolutionError::from)?;
-                    if !committed {
-                        // Lost ownership: reload and loop.
-                        rec = state
-                            .db
-                            .get_admin_action(action_id)
-                            .await
-                            .map_err(ResolutionError::from)?
-                            .ok_or_else(|| {
-                                ResolutionError::Internal(
-                                    "action disappeared after mutation".to_string(),
-                                )
-                            })?;
-                        continue;
-                    }
+                        .map_err(ResolutionError::from)?
+                        .ok_or_else(|| {
+                            ResolutionError::Internal(
+                                "action disappeared after mutation".to_string(),
+                            )
+                        })?;
+                    continue;
+                }
+                Ok(true) => {
+                    // Marker committed. Fall through to finalization below.
                 }
                 Err(e) => {
                     let _ = state
@@ -431,12 +507,22 @@ async fn drive_enforcement(
                 }
             }
         }
-
-        // Finalize: action → succeeded, report → resolved.
+        // Finalize: action → succeeded, report → resolved, outbox rows created.
         // Requires step_marker = 'mutation_committed' AND active_action_id = this action.
         let finalized = state
             .db
-            .finalize_action_success(action_id, community_id, report_id, "resolved", actor_pubkey)
+            .finalize_action_success(
+                action_id,
+                community_id,
+                report_id,
+                "resolved",
+                actor_pubkey,
+                action,
+                target_pubkey,
+                target_event_id,
+                channel_id,
+                reason,
+            )
             .await
             .map_err(ResolutionError::from)?;
 
@@ -458,32 +544,22 @@ async fn drive_enforcement(
             )));
         }
 
-        // Enqueue outbox delivery tasks. Processed by the admin outbox worker.
-        // ON CONFLICT DO NOTHING makes this idempotent on re-drive.
-        enqueue_delivery_tasks(
-            state,
-            tenant,
-            action_id,
-            action,
-            reason,
-            actor_pubkey,
-            target_pubkey,
-            target_event_id,
-            channel_id,
-            reporter_pubkey_hex,
-            report_id,
-        )
-        .await;
-
         info!(action_id = %action_id, report_id = %report_id, action = %action, "enforcement resolved");
         return Ok(EnforcementResolved { action_id });
     }
 }
 
-async fn run_enforcement_mutation(
+/// Execute the enforcement mutation AND commit `step_marker = 'mutation_committed'`
+/// in a single DB transaction, fenced by `action_id`.
+///
+/// Returns `Ok(true)` if this driver committed the marker (successful mutation),
+/// `Ok(false)` if the marker was already committed (another driver raced us),
+/// `Err` if the mutation itself failed.
+async fn run_atomic_mutation(
     state: &Arc<AppState>,
+    action_id: Uuid,
     ctx: &EnforcementCtx<'_>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<bool> {
     match ctx.action {
         "ban" => {
             let target = ctx
@@ -491,9 +567,15 @@ async fn run_enforcement_mutation(
                 .ok_or_else(|| anyhow::anyhow!("ban requires target_pubkey"))?;
             state
                 .db
-                .ban_community_member(ctx.community_id, target, ctx.actor_pubkey, ctx.reason, None)
+                .execute_ban_with_marker(
+                    action_id,
+                    ctx.community_id,
+                    target,
+                    ctx.actor_pubkey,
+                    ctx.reason,
+                )
                 .await
-                .map_err(|e| anyhow::anyhow!("ban failed: {e}"))?;
+                .map_err(|e| anyhow::anyhow!("ban failed: {e}"))
         }
         "timeout" => {
             let target = ctx
@@ -504,7 +586,8 @@ async fn run_enforcement_mutation(
                 .ok_or_else(|| anyhow::anyhow!("timeout requires timeout_until"))?;
             state
                 .db
-                .timeout_community_member(
+                .execute_timeout_with_marker(
+                    action_id,
                     ctx.community_id,
                     target,
                     ctx.actor_pubkey,
@@ -512,7 +595,7 @@ async fn run_enforcement_mutation(
                     ctx.reason,
                 )
                 .await
-                .map_err(|e| anyhow::anyhow!("timeout failed: {e}"))?;
+                .map_err(|e| anyhow::anyhow!("timeout failed: {e}"))
         }
         "kick" => {
             let target = ctx
@@ -521,21 +604,17 @@ async fn run_enforcement_mutation(
             let ch = ctx
                 .channel_id
                 .ok_or_else(|| anyhow::anyhow!("kick requires channel_id"))?;
-            // Distinguish provenance: AlreadyGone = target was absent BEFORE this
-            // action. That is not successful enforcement — surface it distinctly
-            // so the operator knows vs. Removed (new removal this action performed).
             match state
                 .db
-                .deploy_kick_member(ctx.community_id, ch, target, ctx.actor_pubkey)
+                .execute_kick_with_marker(action_id, ctx.community_id, ch, target, ctx.actor_pubkey)
                 .await
                 .map_err(|e| anyhow::anyhow!("kick failed: {e}"))?
             {
-                KickResult::Removed => {}
-                KickResult::AlreadyGone => {
-                    return Err(anyhow::anyhow!(
-                        "kick target was already absent before this action"
-                    ))
-                }
+                buzz_db::relay_admin_actions::KickWithMarkerResult::Removed => Ok(true),
+                buzz_db::relay_admin_actions::KickWithMarkerResult::AlreadyMarked => Ok(false),
+                buzz_db::relay_admin_actions::KickWithMarkerResult::AlreadyGone => Err(
+                    anyhow::anyhow!("kick target was already absent before this action"),
+                ),
             }
         }
         "delete" => {
@@ -549,114 +628,73 @@ async fn run_enforcement_mutation(
                 .map_err(|e| anyhow::anyhow!("thread metadata lookup failed: {e}"))?;
             let parent_id = meta.as_ref().and_then(|m| m.parent_event_id.clone());
             let root_id = meta.as_ref().and_then(|m| m.root_event_id.clone());
-            // false = already deleted = idempotent success.
-            let _ = state
+            state
                 .db
-                .soft_delete_event_and_update_thread(
+                .execute_delete_with_marker(
+                    action_id,
                     ctx.community_id,
                     target,
                     parent_id.as_deref(),
                     root_id.as_deref(),
                 )
                 .await
-                .map_err(|e| anyhow::anyhow!("soft_delete failed: {e}"))?;
+                .map_err(|e| anyhow::anyhow!("delete failed: {e}"))
         }
-        other => return Err(anyhow::anyhow!("unexpected enforcement action: {other}")),
+        other => Err(anyhow::anyhow!("unexpected enforcement action: {other}")),
     }
-    Ok(())
 }
 
-/// Enqueue outbox delivery tasks. Processed by admin outbox worker, not this path.
-/// All tasks use `dedup_key` so re-enqueue on re-drive is idempotent.
+/// Decode the report target hex into binary (public for the action recovery worker).
+pub type TargetPair = (Option<Vec<u8>>, Option<Vec<u8>>);
+
+/// Decode a report target's `target_kind` + hex string into a `(pubkey_bytes, event_id_bytes)` pair.
+///
+/// Exposed for use by the action recovery worker and tests.
+pub fn decode_report_target_pub(
+    target_kind: &str,
+    target_hex: &str,
+) -> Result<TargetPair, ResolutionError> {
+    decode_report_target(target_kind, target_hex)
+}
+
+/// Re-drive an enforcement action from a persisted record (used by the action
+/// recovery worker). Equivalent to calling `drive_enforcement` from the persisted
+/// step state rather than from a fresh HTTP claim.
 #[allow(clippy::too_many_arguments)]
-async fn enqueue_delivery_tasks(
+pub async fn drive_enforcement_pub(
     state: &Arc<AppState>,
     tenant: &TenantContext,
-    action_id: Uuid,
+    community_id: buzz_core::tenant::CommunityId,
+    report_id: Uuid,
     action: &str,
     reason: Option<&str>,
+    timeout_until: Option<DateTime<Utc>>,
     actor_pubkey: &[u8],
     target_pubkey: Option<&[u8]>,
     target_event_id: Option<&[u8]>,
     channel_id: Option<Uuid>,
-    reporter_pubkey_hex: &str,
-    report_id: Uuid,
-) {
-    if action == "delete" {
-        if let (Some(ch), Some(target_id)) = (channel_id, target_event_id) {
-            let payload = serde_json::json!({
-                "community_id": tenant.community().to_string(),
-                "channel_id": ch.to_string(),
-                "actor": hex::encode(actor_pubkey),
-                "target_event_id": hex::encode(target_id),
-                "action_id": action_id.to_string(),
-                "reason_code": reason.unwrap_or(""),
-            });
-            if let Err(e) = state
-                .db
-                .enqueue_admin_outbox(
-                    action_id,
-                    "tombstone",
-                    payload,
-                    &format!("tombstone:{action_id}"),
-                )
-                .await
-            {
-                warn!(error = %e, action_id = %action_id, "tombstone enqueue failed");
-            }
-        }
-    }
-
-    if action == "kick" {
-        if let (Some(ch), Some(target)) = (channel_id, target_pubkey) {
-            let payload = serde_json::json!({
-                "community_id": tenant.community().to_string(),
-                "channel_id": ch.to_string(),
-                "actor": hex::encode(actor_pubkey),
-                "target": hex::encode(target),
-                "action_id": action_id.to_string(),
-            });
-            if let Err(e) = state
-                .db
-                .enqueue_admin_outbox(
-                    action_id,
-                    "system_message",
-                    payload,
-                    &format!("system_message:{action_id}"),
-                )
-                .await
-            {
-                warn!(error = %e, action_id = %action_id, "kick system message enqueue failed");
-            }
-        }
-    }
-
-    let summary = reason
-        .map(|r| r.to_string())
-        .unwrap_or_else(|| "Your report was reviewed and acted on.".to_string());
-    let payload = serde_json::json!({
-        "reporter_pubkey_hex": reporter_pubkey_hex,
-        "report_id": report_id.to_string(),
-        "action_id": action_id.to_string(),
-        "community_id": tenant.community().to_string(),
-        "summary": summary,
-    });
-    if let Err(e) = state
-        .db
-        .enqueue_admin_outbox(
-            action_id,
-            "reporter_notice",
-            payload,
-            &format!("reporter_notice:{action_id}"),
-        )
-        .await
-    {
-        warn!(error = %e, action_id = %action_id, "reporter notice enqueue failed");
-    }
+    initial_record: &AdminActionRecord,
+    // Pre-held lease token from a batch claim.  Pass `None` when re-driving
+    // from the HTTP path (the driver will acquire its own lease).
+    held_lease: Option<Uuid>,
+) -> Result<EnforcementResolved, ResolutionError> {
+    drive_enforcement(
+        state,
+        tenant,
+        community_id,
+        report_id,
+        action,
+        reason,
+        timeout_until,
+        actor_pubkey,
+        target_pubkey,
+        target_event_id,
+        channel_id,
+        initial_record,
+        held_lease,
+    )
+    .await
 }
-
-/// Decode the report target hex into binary.
-type TargetPair = (Option<Vec<u8>>, Option<Vec<u8>>);
 
 fn decode_report_target(
     target_kind: &str,

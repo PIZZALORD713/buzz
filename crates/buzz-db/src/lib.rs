@@ -4267,7 +4267,9 @@ impl Db {
         relay_admin_actions::commit_mutation_step(&self.pool, action_id).await
     }
 
-    /// Finalize enforcement: action → succeeded, report → terminal status.
+    /// Finalize enforcement: action → succeeded, report → terminal status,
+    /// and enqueue outbox delivery rows atomically.
+    #[allow(clippy::too_many_arguments)]
     pub async fn finalize_action_success(
         &self,
         action_id: uuid::Uuid,
@@ -4275,6 +4277,11 @@ impl Db {
         report_id: uuid::Uuid,
         terminal_status: &str,
         actor_pubkey: &[u8],
+        action_name: &str,
+        target_pubkey: Option<&[u8]>,
+        target_event_id: Option<&[u8]>,
+        channel_id: Option<uuid::Uuid>,
+        reason: Option<&str>,
     ) -> Result<bool> {
         relay_admin_actions::finalize_success(
             &self.pool,
@@ -4283,6 +4290,133 @@ impl Db {
             report_id,
             terminal_status,
             actor_pubkey,
+            action_name,
+            target_pubkey,
+            target_event_id,
+            channel_id,
+            reason,
+        )
+        .await
+    }
+
+    /// Atomically execute a ban mutation and commit the step marker.
+    /// Returns `true` if this driver committed the marker, `false` if already marked.
+    pub async fn execute_ban_with_marker(
+        &self,
+        action_id: uuid::Uuid,
+        community_id: CommunityId,
+        target_pubkey: &[u8],
+        actor_pubkey: &[u8],
+        reason: Option<&str>,
+    ) -> Result<bool> {
+        relay_admin_actions::execute_ban_with_marker(
+            &self.pool,
+            action_id,
+            community_id,
+            target_pubkey,
+            actor_pubkey,
+            reason,
+        )
+        .await
+    }
+
+    /// Atomically execute a timeout mutation and commit the step marker.
+    /// Returns `true` if this driver committed the marker, `false` if already marked.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn execute_timeout_with_marker(
+        &self,
+        action_id: uuid::Uuid,
+        community_id: CommunityId,
+        target_pubkey: &[u8],
+        actor_pubkey: &[u8],
+        until: chrono::DateTime<chrono::Utc>,
+        reason: Option<&str>,
+    ) -> Result<bool> {
+        relay_admin_actions::execute_timeout_with_marker(
+            &self.pool,
+            action_id,
+            community_id,
+            target_pubkey,
+            actor_pubkey,
+            until,
+            reason,
+        )
+        .await
+    }
+
+    /// Atomically execute a kick mutation and commit the step marker.
+    /// Returns `Removed` (member was present), `AlreadyGone` (absent before this action),
+    /// or `AlreadyMarked` (marker already committed by another driver).
+    pub async fn execute_kick_with_marker(
+        &self,
+        action_id: uuid::Uuid,
+        community_id: CommunityId,
+        channel_id: uuid::Uuid,
+        target_pubkey: &[u8],
+        actor_pubkey: &[u8],
+    ) -> Result<relay_admin_actions::KickWithMarkerResult> {
+        relay_admin_actions::execute_kick_with_marker(
+            &self.pool,
+            action_id,
+            community_id,
+            channel_id,
+            target_pubkey,
+            actor_pubkey,
+        )
+        .await
+    }
+
+    /// Atomically execute a soft-delete mutation and commit the step marker.
+    /// Returns `true` if this driver committed the marker, `false` if already marked.
+    pub async fn execute_delete_with_marker(
+        &self,
+        action_id: uuid::Uuid,
+        community_id: CommunityId,
+        target_event_id: &[u8],
+        parent_event_id: Option<&[u8]>,
+        root_event_id: Option<&[u8]>,
+    ) -> Result<bool> {
+        relay_admin_actions::execute_delete_with_marker(
+            &self.pool,
+            action_id,
+            community_id,
+            target_event_id,
+            parent_event_id,
+            root_event_id,
+        )
+        .await
+    }
+
+    /// Acquire the action mutation lease (prevents concurrent double-mutation).
+    pub async fn acquire_admin_action_lease(
+        &self,
+        action_id: uuid::Uuid,
+        lease_until: chrono::DateTime<chrono::Utc>,
+    ) -> Result<relay_admin_actions::LeaseResult> {
+        relay_admin_actions::acquire_action_lease(&self.pool, action_id, lease_until).await
+    }
+
+    /// Release the action mutation lease. No-op if caller no longer holds the token.
+    pub async fn release_admin_action_lease(
+        &self,
+        action_id: uuid::Uuid,
+        lease_token: uuid::Uuid,
+    ) -> Result<()> {
+        relay_admin_actions::release_action_lease(&self.pool, action_id, lease_token).await
+    }
+
+    /// Claim a batch of stranded `relay_admin_actions` for the action recovery worker.
+    pub async fn claim_stranded_admin_action_batch(
+        &self,
+        worker_id: &str,
+        lease_until: chrono::DateTime<chrono::Utc>,
+        batch_size: i64,
+    ) -> Result<Vec<relay_admin_actions::StrandedActionClaim>> {
+        relay_admin_actions::claim_stranded_action_batch(
+            &self.pool,
+            worker_id,
+            lease_until,
+            batch_size,
         )
         .await
     }

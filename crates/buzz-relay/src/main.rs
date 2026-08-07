@@ -729,6 +729,19 @@ async fn main() -> anyhow::Result<()> {
         info!("Admin outbox delivery worker started");
     }
 
+    // Action recovery worker: re-drives stranded relay_admin_actions rows whose
+    // action lease expired before the enforcement state machine completed.
+    // Crash safety: a process that died between claim and finalization leaves
+    // an action in pending/enforcing; this worker resumes from the persisted
+    // step_marker state without re-running the mutation.
+    {
+        let action_state = Arc::clone(&state);
+        tokio::spawn(
+            async move { buzz_relay::handlers::admin_action_worker::run(action_state).await },
+        );
+        info!("Admin action recovery worker started");
+    }
+
     // NIP-ER reminder scheduler — polls for due reminders and publishes them
     // to Redis pub/sub for cross-pod fan-out. Each pod's existing
     // subscribe_local consumer picks them up and applies the author-only gate.
