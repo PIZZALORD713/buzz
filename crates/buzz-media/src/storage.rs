@@ -15,6 +15,59 @@ use serde::{Deserialize, Serialize};
 /// A stream of byte chunks from S3, usable with `axum::body::Body::from_stream()`.
 pub type ByteStream = Pin<Box<dyn futures_core::Stream<Item = Result<Bytes, MediaError>> + Send>>;
 
+/// Full-object stream plus metadata resolved from one migration candidate.
+pub struct BlobStream {
+    pub size: u64,
+    pub stream: ByteStream,
+}
+
+/// Parsed single-range request independent of object size.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PayloadByteRange {
+    /// `bytes=START-END` or `bytes=START-`. `end` is inclusive when present.
+    Absolute { start: u64, end: Option<u64> },
+    /// `bytes=-N`, the final N bytes.
+    Suffix(u64),
+}
+
+impl PayloadByteRange {
+    /// Resolve this range against a known total object size.
+    pub fn bounds(self, total: u64) -> Option<(u64, u64)> {
+        match self {
+            Self::Absolute { start, end } => {
+                if let Some(end) = end {
+                    if start > end {
+                        return None;
+                    }
+                    Some((start, end))
+                } else {
+                    Some((start, u64::MAX))
+                }
+            }
+            Self::Suffix(n) => {
+                if n == 0 || total == 0 {
+                    return None;
+                }
+                let start = total.saturating_sub(n);
+                Some((start, total.saturating_sub(1)))
+            }
+        }
+    }
+}
+
+/// Result of a tenant-scoped byte-range read.
+pub enum PayloadRangeRead {
+    Satisfiable {
+        total: u64,
+        start: u64,
+        end: u64,
+        bytes: Vec<u8>,
+    },
+    Unsatisfiable {
+        total: u64,
+    },
+}
+
 /// S3-compatible object storage client.
 pub struct MediaStorage {
     bucket: Box<Bucket>,
@@ -234,7 +287,12 @@ impl MediaStorage {
     /// Intended for HTTP 206 range responses on large video blobs.
     pub async fn get_range(&self, key: &str, start: u64, end: u64) -> Result<Vec<u8>, MediaError> {
         match self.bucket.get_object_range(key, start, Some(end)).await {
-            Ok(response) => Ok(response.to_vec()),
+            Ok(response) if response.status_code() == 404 => Err(MediaError::NotFound),
+            Ok(response) if (200..300).contains(&response.status_code()) => Ok(response.to_vec()),
+            Ok(response) => Err(MediaError::StorageError(format!(
+                "S3 range GET returned status {}",
+                response.status_code()
+            ))),
             Err(s3::error::S3Error::HttpFailWithBody(404, _)) => Err(MediaError::NotFound),
             Err(e) => Err(MediaError::StorageError(e.to_string())),
         }
@@ -246,14 +304,22 @@ impl MediaStorage {
     /// The full object is never buffered — intended for streaming large
     /// blobs (video) directly into HTTP responses via `Body::from_stream()`.
     pub async fn get_stream(&self, key: &str) -> Result<ByteStream, MediaError> {
-        let response = self
-            .bucket
-            .get_object_stream(key)
-            .await
-            .map_err(|e| MediaError::StorageError(e.to_string()))?;
+        let response = match self.bucket.get_object_stream(key).await {
+            Ok(response) => response,
+            Err(s3::error::S3Error::HttpFailWithBody(404, _)) => {
+                return Err(MediaError::NotFound);
+            }
+            Err(e) => return Err(MediaError::StorageError(e.to_string())),
+        };
 
         if response.status_code == 404 {
             return Err(MediaError::NotFound);
+        }
+        if !(200..300).contains(&response.status_code) {
+            return Err(MediaError::StorageError(format!(
+                "S3 GET returned status {}",
+                response.status_code
+            )));
         }
 
         let stream = futures_util::StreamExt::map(response.bytes, |chunk| {
@@ -398,6 +464,180 @@ impl MediaStorage {
                 Err(error)
             }
         }
+    }
+
+    /// HEAD a media payload according to the configured read layout.
+    pub async fn head_payload(
+        &self,
+        ctx: &TenantContext,
+        payload_name: &str,
+    ) -> Result<BlobHeadMeta, MediaError> {
+        for candidate in self.ordered_read_candidates(ctx, payload_name)? {
+            match self.head_with_metadata(&candidate.key).await {
+                Ok(Some(meta)) => {
+                    self.record_read_resolution(candidate.result);
+                    return Ok(meta);
+                }
+                Ok(None) => {
+                    self.record_candidate_missing(candidate);
+                }
+                Err(error) => {
+                    self.record_read_resolution(ReadResolution::StorageError);
+                    return Err(error);
+                }
+            }
+        }
+
+        self.record_read_resolution(ReadResolution::Missing);
+        Err(MediaError::NotFound)
+    }
+
+    /// Stream a media payload by trying read-layout candidates with the real GET.
+    ///
+    /// A candidate that disappears between its metadata lookup and GET falls
+    /// through to the next layout only on `NotFound`; storage/auth/transport
+    /// errors are surfaced so fallback cannot mask an unhealthy store.
+    pub async fn get_payload_stream(
+        &self,
+        ctx: &TenantContext,
+        payload_name: &str,
+    ) -> Result<BlobStream, MediaError> {
+        for candidate in self.ordered_read_candidates(ctx, payload_name)? {
+            let meta = match self.head_with_metadata(&candidate.key).await {
+                Ok(Some(meta)) => meta,
+                Ok(None) => {
+                    self.record_candidate_missing(candidate);
+                    continue;
+                }
+                Err(error) => {
+                    self.record_read_resolution(ReadResolution::StorageError);
+                    return Err(error);
+                }
+            };
+
+            match self.get_stream(&candidate.key).await {
+                Ok(stream) => {
+                    self.record_read_resolution(candidate.result);
+                    return Ok(BlobStream {
+                        size: meta.size,
+                        stream,
+                    });
+                }
+                Err(MediaError::NotFound) => {
+                    self.record_candidate_missing(candidate);
+                }
+                Err(error) => {
+                    self.record_read_resolution(ReadResolution::StorageError);
+                    return Err(error);
+                }
+            }
+        }
+
+        self.record_read_resolution(ReadResolution::Missing);
+        Err(MediaError::NotFound)
+    }
+
+    /// Read a bounded byte range from a media payload by trying read-layout
+    /// candidates with the real range GET.
+    pub async fn get_payload_range(
+        &self,
+        ctx: &TenantContext,
+        payload_name: &str,
+        requested_range: PayloadByteRange,
+        max_len: u64,
+    ) -> Result<PayloadRangeRead, MediaError> {
+        for candidate in self.ordered_read_candidates(ctx, payload_name)? {
+            let total = match self.head_with_metadata(&candidate.key).await {
+                Ok(Some(meta)) => meta.size,
+                Ok(None) => {
+                    self.record_candidate_missing(candidate);
+                    continue;
+                }
+                Err(error) => {
+                    self.record_read_resolution(ReadResolution::StorageError);
+                    return Err(error);
+                }
+            };
+
+            let Some((start, end)) = requested_range.bounds(total) else {
+                self.record_read_resolution(candidate.result);
+                return Ok(PayloadRangeRead::Unsatisfiable { total });
+            };
+
+            if start >= total {
+                self.record_read_resolution(candidate.result);
+                return Ok(PayloadRangeRead::Unsatisfiable { total });
+            }
+
+            let max_end = start.saturating_add(max_len.max(1).saturating_sub(1));
+            let end = end.min(total.saturating_sub(1)).min(max_end);
+
+            match self.get_range(&candidate.key, start, end).await {
+                Ok(bytes) => {
+                    self.record_read_resolution(candidate.result);
+                    return Ok(PayloadRangeRead::Satisfiable {
+                        total,
+                        start,
+                        end,
+                        bytes,
+                    });
+                }
+                Err(MediaError::NotFound) => {
+                    self.record_candidate_missing(candidate);
+                }
+                Err(error) => {
+                    self.record_read_resolution(ReadResolution::StorageError);
+                    return Err(error);
+                }
+            }
+        }
+
+        self.record_read_resolution(ReadResolution::Missing);
+        Err(MediaError::NotFound)
+    }
+
+    fn ordered_read_candidates(
+        &self,
+        ctx: &TenantContext,
+        payload_name: &str,
+    ) -> Result<Vec<ReadCandidate>, MediaError> {
+        let candidates = crate::keys::read_candidates(ctx, payload_name).map_err(|_| {
+            self.record_read_resolution(ReadResolution::Missing);
+            MediaError::NotFound
+        })?;
+
+        let mut ordered = Vec::with_capacity(2);
+        if self.migration_phase.reads_sharded() {
+            ordered.push(ReadCandidate {
+                key: candidates.sharded,
+                result: ReadResolution::Sharded,
+            });
+        }
+        if self.migration_phase.reads_legacy() {
+            ordered.push(ReadCandidate {
+                key: candidates.legacy,
+                result: ReadResolution::Legacy,
+            });
+        }
+        Ok(ordered)
+    }
+
+    fn record_candidate_missing(&self, candidate: ReadCandidate) {
+        if matches!(candidate.result, ReadResolution::Sharded)
+            && self.migration_phase.reads_legacy()
+        {
+            metrics::counter!("buzz_media_s3_read_fallbacks_total").increment(1);
+        }
+    }
+
+    fn record_read_resolution(&self, resolution: ReadResolution) {
+        let result = match resolution {
+            ReadResolution::Sharded => "sharded",
+            ReadResolution::Legacy => "legacy",
+            ReadResolution::Missing => "missing",
+            ReadResolution::StorageError => "storage_error",
+        };
+        metrics::counter!("buzz_media_s3_read_resolutions_total", "result" => result).increment(1);
     }
 
     /// Copy an object within the media bucket using an S3 server-side copy.
@@ -656,6 +896,20 @@ mod tests {
             "video/mp4"
         );
     }
+}
+
+#[derive(Debug, Clone)]
+struct ReadCandidate {
+    key: String,
+    result: ReadResolution,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ReadResolution {
+    Sharded,
+    Legacy,
+    Missing,
+    StorageError,
 }
 
 /// Metadata returned by HEAD — just enough for BUD-01 response headers.
