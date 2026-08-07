@@ -29,23 +29,37 @@ pub enum ConfigError {
 /// Configured by `BUZZ_ADMIN_AUTH`. Exactly one variant is active; invalid
 /// combinations (e.g. `BUZZ_ADMIN_TOKEN` set in `Nip98` mode) are startup
 /// errors — they are not representable.
+///
+/// # Role resolution (nip98 mode only)
+///
+/// In `nip98` mode the authenticated pubkey is resolved to an
+/// `AdminPrincipal` at request time via [`crate::api::admin::auth::resolve_admin_principal`]:
+/// - `Operator/Config` if pubkey ∈ `RELAY_OPERATOR_PUBKEYS`
+/// - `Operator/OwnerFallback` if pubkey == `RELAY_OWNER_PUBKEY` **and**
+///   `RELAY_OPERATOR_PUBKEYS` is empty (evaluated from config, never runtime rows)
+/// - `Moderator/Db` from the `relay_operators` table otherwise
+/// - `None` → 403 (no fall-through role, ever)
+///
+/// `token`/`disabled` modes retain exactly the existing read surface; they
+/// expose no role, no capabilities, and no mutation endpoints.
 #[derive(Debug, Clone)]
 pub enum AdminAuth {
     /// Operator bearer credential required on every request.
     /// Selected by `BUZZ_ADMIN_AUTH=token` (or leaving `BUZZ_ADMIN_AUTH` unset).
+    /// Read-only surface only; mutations require `nip98` mode.
     Token(AdminToken),
     /// Bearer authentication disabled. The operator has explicitly asserted
     /// that the admin API is protected at the network layer (reverse proxy,
     /// VPN, firewall). `Host`/`Origin` checks remain active as defense-in-depth.
     /// Selected by `BUZZ_ADMIN_AUTH=disabled`.
+    /// Read-only surface only; mutations require `nip98` mode.
     Disabled,
     /// NIP-98 HTTP Auth. Every request must carry an `Authorization: Nostr`
-    /// header containing a signed kind-27235 event. The pubkey is checked
-    /// against `BUZZ_ADMIN_PUBKEYS`. Selected by `BUZZ_ADMIN_AUTH=nip98`.
-    Nip98 {
-        /// Allowlisted operator pubkeys (64-char lowercase hex, deduplicated).
-        pubkeys: Vec<String>,
-    },
+    /// header containing a signed kind-27235 event. The authenticated pubkey
+    /// is resolved to an [`crate::api::admin::auth::AdminPrincipal`] at request
+    /// time from config + DB. Selected by `BUZZ_ADMIN_AUTH=nip98`.
+    /// Only mode that exposes mutation and staffing endpoints.
+    Nip98,
 }
 
 /// Deny-by-default read-only deployment-admin configuration.
@@ -655,19 +669,24 @@ impl Config {
             .ok()
             .map(|s| s.trim().to_lowercase())
             .filter(|s| !s.is_empty())
-            .and_then(|s| {
+            .map(|s| {
                 // Must be exactly 64 lowercase hex characters (32-byte pubkey).
+                // Fail closed — once RELAY_OWNER_PUBKEY can be the break-glass
+                // operator root (owner-fallback B), silently discarding a malformed
+                // value would be a lockout, not a graceful degradation.
                 let valid = s.len() == 64 && s.chars().all(|c| c.is_ascii_hexdigit());
                 if valid {
-                    Some(s)
+                    Ok(s)
                 } else {
-                    warn!(
-                        "RELAY_OWNER_PUBKEY is not a valid 64-char hex pubkey — ignoring. \
-                         Got: {s:?}"
-                    );
-                    None
+                    Err(ConfigError::InvalidValue(format!(
+                        "RELAY_OWNER_PUBKEY is not a valid 64-char hex pubkey — \
+                         got: {s:?}. Fix or unset it; a malformed value is a startup error \
+                         because this key can serve as the break-glass operator root when \
+                         RELAY_OPERATOR_PUBKEYS is empty."
+                    )))
                 }
-            });
+            })
+            .transpose()?;
 
         // Note: intentionally not prefixed with BUZZ_ — same relay-identity
         // config family as RELAY_OWNER_PUBKEY. Comma-separated 64-char hex
@@ -968,12 +987,6 @@ impl Config {
                          the admin dashboard and API stay disabled and the value is ignored"
                     );
                 }
-                if std::env::var_os("BUZZ_ADMIN_PUBKEYS").is_some() {
-                    tracing::warn!(
-                        "BUZZ_ADMIN_PUBKEYS is set without BUZZ_ADMIN_HOST — \
-                         the admin dashboard and API stay disabled and the value is ignored"
-                    );
-                }
                 None
             }
             Some(host) => {
@@ -1002,48 +1015,6 @@ impl Config {
                     }
                 };
 
-                // Parse BUZZ_ADMIN_PUBKEYS — required non-empty in nip98 mode;
-                // warn-and-ignore in all other modes (same ignored-var convention
-                // as BUZZ_ADMIN_TOKEN without BUZZ_ADMIN_HOST).
-                let admin_pubkeys_raw = std::env::var("BUZZ_ADMIN_PUBKEYS").ok();
-                if auth_mode != "nip98" && admin_pubkeys_raw.is_some() {
-                    tracing::warn!(
-                        "BUZZ_ADMIN_PUBKEYS is set but BUZZ_ADMIN_AUTH is not \"nip98\" — \
-                         the value is ignored"
-                    );
-                }
-                let admin_pubkeys: Vec<String> = if auth_mode == "nip98" {
-                    let raw = admin_pubkeys_raw.unwrap_or_default();
-                    let mut pubkeys = Vec::new();
-                    for entry in raw.split(',') {
-                        let entry = entry.trim().to_lowercase();
-                        if entry.is_empty() {
-                            continue;
-                        }
-                        let valid =
-                            entry.len() == 64 && entry.chars().all(|c| c.is_ascii_hexdigit());
-                        if !valid {
-                            return Err(ConfigError::InvalidValue(format!(
-                                "BUZZ_ADMIN_PUBKEYS entry is not a valid 64-char hex pubkey: \
-                                 {entry:?}"
-                            )));
-                        }
-                        if !pubkeys.contains(&entry) {
-                            pubkeys.push(entry);
-                        }
-                    }
-                    if pubkeys.is_empty() {
-                        return Err(ConfigError::InvalidValue(
-                            "BUZZ_ADMIN_PUBKEYS must be a non-empty comma-separated list of \
-                             64-char hex pubkeys when BUZZ_ADMIN_AUTH=nip98"
-                                .to_string(),
-                        ));
-                    }
-                    pubkeys
-                } else {
-                    Vec::new()
-                };
-
                 // BUZZ_ADMIN_TOKEN set in nip98 or disabled mode is ambiguous intent; fail
                 // closed.
                 if auth_mode != "token" && std::env::var_os("BUZZ_ADMIN_TOKEN").is_some() {
@@ -1062,9 +1033,7 @@ impl Config {
                         );
                         AdminAuth::Disabled
                     }
-                    "nip98" => AdminAuth::Nip98 {
-                        pubkeys: admin_pubkeys,
-                    },
+                    "nip98" => AdminAuth::Nip98,
                     _ => AdminAuth::Token(parse_admin_token()?),
                 };
 
@@ -1245,12 +1214,7 @@ mod tests {
     /// Run `Config::from_env()` with the admin variables forced to `values`,
     /// restoring the ambient environment afterwards.
     fn config_with_admin_env(values: &[(&str, Option<&str>)]) -> Result<Config, ConfigError> {
-        const KEYS: [&str; 4] = [
-            "BUZZ_ADMIN_HOST",
-            "BUZZ_ADMIN_TOKEN",
-            "BUZZ_ADMIN_AUTH",
-            "BUZZ_ADMIN_PUBKEYS",
-        ];
+        const KEYS: [&str; 3] = ["BUZZ_ADMIN_HOST", "BUZZ_ADMIN_TOKEN", "BUZZ_ADMIN_AUTH"];
         let previous: Vec<_> = KEYS
             .iter()
             .map(|key| (*key, std::env::var_os(key)))
@@ -1475,67 +1439,18 @@ mod tests {
     }
 
     #[test]
-    fn nip98_mode_parses_pubkeys_and_deduplicates() {
+    fn nip98_mode_parses_and_succeeds_without_pubkeys_env() {
         let _guard = ENV_MUTEX.lock().unwrap();
-        let pubkey_a = "a".repeat(64);
-        let pubkey_b = "b".repeat(64);
         let admin = config_with_admin_env(&[
             ("BUZZ_ADMIN_HOST", Some("admin.example")),
             ("BUZZ_ADMIN_AUTH", Some("nip98")),
-            (
-                "BUZZ_ADMIN_PUBKEYS",
-                Some(&format!("{pubkey_a},{pubkey_b},{pubkey_a}")),
-            ),
         ])
-        .expect("nip98 mode with valid pubkeys is valid")
+        .expect(
+            "nip98 mode succeeds without BUZZ_ADMIN_PUBKEYS (role resolution is at request time)",
+        )
         .admin
         .expect("admin surface is configured");
-        match admin.auth {
-            crate::config::AdminAuth::Nip98 { ref pubkeys } => {
-                assert_eq!(pubkeys, &[pubkey_a, pubkey_b]);
-            }
-            other => panic!("expected Nip98, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn nip98_mode_requires_nonempty_pubkeys() {
-        let _guard = ENV_MUTEX.lock().unwrap();
-        for pubkeys in [None, Some(""), Some("  ,  ")] {
-            let result = config_with_admin_env(&[
-                ("BUZZ_ADMIN_HOST", Some("admin.example")),
-                ("BUZZ_ADMIN_AUTH", Some("nip98")),
-                ("BUZZ_ADMIN_PUBKEYS", pubkeys),
-            ]);
-            assert!(
-                matches!(
-                    result,
-                    Err(ConfigError::InvalidValue(ref message))
-                        if message.contains("BUZZ_ADMIN_PUBKEYS")
-                ),
-                "{pubkeys:?} must be rejected: {result:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn nip98_mode_rejects_invalid_pubkey_entries() {
-        let _guard = ENV_MUTEX.lock().unwrap();
-        for bad in ["not-a-pubkey", &"a".repeat(63), &"z".repeat(64)] {
-            let result = config_with_admin_env(&[
-                ("BUZZ_ADMIN_HOST", Some("admin.example")),
-                ("BUZZ_ADMIN_AUTH", Some("nip98")),
-                ("BUZZ_ADMIN_PUBKEYS", Some(bad)),
-            ]);
-            assert!(
-                matches!(
-                    result,
-                    Err(ConfigError::InvalidValue(ref message))
-                        if message.contains("BUZZ_ADMIN_PUBKEYS")
-                ),
-                "{bad:?} must be rejected: {result:?}"
-            );
-        }
+        assert!(matches!(admin.auth, crate::config::AdminAuth::Nip98));
     }
 
     #[test]
@@ -1544,7 +1459,6 @@ mod tests {
         let result = config_with_admin_env(&[
             ("BUZZ_ADMIN_HOST", Some("admin.example")),
             ("BUZZ_ADMIN_AUTH", Some("nip98")),
-            ("BUZZ_ADMIN_PUBKEYS", Some(&"a".repeat(64))),
             ("BUZZ_ADMIN_TOKEN", Some(VALID_ADMIN_TOKEN)),
         ]);
         assert!(
@@ -1556,6 +1470,45 @@ mod tests {
             ),
             "nip98 + token must be a startup error: {result:?}"
         );
+    }
+
+    #[test]
+    fn malformed_relay_owner_pubkey_is_a_startup_error_not_warn_and_ignore() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        let previous = std::env::var_os("RELAY_OWNER_PUBKEY");
+        for bad in ["not-a-pubkey", &"a".repeat(63), &"z".repeat(64), "abcd"] {
+            std::env::set_var("RELAY_OWNER_PUBKEY", bad);
+            let result = Config::from_env();
+            std::env::remove_var("RELAY_OWNER_PUBKEY");
+            assert!(
+                matches!(
+                    result,
+                    Err(ConfigError::InvalidValue(ref message))
+                        if message.contains("RELAY_OWNER_PUBKEY")
+                ),
+                "malformed RELAY_OWNER_PUBKEY {bad:?} must be a startup error, got: {result:?}"
+            );
+        }
+        // Restore.
+        match previous {
+            Some(v) => std::env::set_var("RELAY_OWNER_PUBKEY", v),
+            None => std::env::remove_var("RELAY_OWNER_PUBKEY"),
+        }
+    }
+
+    #[test]
+    fn valid_relay_owner_pubkey_parses_correctly() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        let previous = std::env::var_os("RELAY_OWNER_PUBKEY");
+        let valid = "a".repeat(64);
+        std::env::set_var("RELAY_OWNER_PUBKEY", &valid);
+        let config = Config::from_env().expect("valid RELAY_OWNER_PUBKEY parses");
+        std::env::remove_var("RELAY_OWNER_PUBKEY");
+        match previous {
+            Some(v) => std::env::set_var("RELAY_OWNER_PUBKEY", v),
+            None => {}
+        }
+        assert_eq!(config.relay_owner_pubkey, Some(valid));
     }
 
     #[test]

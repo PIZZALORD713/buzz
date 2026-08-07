@@ -43,6 +43,8 @@ pub mod reaction;
 pub mod relay_invite;
 /// Relay-level membership persistence (NIP-43).
 pub mod relay_members;
+/// Deployment-global operator/moderator roster persistence.
+pub mod relay_operators;
 /// Replica freshness fence for keyset-cursor read routing.
 pub mod replica_fence;
 /// Thread metadata persistence.
@@ -4152,6 +4154,36 @@ impl Db {
     /// inserted, or 0 if the `pubkey_allowlist` table doesn't exist.
     pub async fn backfill_from_allowlist(&self, community: CommunityId) -> Result<u64> {
         relay_members::backfill_from_allowlist(&self.pool, community).await
+    }
+
+    // ── relay_operators (deployment-global principal roster) ──────────────────
+
+    /// Fetch one relay operator/moderator row by pubkey (32-byte binary).
+    pub async fn get_relay_operator(
+        &self,
+        pubkey: &[u8],
+    ) -> Result<Option<relay_operators::RelayOperatorRecord>> {
+        relay_operators::get(&self.pool, pubkey).await
+    }
+
+    /// List all relay operator/moderator rows ordered by creation time.
+    pub async fn list_relay_operators(&self) -> Result<Vec<relay_operators::RelayOperatorRecord>> {
+        relay_operators::list(&self.pool).await
+    }
+
+    /// Insert or update a relay operator/moderator row (upsert by pubkey).
+    pub async fn upsert_relay_operator(
+        &self,
+        pubkey: &[u8],
+        role: &str,
+        added_by: &[u8],
+    ) -> Result<()> {
+        relay_operators::upsert(&self.pool, pubkey, role, added_by).await
+    }
+
+    /// Remove a relay operator/moderator row. Returns `true` if deleted.
+    pub async fn remove_relay_operator(&self, pubkey: &[u8]) -> Result<bool> {
+        relay_operators::remove(&self.pool, pubkey).await
     }
 
     /// Mints a v2 use-limited relay invite. The plaintext code is returned

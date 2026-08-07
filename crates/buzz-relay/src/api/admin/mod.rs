@@ -1,11 +1,14 @@
-//! Private, read-only deployment moderation API.
+//! Private deployment moderation API.
+//!
+//! Read routes are available in all auth modes (token, disabled, nip98).
+//! Mutation and staffing routes require `BUZZ_ADMIN_AUTH=nip98`.
 
 mod auth;
 mod error;
 
 use std::sync::Arc;
 
-use auth::authorize;
+use auth::{authorize, AdminRole, AdminSource};
 use axum::{
     extract::{Path, Query, State},
     http::{header, HeaderMap, HeaderValue, Uri},
@@ -24,9 +27,14 @@ pub(crate) fn is_admin_host(state: &crate::state::AppState, headers: &HeaderMap)
     auth::is_admin_host(state, headers)
 }
 
-/// Build the read-only deployment-admin routes.
+/// Build the deployment-admin routes.
+///
+/// Read routes are available in all auth modes.
+/// Mutation routes (/reports/{id}/resolve, /feedback/{id}) and staffing routes
+/// (/operators) require BUZZ_ADMIN_AUTH=nip98.
 pub fn router(state: Arc<crate::state::AppState>) -> Router {
     Router::new()
+        .route("/probe", get(probe))
         .route("/reports", get(reports))
         .route("/reports/{id}", get(report_detail))
         .route("/feedback", get(feedback))
@@ -90,6 +98,84 @@ fn validate(value: Option<&str>, allowed: &[&str], code: &'static str) -> Result
     }
 }
 
+/// Probe response — allows the desktop to discover the auth mode, role, and
+/// available capabilities before rendering the console UI.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ProbeResponse {
+    /// `"ok"`
+    status: &'static str,
+    /// Auth mode: `"nip98"` | `"token"` | `"disabled"`.
+    auth_mode: &'static str,
+    /// Role of the authenticated principal (`"operator"` | `"moderator"`),
+    /// or `null` in token/disabled modes (no named principal).
+    role: Option<&'static str>,
+    /// How the role was established (`"config"` | `"owner_fallback"` | `"db"`),
+    /// or `null` when role is null.
+    source: Option<&'static str>,
+    /// Whether mutation (report-action) endpoints are available.
+    can_act: bool,
+    /// Whether staffing endpoints (/operators) are available.
+    can_staff: bool,
+}
+
+async fn probe(
+    State(state): State<Arc<crate::state::AppState>>,
+    uri: Uri,
+    headers: HeaderMap,
+) -> Result<Json<ProbeResponse>, ApiError> {
+    let principal = authorize(
+        &state,
+        &headers,
+        uri.path_and_query()
+            .map_or_else(|| uri.path(), |pq| pq.as_str()),
+        "GET",
+        None,
+    )
+    .await?;
+
+    let (auth_mode, role, source, can_act, can_staff) = match &state.config.admin {
+        Some(config) => match &config.auth {
+            crate::config::AdminAuth::Token(_) => ("token", None, None, false, false),
+            crate::config::AdminAuth::Disabled => ("disabled", None, None, false, false),
+            crate::config::AdminAuth::Nip98 => {
+                // principal is Some in nip98 mode (authorize returns Ok(Some(_)))
+                let p = principal
+                    .as_ref()
+                    .expect("nip98 mode always resolves principal");
+                let role_str = match p.role {
+                    AdminRole::Operator => "operator",
+                    AdminRole::Moderator => "moderator",
+                };
+                let source_str = match p.source {
+                    AdminSource::Config => "config",
+                    AdminSource::OwnerFallback => "owner_fallback",
+                    AdminSource::Db => "db",
+                };
+                let can_act = true; // both Operator and Moderator can act
+                let can_staff = p.role == AdminRole::Operator;
+                (
+                    "nip98",
+                    Some(role_str),
+                    Some(source_str),
+                    can_act,
+                    can_staff,
+                )
+            }
+        },
+        None => return Err(ApiError::not_found()),
+    };
+
+    Ok(Json(ProbeResponse {
+        status: "ok",
+        auth_mode,
+        role,
+        source,
+        can_act,
+        can_staff,
+    }))
+}
+
 async fn reports(
     State(state): State<Arc<crate::state::AppState>>,
     uri: Uri,
@@ -101,6 +187,8 @@ async fn reports(
         &headers,
         uri.path_and_query()
             .map_or_else(|| uri.path(), |pq| pq.as_str()),
+        "GET",
+        None,
     )
     .await?;
     validate(
@@ -140,6 +228,8 @@ async fn report_detail(
         &headers,
         uri.path_and_query()
             .map_or_else(|| uri.path(), |pq| pq.as_str()),
+        "GET",
+        None,
     )
     .await?;
     state
@@ -172,6 +262,8 @@ async fn feedback(
         &headers,
         uri.path_and_query()
             .map_or_else(|| uri.path(), |pq| pq.as_str()),
+        "GET",
+        None,
     )
     .await?;
     let items = state
@@ -206,6 +298,8 @@ async fn feedback_detail(
         &headers,
         uri.path_and_query()
             .map_or_else(|| uri.path(), |pq| pq.as_str()),
+        "GET",
+        None,
     )
     .await?;
     state
@@ -227,6 +321,8 @@ async fn feedback_attachment(
         &headers,
         uri.path_and_query()
             .map_or_else(|| uri.path(), |pq| pq.as_str()),
+        "GET",
+        None,
     )
     .await?;
     if !is_sha256(&sha256) {
@@ -891,8 +987,8 @@ mod tests {
         }
     }
 
-    /// Build a test AppState in nip98 mode with the given allowlisted pubkeys
-    /// and an AlwaysFreshReplayGuard (replay is never an issue for most tests).
+    /// Build a test AppState in nip98 mode with the given operator pubkeys
+    /// (populated in relay_operator_pubkeys config) and an AlwaysFreshReplayGuard.
     async fn nip98_state(pubkeys: Vec<String>) -> Arc<crate::state::AppState> {
         nip98_state_with_replay(pubkeys, Arc::new(AlwaysFreshReplayGuard)).await
     }
@@ -904,9 +1000,16 @@ mod tests {
         let mut config = crate::config::Config::from_env().expect("default config loads");
         config.require_relay_membership = false;
         config.redis_url = "redis://127.0.0.1:1".to_string();
+        // Populate relay_operator_pubkeys so resolve_admin_principal can grant
+        // Operator/Config to the test pubkeys without a DB lookup.
+        config.relay_operator_pubkeys = pubkeys;
+        // Ensure relay_operator_api_origin is set (required when pubkeys is non-empty).
+        if !config.relay_operator_pubkeys.is_empty() {
+            config.relay_operator_api_origin = Some("https://admin.example".to_string());
+        }
         config.admin = Some(crate::config::AdminConfig {
             host: "admin.example".to_string(),
-            auth: crate::config::AdminAuth::Nip98 { pubkeys },
+            auth: crate::config::AdminAuth::Nip98,
             web_dir: None,
         });
         let pool = sqlx::PgPool::connect_lazy(&config.database_url).expect("lazy pg pool");
@@ -989,7 +1092,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn nip98_mode_valid_event_from_allowlisted_pubkey_is_served() {
+    async fn nip98_mode_valid_event_from_operator_pubkey_is_served() {
         let keys = nostr::Keys::generate();
         let state = nip98_state(vec![keys.public_key().to_hex()]).await;
         let auth = make_nostr_auth(&keys, "/reports");
@@ -1008,11 +1111,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn nip98_mode_valid_event_wrong_pubkey_is_401() {
-        let allowlisted = nostr::Keys::generate();
-        let other = nostr::Keys::generate();
-        let state = nip98_state(vec![allowlisted.public_key().to_hex()]).await;
-        let auth = make_nostr_auth(&other, "/reports");
+    #[ignore = "requires Postgres — DB lookup returns None for unknown key → 403"]
+    async fn nip98_mode_valid_event_unknown_pubkey_is_403() {
+        let operator = nostr::Keys::generate();
+        let unknown = nostr::Keys::generate();
+        let state = nip98_state(vec![operator.public_key().to_hex()]).await;
+        let auth = make_nostr_auth(&unknown, "/reports");
         let response = status_for(
             state,
             Request::builder()
@@ -1023,7 +1127,9 @@ mod tests {
                 .expect("request"),
         )
         .await;
-        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        // NIP-98 signature is valid but the pubkey has no operator/moderator
+        // grant — that is an authorization failure (403), not an auth failure.
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
     }
 
     #[tokio::test]
@@ -1204,5 +1310,200 @@ mod tests {
         )
         .await;
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    // ── Phase 1 acceptance tests ─────────────────────────────────────────
+    //
+    // Method-substitution and payload-tag checks are exercised via
+    // authorize() directly (see auth::tests) — the admin API calls
+    // authorize() per-handler after routing, so a POST to a GET-only route
+    // returns 405 from the router before any auth code runs. The HTTP-level
+    // integration tests for mutation endpoints live in Phase 2 once those
+    // routes exist.
+
+    // ── token/disabled mode probe tests ─────────────────────────────────
+
+    #[tokio::test]
+    async fn probe_in_token_mode_returns_no_role_and_no_capabilities() {
+        let state = test_state().await; // token mode
+        let response = status_for(state.clone(), status_request(authorized("/probe"))).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        // Body should report no role and can_act=false.
+        let bytes = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        let probe: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(probe["authMode"], "token");
+        assert!(probe["role"].is_null(), "token mode has no role");
+        assert_eq!(probe["canAct"], false);
+        assert_eq!(probe["canStaff"], false);
+    }
+
+    #[tokio::test]
+    async fn probe_in_disabled_mode_returns_no_role_and_no_capabilities() {
+        let state = disabled_mode_state().await;
+        let response = status_for(
+            state,
+            Request::builder()
+                .uri("/probe")
+                .header(header::HOST, "admin.example")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        let probe: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(probe["authMode"], "disabled");
+        assert!(probe["role"].is_null(), "disabled mode has no role");
+        assert_eq!(probe["canAct"], false);
+        assert_eq!(probe["canStaff"], false);
+    }
+
+    /// Fallback B: when RELAY_OPERATOR_PUBKEYS is empty, RELAY_OWNER_PUBKEY is
+    /// the implicit Operator and the probe returns role=operator, source=owner_fallback.
+    #[tokio::test]
+    async fn probe_in_nip98_mode_with_owner_fallback_b_returns_operator_role() {
+        let owner_keys = nostr::Keys::generate();
+        let mut config = crate::config::Config::from_env().expect("default config");
+        config.require_relay_membership = false;
+        config.redis_url = "redis://127.0.0.1:1".to_string();
+        // Empty operator list — activates fallback B.
+        config.relay_operator_pubkeys = vec![];
+        config.relay_owner_pubkey = Some(owner_keys.public_key().to_hex());
+        config.admin = Some(crate::config::AdminConfig {
+            host: "admin.example".to_string(),
+            auth: crate::config::AdminAuth::Nip98,
+            web_dir: None,
+        });
+        let pool = sqlx::PgPool::connect_lazy(&config.database_url).expect("lazy pg pool");
+        let db = buzz_db::Db::from_pool(pool.clone());
+        let redis_pool = deadpool_redis::Config::from_url(&config.redis_url)
+            .create_pool(Some(deadpool_redis::Runtime::Tokio1))
+            .expect("redis pool");
+        let pubsub = Arc::new(
+            buzz_pubsub::PubSubManager::new(&config.redis_url, redis_pool.clone())
+                .await
+                .expect("pubsub manager"),
+        );
+        let audit = buzz_audit::AuditService::new(pool.clone());
+        let auth = buzz_auth::AuthService::new(config.auth.clone());
+        let search = buzz_search::SearchService::new(pool.clone());
+        let workflow_engine = Arc::new(buzz_workflow::WorkflowEngine::new(
+            db.clone(),
+            buzz_workflow::WorkflowConfig::default(),
+        ));
+        let media_storage = buzz_media::MediaStorage::new(&config.media).expect("media storage");
+        let (mut state, _) = crate::state::AppState::new(
+            config,
+            db,
+            redis_pool,
+            audit,
+            pubsub,
+            auth,
+            search,
+            workflow_engine,
+            nostr::Keys::generate(),
+            media_storage,
+        );
+        state.nip98_replay = Arc::new(AlwaysFreshReplayGuard);
+        let state = Arc::new(state);
+
+        let auth_header = make_nostr_auth(&owner_keys, "/probe");
+        let response = status_for(
+            state,
+            Request::builder()
+                .uri("/probe")
+                .header(header::HOST, "admin.example")
+                .header(header::AUTHORIZATION, auth_header)
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        let probe: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(probe["authMode"], "nip98");
+        assert_eq!(probe["role"], "operator");
+        assert_eq!(probe["source"], "owner_fallback");
+        assert_eq!(probe["canAct"], true);
+        assert_eq!(probe["canStaff"], true);
+    }
+
+    /// Fallback B does NOT activate when RELAY_OPERATOR_PUBKEYS is non-empty:
+    /// the owner key is then treated as an unknown pubkey → DB lookup → 403.
+    #[tokio::test]
+    #[ignore = "requires Postgres — owner key not in config, falls to DB lookup → 403"]
+    async fn probe_owner_fallback_b_disabled_when_operator_pubkeys_nonempty() {
+        let owner_keys = nostr::Keys::generate();
+        let other_operator = nostr::Keys::generate();
+        // Non-empty RELAY_OPERATOR_PUBKEYS — owner fallback should NOT apply.
+        let state = nip98_state(vec![other_operator.public_key().to_hex()]).await;
+
+        // Inject RELAY_OWNER_PUBKEY into the state config manually.
+        // We need a fresh state with both set.
+        let mut config = crate::config::Config::from_env().expect("default config");
+        config.require_relay_membership = false;
+        config.redis_url = "redis://127.0.0.1:1".to_string();
+        config.relay_operator_pubkeys = vec![other_operator.public_key().to_hex()];
+        config.relay_operator_api_origin = Some("https://admin.example".to_string());
+        config.relay_owner_pubkey = Some(owner_keys.public_key().to_hex());
+        config.admin = Some(crate::config::AdminConfig {
+            host: "admin.example".to_string(),
+            auth: crate::config::AdminAuth::Nip98,
+            web_dir: None,
+        });
+        drop(state); // not used
+        let pool = sqlx::PgPool::connect_lazy(&config.database_url).expect("lazy pg pool");
+        let db = buzz_db::Db::from_pool(pool.clone());
+        let redis_pool = deadpool_redis::Config::from_url(&config.redis_url)
+            .create_pool(Some(deadpool_redis::Runtime::Tokio1))
+            .expect("redis pool");
+        let pubsub = Arc::new(
+            buzz_pubsub::PubSubManager::new(&config.redis_url, redis_pool.clone())
+                .await
+                .expect("pubsub manager"),
+        );
+        let audit = buzz_audit::AuditService::new(pool.clone());
+        let auth = buzz_auth::AuthService::new(config.auth.clone());
+        let search = buzz_search::SearchService::new(pool.clone());
+        let workflow_engine = Arc::new(buzz_workflow::WorkflowEngine::new(
+            db.clone(),
+            buzz_workflow::WorkflowConfig::default(),
+        ));
+        let media_storage = buzz_media::MediaStorage::new(&config.media).expect("media storage");
+        let (mut state, _) = crate::state::AppState::new(
+            config,
+            db,
+            redis_pool,
+            audit,
+            pubsub,
+            auth,
+            search,
+            workflow_engine,
+            nostr::Keys::generate(),
+            media_storage,
+        );
+        state.nip98_replay = Arc::new(AlwaysFreshReplayGuard);
+        let state = Arc::new(state);
+
+        // Owner key signs a valid NIP-98 credential, but fallback B is OFF.
+        let auth_header = make_nostr_auth(&owner_keys, "/probe");
+        let response = status_for(
+            state,
+            Request::builder()
+                .uri("/probe")
+                .header(header::HOST, "admin.example")
+                .header(header::AUTHORIZATION, auth_header)
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await;
+        // Should be 403: valid NIP-98 credential, but no grant.
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
     }
 }

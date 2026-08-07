@@ -47,6 +47,15 @@ impl ApiError {
         }
     }
 
+    pub fn forbidden_with_message(message: &'static str) -> Self {
+        Self {
+            status: StatusCode::FORBIDDEN,
+            code: "forbidden",
+            message,
+            www_authenticate: "Bearer",
+        }
+    }
+
     pub fn unauthorized() -> Self {
         Self {
             status: StatusCode::UNAUTHORIZED,

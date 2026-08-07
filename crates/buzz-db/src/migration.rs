@@ -348,6 +348,7 @@ mod tests {
             "push_gateway_delivery_request_replays",
             "product_feedback",
             "replica_heartbeat",
+            "relay_operators",
         ] {
             if normalized[insert_pos..].contains(&format!("'{value}'")) {
                 globals.insert(value.to_owned());
@@ -561,7 +562,7 @@ mod tests {
         let mut migrations: Vec<_> = MIGRATOR.iter().collect();
         migrations.sort_by_key(|migration| migration.version);
 
-        assert_eq!(migrations.len(), 27);
+        assert_eq!(migrations.len(), 28);
         assert_eq!(migrations[0].version, 1);
         assert_eq!(&*migrations[0].description, "initial schema");
         assert!(migrations[0]
@@ -940,6 +941,25 @@ mod tests {
             desired_schema.contains("idx_channels_id_live"),
             "desired-state schema must carry the channel-id lookup index",
         );
+
+        assert_eq!(migrations[27].version, 28);
+        let relay_operators = migrations[27].sql.as_str();
+        assert!(
+            relay_operators.contains("CREATE TABLE relay_operators"),
+            "migration 28 must create relay_operators"
+        );
+        assert!(
+            relay_operators.contains("_operator_global_tables"),
+            "migration 28 must register relay_operators in _operator_global_tables"
+        );
+        assert!(
+            relay_operators.contains("actor_authority"),
+            "migration 28 must add actor_authority to moderation_actions"
+        );
+        assert!(
+            relay_operators.contains("processing"),
+            "migration 28 must add processing status to moderation_reports"
+        );
     }
 
     #[test]
@@ -1182,7 +1202,7 @@ mod tests {
         run_migrations(&pool)
             .await
             .expect("retry succeeds after operator repair");
-        assert_eq!(applied_versions(&pool).await.last().copied(), Some(27));
+        assert_eq!(applied_versions(&pool).await.last().copied(), Some(28));
     }
 
     #[tokio::test]
