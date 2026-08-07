@@ -39,6 +39,7 @@ pub mod product_feedback;
 pub mod push;
 /// Reaction persistence.
 pub mod reaction;
+pub mod relay_admin_actions;
 /// Use-limited relay invite persistence (v2 opaque tokens).
 pub mod relay_invite;
 /// Relay-level membership persistence (NIP-43).
@@ -4184,6 +4185,146 @@ impl Db {
     /// Remove a relay operator/moderator row. Returns `true` if deleted.
     pub async fn remove_relay_operator(&self, pubkey: &[u8]) -> Result<bool> {
         relay_operators::remove(&self.pool, pubkey).await
+    }
+
+    // ── relay_admin_actions (HTTP enforcement state machine) ──────────────────
+
+    /// Attempt to claim a report for HTTP enforcement (CAS open → processing).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn claim_report_for_enforcement(
+        &self,
+        community_id: CommunityId,
+        report_id: uuid::Uuid,
+        request_id: uuid::Uuid,
+        actor_pubkey: &[u8],
+        actor_role: &str,
+        action: &str,
+        reason: Option<&str>,
+        timeout_until: Option<chrono::DateTime<chrono::Utc>>,
+        audit_action: &str,
+        actor_authority: &str,
+        target_pubkey: Option<&[u8]>,
+        target_event_id: Option<&[u8]>,
+        channel_id: Option<uuid::Uuid>,
+    ) -> Result<relay_admin_actions::ClaimResult> {
+        relay_admin_actions::claim_report(
+            &self.pool,
+            community_id,
+            report_id,
+            request_id,
+            actor_pubkey,
+            actor_role,
+            action,
+            reason,
+            timeout_until,
+            audit_action,
+            actor_authority,
+            target_pubkey,
+            target_event_id,
+            channel_id,
+        )
+        .await
+    }
+
+    /// Advance an action from 'pending' to 'enforcing'.
+    pub async fn begin_enforcing_action(&self, action_id: uuid::Uuid) -> Result<bool> {
+        relay_admin_actions::begin_enforcing(&self.pool, action_id).await
+    }
+
+    /// Commit the core mutation step (advance step_marker to 'mutation_committed').
+    pub async fn commit_action_mutation_step(&self, action_id: uuid::Uuid) -> Result<bool> {
+        relay_admin_actions::commit_mutation_step(&self.pool, action_id).await
+    }
+
+    /// Finalize enforcement: action → succeeded, report → terminal status.
+    pub async fn finalize_action_success(
+        &self,
+        action_id: uuid::Uuid,
+        community_id: CommunityId,
+        report_id: uuid::Uuid,
+        terminal_status: &str,
+        actor_pubkey: &[u8],
+    ) -> Result<bool> {
+        relay_admin_actions::finalize_success(
+            &self.pool,
+            action_id,
+            community_id,
+            report_id,
+            terminal_status,
+            actor_pubkey,
+        )
+        .await
+    }
+
+    /// Record a pre-mutation enforcement failure (keeps report in 'processing').
+    pub async fn record_action_failure(&self, action_id: uuid::Uuid, error: &str) -> Result<()> {
+        relay_admin_actions::record_failure(&self.pool, action_id, error).await
+    }
+
+    /// Cancel a pre-mutation failed action (returns report to 'open').
+    pub async fn cancel_admin_action(
+        &self,
+        action_id: uuid::Uuid,
+        community_id: CommunityId,
+        report_id: uuid::Uuid,
+    ) -> Result<bool> {
+        relay_admin_actions::cancel_action(&self.pool, action_id, community_id, report_id).await
+    }
+
+    /// Fetch an action record by ID.
+    pub async fn get_admin_action(
+        &self,
+        action_id: uuid::Uuid,
+    ) -> Result<Option<relay_admin_actions::AdminActionRecord>> {
+        relay_admin_actions::get_action(&self.pool, action_id).await
+    }
+
+    /// Enqueue an outbox artifact/notice delivery command.
+    pub async fn enqueue_admin_outbox(
+        &self,
+        action_id: uuid::Uuid,
+        task_type: &str,
+        payload: serde_json::Value,
+        dedup_key: &str,
+    ) -> Result<()> {
+        relay_admin_actions::enqueue_outbox(&self.pool, action_id, task_type, payload, dedup_key)
+            .await
+    }
+
+    /// Mark an outbox record as delivered.
+    pub async fn mark_admin_outbox_delivered(&self, outbox_id: uuid::Uuid) -> Result<()> {
+        relay_admin_actions::mark_outbox_delivered(&self.pool, outbox_id).await
+    }
+
+    /// List pending outbox records for an action.
+    pub async fn list_pending_admin_outbox(
+        &self,
+        action_id: uuid::Uuid,
+    ) -> Result<Vec<relay_admin_actions::OutboxRecord>> {
+        relay_admin_actions::list_pending_outbox(&self.pool, action_id).await
+    }
+
+    /// Deployment-authority kick: remove a member without requiring tenant owner/admin actor.
+    pub async fn deploy_kick_member(
+        &self,
+        community_id: CommunityId,
+        channel_id: uuid::Uuid,
+        target_pubkey: &[u8],
+        actor_pubkey: &[u8],
+    ) -> Result<relay_admin_actions::KickResult> {
+        relay_admin_actions::deploy_kick_member(
+            &self.pool,
+            community_id,
+            channel_id,
+            target_pubkey,
+            actor_pubkey,
+        )
+        .await
+    }
+
+    /// Update product_feedback status (operator-managed lifecycle).
+    pub async fn update_feedback_status(&self, id: uuid::Uuid, status: &str) -> Result<bool> {
+        relay_admin_actions::update_feedback_status(&self.pool, id, status).await
     }
 
     /// Mints a v2 use-limited relay invite. The plaintext code is returned

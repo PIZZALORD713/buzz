@@ -78,19 +78,18 @@ rotating it revokes access for everyone at once.
 ### NIP-98 mode (`BUZZ_ADMIN_AUTH=nip98`)
 
 Every `/api/admin/v1` request must carry a NIP-98 HTTP Auth header containing a
-signed kind-27235 event. The signer's pubkey must be in the `BUZZ_ADMIN_PUBKEYS`
-allowlist.
+signed kind-27235 event. The signer's pubkey is resolved against a two-tier
+principal model — **Operator** or **Moderator** — that grants capabilities
+accordingly.
 
 ```text
 BUZZ_ADMIN_AUTH=nip98
-BUZZ_ADMIN_PUBKEYS=<64-char hex pubkey>[,<64-char hex pubkey>...]
+RELAY_OPERATOR_PUBKEYS=<64-char hex pubkey>[,<64-char hex pubkey>...]
 ```
 
-- `BUZZ_ADMIN_PUBKEYS` must be a non-empty comma-separated list of 64-character
-  lowercase hex pubkeys. Invalid entries or an empty list are startup errors.
-- Duplicate pubkeys are silently deduplicated.
 - `BUZZ_ADMIN_TOKEN` set alongside `nip98` is a startup error (ambiguous intent).
-- `BUZZ_ADMIN_PUBKEYS` set in any other mode is warn-and-ignored.
+- A malformed `RELAY_OWNER_PUBKEY` alongside `nip98` is a startup error (see
+  owner fallback below).
 
 Each request requires:
 
@@ -99,23 +98,72 @@ Authorization: Nostr <base64(JSON event)>
 ```
 
 The event must be kind 27235, have a `u` tag matching the exact request URL
-(`https://admin.example.com/api/admin/v1/reports`), a `method` tag `GET`, a
-valid Schnorr signature, and a `created_at` within ±60 seconds of now. A
-deployment-scoped replay guard rejects reused event IDs.
+(including any query string, e.g.
+`https://admin.example.com/api/admin/v1/reports?status=open`), a `method` tag
+matching the HTTP method, a valid Schnorr signature, and a `created_at` within
+±60 seconds of now. Body-bearing mutations (`POST`, `PUT`, `PATCH`) additionally
+require a `payload` tag containing the SHA-256 hex digest of the raw request
+body. A deployment-scoped replay guard rejects reused event IDs; Redis failure
+fails closed.
 
-Any auth failure (bad event, bad signature, expired, replay, non-allowlisted
-pubkey, duplicate `Authorization` header) returns `401` with
-`WWW-Authenticate: Nostr`. The dashboard uses this header to discover the auth
-mode on first load.
+Any auth failure (bad event, bad signature, expired, replay, unrecognised pubkey,
+missing/incorrect `payload` tag on mutations, duplicate `Authorization` header)
+returns `401` with `WWW-Authenticate: Nostr`. The dashboard uses this header to
+discover the auth mode on first load.
 
 The dashboard requires a NIP-07 browser extension (such as
 [nos2x](https://github.com/fiatjaf/nos2x) or [Alby](https://getalby.com)). If
 no extension is detected, the dashboard shows an installation screen. Once an
-extension is present, each API request is automatically signed with the operator's
-nostr key without any prompts.
+extension is present, each API request is automatically signed with the
+principal's nostr key without any prompts.
 
-Adding or removing a pubkey from `BUZZ_ADMIN_PUBKEYS` and restarting the relay
-grants or revokes individual operator access without affecting any other operator.
+#### Principal model: Operator and Moderator
+
+The signer's pubkey is resolved to a principal with an effective role and a
+source that describes how the grant was established:
+
+| Resolution order | Role | Source |
+|---|---|---|
+| Pubkey is in `RELAY_OPERATOR_PUBKEYS` (config) | Operator | `config` |
+| Pubkey equals `RELAY_OWNER_PUBKEY` **and** `RELAY_OPERATOR_PUBKEYS` is empty | Operator | `owner_fallback` |
+| Pubkey has a row in the `relay_operators` DB table | Operator or Moderator | `db` |
+| No grant found | — | 403 |
+
+Config always outranks DB: a DB row for a config-backed pubkey is ignored and
+never demotes the config grant. `None` never falls through as a role.
+
+**Owner fallback** is an implicit Operator grant for self-hosters that do not yet
+have an operator configured. It activates only when the configured
+`RELAY_OPERATOR_PUBKEYS` list is empty, and it is evaluated from config at
+request time — staffing the roster cannot make it flap. Once any pubkey is added
+to `RELAY_OPERATOR_PUBKEYS`, the fallback deactivates. A malformed
+`RELAY_OWNER_PUBKEY` is a startup error (not warn-and-ignore): once the owner key
+can be a break-glass root, silently discarding it would be a lockout.
+
+#### Capabilities by role
+
+| Capability | Operator | Moderator |
+|---|---|---|
+| Read reports, feedback, attachment bytes | ✓ | ✓ |
+| Resolve reports (dismiss, escalate, delete, kick, ban, timeout) | ✓ | ✓ |
+| Update feedback status | ✓ | ✓ |
+| Manage operator roster (`GET/PUT/DELETE /operators`) | ✓ | ✗ |
+
+Capability checks are server-authoritative; the desktop console hides Staffing
+tab controls for Moderators as a UX convenience only.
+
+#### Roster management
+
+Operators manage the roster via the staffing endpoints (`GET/PUT/DELETE
+/operators/{pubkey}`). Staffing operations are only available in `nip98` mode.
+
+Config-backed pubkeys (`RELAY_OPERATOR_PUBKEYS`, owner fallback) cannot be
+modified through the API — `PUT` or `DELETE` against a config-backed pubkey
+returns `409 Conflict`. A DB moderator row for a config-backed Operator pubkey is
+ignored; it never demotes the config grant.
+
+`GET /operators` returns every effective principal with its `effectiveRole` and
+all contributing `sources` (`config`, `owner_fallback`, `db`).
 
 ### Disabled mode (`BUZZ_ADMIN_AUTH=disabled`)
 
@@ -159,13 +207,11 @@ abort startup:
 |---|---|
 | `BUZZ_ADMIN_AUTH=token` without `BUZZ_ADMIN_TOKEN` | startup error |
 | `BUZZ_ADMIN_AUTH=disabled` + `BUZZ_ADMIN_TOKEN` | startup error |
-| `BUZZ_ADMIN_AUTH=nip98` without `BUZZ_ADMIN_PUBKEYS` | startup error |
 | `BUZZ_ADMIN_AUTH=nip98` + `BUZZ_ADMIN_TOKEN` | startup error |
+| `BUZZ_ADMIN_AUTH=nip98` with a malformed `RELAY_OWNER_PUBKEY` | startup error |
 | `BUZZ_ADMIN_AUTH` junk value | startup error |
 | `BUZZ_ADMIN_TOKEN` without `BUZZ_ADMIN_HOST` | warn + ignore |
 | `BUZZ_ADMIN_AUTH` without `BUZZ_ADMIN_HOST` | warn + ignore |
-| `BUZZ_ADMIN_PUBKEYS` without `BUZZ_ADMIN_HOST` | warn + ignore |
-| `BUZZ_ADMIN_PUBKEYS` in non-nip98 mode | warn + ignore |
 
 ## Content Security Policy
 
@@ -212,8 +258,12 @@ deployment:
   in your deploy config, then roll the new version.
 - **Network-layer mode (e.g. Block's `bb-public` behind WARP+Okta):** set
   `BUZZ_ADMIN_AUTH=disabled` in your deploy config, then roll the new version.
-- **Nostr pubkey allowlist:** set `BUZZ_ADMIN_AUTH=nip98` and
-  `BUZZ_ADMIN_PUBKEYS` in your deploy config, then roll the new version.
+- **Nostr principal model:** set `BUZZ_ADMIN_AUTH=nip98` and populate
+  `RELAY_OPERATOR_PUBKEYS` with at least one operator pubkey (or rely on owner
+  fallback if `RELAY_OWNER_PUBKEY` is already set) in your deploy config, then
+  roll the new version. In a single config rollout, both set `BUZZ_ADMIN_AUTH=nip98`
+  and add the operator pubkey(s) — never split these across separate rollouts, as
+  a mode-flip without operators configured leaves no-one able to authenticate.
 
 **Upgrading from the previous `BUZZ_ADMIN_INSECURE_NO_AUTH=true` variable:**
 replace it with `BUZZ_ADMIN_AUTH=disabled`. Behavior is identical; the old
@@ -235,12 +285,34 @@ The seed command also uploads real image and diagnostic fixtures to local MinIO.
 Feedback search and filters run over the bounded browser result set; the
 **Acted on** checkbox is stored in that browser's local storage.
 
-## Read routes
+## Routes
 
+### Read routes (Operator and Moderator)
+
+- `GET /api/admin/v1/probe`
 - `GET /api/admin/v1/reports`
 - `GET /api/admin/v1/reports/:id`
 - `GET /api/admin/v1/feedback`
 - `GET /api/admin/v1/feedback/:id`
+- `GET /api/admin/v1/feedback/:id/attachments/:sha256`
+- `GET /api/admin/v1/operators`
+
+### Action routes (Operator and Moderator, nip98 only)
+
+- `POST /api/admin/v1/reports/:id/resolve`
+  Body: `{"action": "delete|kick|ban|timeout|dismiss|escalate", "expirationSecs": <number>, "reason": "<string>", "requestId": "<uuid>"}`
+  `expirationSecs` required for `timeout`, rejected for all others.
+  Target/channel are always derived from server-owned report provenance.
+- `PATCH /api/admin/v1/feedback/:id`
+  Body: `{"status": "new|reviewed|archived"}`
+
+### Staffing routes (Operator only, nip98 only)
+
+- `PUT /api/admin/v1/operators/:pubkey`
+  Body: `{"role": "operator|moderator"}`
+  Returns `409` if the target is config-backed.
+- `DELETE /api/admin/v1/operators/:pubkey`
+  Returns `409` if the target is config-backed.
 
 Report reads accept optional `communityId`, `status`, `reportType`, `targetKind`,
 `after`, `before`, and `limit` parameters. Limits are capped at 200. Feedback is
@@ -249,9 +321,8 @@ a bounded newest-first summary from the existing product-feedback repository.
 ## Feedback attachment boundary
 
 Feedback attachment bytes are available only through the feedback-scoped read
-route:
-
-- `GET /api/admin/v1/feedback/:id/attachments/:sha256`
+route (`GET /api/admin/v1/feedback/:id/attachments/:sha256`, listed under Read
+routes above).
 
 The route uses the same credential requirement (bearer token, NIP-98 event, or
 network-layer boundary in disabled mode), private-ingress, exact admin `Host`, and same-origin

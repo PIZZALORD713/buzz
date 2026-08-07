@@ -538,6 +538,7 @@ async fn insert_audit(
                 public_reason,
                 private_reason: None,
                 matched_principal: None,
+                actor_authority: None, // community path
             },
         )
         .await

@@ -8,13 +8,14 @@ mod error;
 
 use std::sync::Arc;
 
-use auth::{authorize, AdminRole, AdminSource};
+use auth::{authorize, require_mutation_principal, require_operator, AdminRole, AdminSource};
 use axum::{
+    body::Bytes,
     extract::{Path, Query, State},
     http::{header, HeaderMap, HeaderValue, Uri},
     middleware::{self, Next},
     response::Response,
-    routing::get,
+    routing::{delete, get, patch, put},
     Json, Router,
 };
 use chrono::{DateTime, Utc};
@@ -37,14 +38,20 @@ pub fn router(state: Arc<crate::state::AppState>) -> Router {
         .route("/probe", get(probe))
         .route("/reports", get(reports))
         .route("/reports/{id}", get(report_detail))
+        .route("/reports/{id}/resolve", axum::routing::post(resolve_report))
         .route("/feedback", get(feedback))
         .route("/feedback/{id}", get(feedback_detail))
+        .route("/feedback/{id}", patch(update_feedback_status))
         .route(
             "/feedback/{id}/attachments/{sha256}",
             get(feedback_attachment),
         )
+        .route("/operators", get(list_operators))
+        .route("/operators/{pubkey}", put(upsert_operator))
+        .route("/operators/{pubkey}", delete(delete_operator))
         .layer(middleware::from_fn(security_headers))
-        .layer(RequestBodyLimitLayer::new(1024))
+        // Mutation routes carry a JSON body (max ~4 KB); read-only routes have no body.
+        .layer(RequestBodyLimitLayer::new(4096))
         .with_state(state)
 }
 
@@ -369,6 +376,500 @@ async fn feedback_attachment(
     Ok(response)
 }
 
+// ── Phase 2: Report resolution ────────────────────────────────────────────────
+
+/// Request body for POST /reports/{id}/resolve.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ResolveReportBody {
+    /// Action to take: delete | kick | ban | timeout | dismiss | escalate.
+    action: String,
+    /// Client-generated idempotency key. Required for enforcement actions.
+    request_id: Option<Uuid>,
+    /// Seconds until timeout expiry. Required for `timeout`, rejected otherwise.
+    expiration_secs: Option<u64>,
+    /// Optional operator reason.
+    reason: Option<String>,
+}
+
+/// POST /reports/{id}/resolve
+///
+/// Requires nip98 auth. Both Operator and Moderator may act.
+///
+/// - dismiss/escalate: decision-only (no enforcement), runs in-transaction.
+/// - delete/kick/ban/timeout: server-side enforcement state machine.
+async fn resolve_report(
+    State(state): State<Arc<crate::state::AppState>>,
+    uri: Uri,
+    headers: HeaderMap,
+    Path(report_id): Path<Uuid>,
+    body_bytes: Bytes,
+) -> Result<axum::http::Response<axum::body::Body>, ApiError> {
+    use crate::handlers::report_resolution::{
+        enforcement_audit_action, http_validate_and_derive_status, resolve_report_decision_only,
+        resolve_report_with_enforcement, ResolutionError,
+    };
+
+    let principal_opt = authorize(
+        &state,
+        &headers,
+        uri.path_and_query()
+            .map_or_else(|| uri.path(), |pq| pq.as_str()),
+        "POST",
+        Some(&body_bytes),
+    )
+    .await?;
+
+    let principal = require_mutation_principal(principal_opt)?;
+
+    let body: ResolveReportBody = serde_json::from_slice(&body_bytes)
+        .map_err(|_e| ApiError::bad_request("invalid_body", "invalid JSON body"))?;
+
+    // Validate action name.
+    let valid_actions = ["delete", "kick", "ban", "timeout", "dismiss", "escalate"];
+    if !valid_actions.contains(&body.action.as_str()) {
+        return Err(ApiError::bad_request("invalid_action", "unknown action"));
+    }
+
+    // Load report globally to derive target provenance.
+    let report_detail = state
+        .db
+        .admin_get_report(report_id)
+        .await?
+        .ok_or_else(ApiError::not_found)?;
+
+    // Compute timeout_until if needed.
+    let timeout_until: Option<DateTime<Utc>> = match body.expiration_secs {
+        Some(secs) => Some(Utc::now() + chrono::Duration::seconds(secs as i64)),
+        None => None,
+    };
+
+    // Validate action/target matrix and derive HTTP terminal status.
+    let _derived_status = http_validate_and_derive_status(
+        &body.action,
+        &report_detail.report.target_kind,
+        report_detail.report.channel_id,
+        timeout_until,
+    )
+    .map_err(|msg| ApiError::bad_request("invalid_action_for_target", &msg))?;
+
+    let actor_pubkey: Vec<u8> = principal.pubkey.to_vec();
+    let actor_role_str = match principal.role {
+        AdminRole::Operator => "operator",
+        AdminRole::Moderator => "moderator",
+    };
+    let actor_authority = match principal.role {
+        AdminRole::Operator => "relay_operator",
+        AdminRole::Moderator => "relay_moderator",
+    };
+
+    // Bind tenant from server-owned report provenance (never from client input).
+    let tenant = crate::tenant::bind_community(&state.db, &report_detail.report.community_host)
+        .await
+        .map_err(|_| ApiError::internal())?;
+
+    match body.action.as_str() {
+        "dismiss" | "escalate" => {
+            // Decision-only: CAS open→terminal + audit row in one transaction.
+            let audit_action = enforcement_audit_action(&body.action);
+            let terminal_status = if body.action == "escalate" {
+                "escalated"
+            } else {
+                "dismissed"
+            };
+
+            // Derive target fields from the report row.
+            let (target_pubkey_bytes, target_event_id_bytes) = decode_report_target_hex(
+                &report_detail.report.target_kind,
+                &report_detail.report.target,
+            )
+            .map_err(|_| ApiError::internal())?;
+
+            let reporter_bytes = hex::decode(&report_detail.report.reporter_pubkey)
+                .map_err(|_| ApiError::internal())?;
+
+            resolve_report_decision_only(
+                &state,
+                &tenant,
+                report_id,
+                terminal_status,
+                audit_action,
+                &actor_pubkey,
+                actor_authority,
+                target_pubkey_bytes.as_deref(),
+                target_event_id_bytes.as_deref(),
+                report_detail.report.channel_id,
+                body.reason.as_deref(),
+                &reporter_bytes,
+            )
+            .await
+            .map_err(|e| match e {
+                ResolutionError::NotFound => ApiError::not_found(),
+                ResolutionError::NotOpen(status) => {
+                    ApiError::conflict(&format!("report is not open (current status: {status})"))
+                }
+                ResolutionError::InvalidAction(msg) => {
+                    ApiError::bad_request("invalid_action", &msg)
+                }
+                _ => ApiError::internal(),
+            })?;
+
+            Ok(axum::http::Response::builder()
+                .status(200)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(axum::body::Body::from(
+                    serde_json::json!({"status": terminal_status}).to_string(),
+                ))
+                .unwrap())
+        }
+        _ => {
+            // Enforcement actions require a request_id.
+            let request_id = body.request_id.ok_or_else(|| {
+                ApiError::bad_request(
+                    "missing_request_id",
+                    "requestId is required for enforcement actions",
+                )
+            })?;
+
+            let result = resolve_report_with_enforcement(
+                &state,
+                &tenant,
+                &report_detail,
+                &body.action,
+                body.reason.as_deref(),
+                timeout_until,
+                request_id,
+                &actor_pubkey,
+                actor_role_str,
+                actor_authority,
+            )
+            .await
+            .map_err(|e| match e {
+                ResolutionError::NotFound => ApiError::not_found(),
+                ResolutionError::NotOpen(status) => ApiError::conflict(&format!(
+                    "report is not open (current status: {status})"
+                )),
+                ResolutionError::InvalidAction(msg) => ApiError::bad_request("invalid_action", &msg),
+                ResolutionError::EnforcementFailed { action_id, error } => {
+                    ApiError::unprocessable(&format!(
+                        "enforcement failed (action_id={action_id}): {error}"
+                    ))
+                }
+                ResolutionError::Internal(msg) => {
+                    tracing::error!(report_id = %report_id, error = %msg, "resolve_report internal error");
+                    ApiError::internal()
+                }
+            })?;
+
+            Ok(axum::http::Response::builder()
+                .status(200)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(axum::body::Body::from(
+                    serde_json::json!({
+                        "status": "resolved",
+                        "actionId": result.action_id.to_string(),
+                    })
+                    .to_string(),
+                ))
+                .unwrap())
+        }
+    }
+}
+
+/// PATCH /feedback/{id}
+///
+/// Update product_feedback status. Requires nip98 auth.
+async fn update_feedback_status(
+    State(state): State<Arc<crate::state::AppState>>,
+    uri: Uri,
+    headers: HeaderMap,
+    Path(id): Path<Uuid>,
+    body_bytes: Bytes,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let principal_opt = authorize(
+        &state,
+        &headers,
+        uri.path_and_query()
+            .map_or_else(|| uri.path(), |pq| pq.as_str()),
+        "PATCH",
+        Some(&body_bytes),
+    )
+    .await?;
+
+    let _principal = require_mutation_principal(principal_opt)?;
+
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase", deny_unknown_fields)]
+    struct FeedbackStatusBody {
+        status: String,
+    }
+
+    let body: FeedbackStatusBody = serde_json::from_slice(&body_bytes)
+        .map_err(|_| ApiError::bad_request("invalid_body", "invalid JSON body"))?;
+
+    let allowed = ["new", "reviewed", "archived"];
+    if !allowed.contains(&body.status.as_str()) {
+        return Err(ApiError::bad_request(
+            "invalid_status",
+            "status must be new|reviewed|archived",
+        ));
+    }
+
+    let updated = state.db.update_feedback_status(id, &body.status).await?;
+    if !updated {
+        return Err(ApiError::not_found());
+    }
+
+    Ok(Json(serde_json::json!({"status": body.status})))
+}
+
+// ── Phase 2: Staffing endpoints ───────────────────────────────────────────────
+
+/// Effective principal entry returned by GET /operators.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct OperatorEntry {
+    /// Hex-encoded pubkey.
+    pubkey: String,
+    /// Effective role: `"operator"` | `"moderator"`.
+    effective_role: String,
+    /// Sources contributing to this principal's grant.
+    sources: Vec<String>,
+}
+
+/// GET /operators
+///
+/// List all effective principals (union of config and DB). Source-aware.
+/// Requires nip98 auth + Operator role.
+async fn list_operators(
+    State(state): State<Arc<crate::state::AppState>>,
+    uri: Uri,
+    headers: HeaderMap,
+) -> Result<Json<Vec<OperatorEntry>>, ApiError> {
+    let principal_opt = authorize(
+        &state,
+        &headers,
+        uri.path_and_query()
+            .map_or_else(|| uri.path(), |pq| pq.as_str()),
+        "GET",
+        None,
+    )
+    .await?;
+
+    let principal = require_mutation_principal(principal_opt)?;
+    require_operator(&principal)?;
+
+    let config = state
+        .config
+        .admin
+        .as_ref()
+        .ok_or_else(ApiError::not_found)?;
+    let _ = config; // admin config present — we already passed auth
+
+    // Build effective principal set.
+    let mut entries: Vec<OperatorEntry> = vec![];
+
+    // 1. Config-backed operators (RELAY_OPERATOR_PUBKEYS).
+    for hex_key in &state.config.relay_operator_pubkeys {
+        entries.push(OperatorEntry {
+            pubkey: hex_key.clone(),
+            effective_role: "operator".to_string(),
+            sources: vec!["config".to_string()],
+        });
+    }
+
+    // 2. Owner fallback B: implicit operator when RELAY_OPERATOR_PUBKEYS is empty.
+    if state.config.relay_operator_pubkeys.is_empty() {
+        if let Some(owner_hex) = &state.config.relay_owner_pubkey {
+            entries.push(OperatorEntry {
+                pubkey: owner_hex.clone(),
+                effective_role: "operator".to_string(),
+                sources: vec!["owner_fallback".to_string()],
+            });
+        }
+    }
+
+    // 3. DB rows. Config outranks DB: if a DB entry is already covered by config,
+    //    add "db" to its sources rather than creating a duplicate.
+    let db_rows = state.db.list_relay_operators().await?;
+    let config_pubkeys: std::collections::HashSet<&str> = state
+        .config
+        .relay_operator_pubkeys
+        .iter()
+        .map(String::as_str)
+        .collect();
+
+    for row in db_rows {
+        let hex = hex::encode(&row.pubkey);
+        if config_pubkeys.contains(hex.as_str()) {
+            // Config already grants Operator; annotate sources but don't demote.
+            if let Some(e) = entries.iter_mut().find(|e| e.pubkey == hex) {
+                e.sources.push("db".to_string());
+            }
+        } else {
+            entries.push(OperatorEntry {
+                pubkey: hex,
+                effective_role: row.role.clone(),
+                sources: vec!["db".to_string()],
+            });
+        }
+    }
+
+    Ok(Json(entries))
+}
+
+/// Request body for PUT /operators/{pubkey}.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct UpsertOperatorBody {
+    role: String,
+}
+
+/// PUT /operators/{pubkey}
+///
+/// Idempotent upsert of a DB operator/moderator row.
+/// Returns 409 if the target pubkey is config-backed (immutable through the API).
+/// Requires nip98 auth + Operator role.
+async fn upsert_operator(
+    State(state): State<Arc<crate::state::AppState>>,
+    uri: Uri,
+    headers: HeaderMap,
+    Path(pubkey_hex): Path<String>,
+    body_bytes: Bytes,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let principal_opt = authorize(
+        &state,
+        &headers,
+        uri.path_and_query()
+            .map_or_else(|| uri.path(), |pq| pq.as_str()),
+        "PUT",
+        Some(&body_bytes),
+    )
+    .await?;
+
+    let principal = require_mutation_principal(principal_opt)?;
+    require_operator(&principal)?;
+
+    // Decode target pubkey.
+    let target_bytes = decode_hex_pubkey(&pubkey_hex)?;
+
+    // Reject if config-backed (immutable through the API).
+    if is_config_backed_pubkey(&state.config, &pubkey_hex) {
+        return Err(ApiError::conflict(
+            "pubkey is backed by config (RELAY_OPERATOR_PUBKEYS or owner fallback) — immutable through the API",
+        ));
+    }
+
+    let body: UpsertOperatorBody = serde_json::from_slice(&body_bytes)
+        .map_err(|_| ApiError::bad_request("invalid_body", "invalid JSON body"))?;
+
+    if !["operator", "moderator"].contains(&body.role.as_str()) {
+        return Err(ApiError::bad_request(
+            "invalid_role",
+            "role must be operator|moderator",
+        ));
+    }
+
+    state
+        .db
+        .upsert_relay_operator(&target_bytes, &body.role, &principal.pubkey)
+        .await?;
+
+    Ok(Json(
+        serde_json::json!({"pubkey": pubkey_hex, "role": body.role}),
+    ))
+}
+
+/// DELETE /operators/{pubkey}
+///
+/// Remove a DB operator/moderator row.
+/// Returns 409 if the target pubkey is config-backed.
+/// Requires nip98 auth + Operator role.
+async fn delete_operator(
+    State(state): State<Arc<crate::state::AppState>>,
+    uri: Uri,
+    headers: HeaderMap,
+    Path(pubkey_hex): Path<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let principal_opt = authorize(
+        &state,
+        &headers,
+        uri.path_and_query()
+            .map_or_else(|| uri.path(), |pq| pq.as_str()),
+        "DELETE",
+        None,
+    )
+    .await?;
+
+    let principal = require_mutation_principal(principal_opt)?;
+    require_operator(&principal)?;
+
+    // Reject if config-backed.
+    if is_config_backed_pubkey(&state.config, &pubkey_hex) {
+        return Err(ApiError::conflict(
+            "pubkey is backed by config (RELAY_OPERATOR_PUBKEYS or owner fallback) — immutable through the API",
+        ));
+    }
+
+    let target_bytes = decode_hex_pubkey(&pubkey_hex)?;
+    let removed = state.db.remove_relay_operator(&target_bytes).await?;
+    if !removed {
+        return Err(ApiError::not_found());
+    }
+
+    Ok(Json(serde_json::json!({"deleted": pubkey_hex})))
+}
+
+// ── Staffing helpers ──────────────────────────────────────────────────────────
+
+/// Returns true if the hex pubkey is covered by a config-backed grant
+/// (RELAY_OPERATOR_PUBKEYS or owner-fallback B).
+fn is_config_backed_pubkey(config: &crate::config::Config, pubkey_hex: &str) -> bool {
+    if config
+        .relay_operator_pubkeys
+        .iter()
+        .any(|k| k == pubkey_hex)
+    {
+        return true;
+    }
+    // Owner fallback B: only when RELAY_OPERATOR_PUBKEYS is empty.
+    if config.relay_operator_pubkeys.is_empty() {
+        if let Some(owner) = &config.relay_owner_pubkey {
+            if owner == pubkey_hex {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Decode a 64-character hex string into 32 bytes, returning 404 on failure.
+fn decode_hex_pubkey(hex_str: &str) -> Result<Vec<u8>, ApiError> {
+    if hex_str.len() != 64 {
+        return Err(ApiError::not_found());
+    }
+    hex::decode(hex_str).map_err(|_| ApiError::not_found())
+}
+
+/// Decode a hex-encoded report target into (pubkey_bytes, event_id_bytes).
+fn decode_report_target_hex(
+    target_kind: &str,
+    target_hex: &str,
+) -> Result<(Option<Vec<u8>>, Option<Vec<u8>>), String> {
+    match target_kind {
+        "event" => {
+            let bytes = hex::decode(target_hex).map_err(|e| e.to_string())?;
+            Ok((None, Some(bytes)))
+        }
+        "pubkey" => {
+            let bytes = hex::decode(target_hex).map_err(|e| e.to_string())?;
+            Ok((Some(bytes), None))
+        }
+        "blob" => Ok((None, None)),
+        other => Err(format!("unknown target_kind: {other}")),
+    }
+}
+
 fn feedback_references_hash(tags: &serde_json::Value, community_host: &str, sha256: &str) -> bool {
     tags.as_array()
         .into_iter()
@@ -674,17 +1175,19 @@ mod tests {
 
     #[tokio::test]
     async fn lowercase_bearer_scheme_is_accepted() {
+        // Use /probe (no DB dependency) to verify that a lowercase "bearer" scheme
+        // is accepted and auth succeeds. A 200 from probe confirms auth passed.
         let response = status_for(
             test_state().await,
             Request::builder()
-                .uri(format!("/reports/{}", Uuid::nil()))
+                .uri("/probe")
                 .header(header::HOST, "admin.example")
                 .header(header::AUTHORIZATION, format!("bearer {TOKEN}"))
                 .body(Body::empty())
                 .expect("request"),
         )
         .await;
-        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert_eq!(response.status(), StatusCode::OK);
     }
 
     #[tokio::test]
@@ -717,7 +1220,8 @@ mod tests {
 
     #[tokio::test]
     async fn a_valid_credential_on_the_admin_host_without_an_origin_is_served() {
-        let response = status_for(test_state().await, status_request(authorized("/reports"))).await;
+        // Use /probe (no DB dependency) to confirm auth succeeds without an Origin header.
+        let response = status_for(test_state().await, status_request(authorized("/probe"))).await;
         assert_eq!(response.status(), StatusCode::OK);
     }
 
@@ -1095,18 +1599,19 @@ mod tests {
     async fn nip98_mode_valid_event_from_operator_pubkey_is_served() {
         let keys = nostr::Keys::generate();
         let state = nip98_state(vec![keys.public_key().to_hex()]).await;
-        let auth = make_nostr_auth(&keys, "/reports");
+        // Use /probe (no DB dependency) — config-backed operator resolves without DB.
+        let auth = make_nostr_auth(&keys, "/probe");
         let response = status_for(
             state,
             Request::builder()
-                .uri("/reports")
+                .uri("/probe")
                 .header(header::HOST, "admin.example")
                 .header(header::AUTHORIZATION, auth)
                 .body(Body::empty())
                 .expect("request"),
         )
         .await;
-        // 200 (DB returns empty list) — not 401.
+        // 200 from probe confirms the event was authenticated and operator was resolved.
         assert_eq!(response.status(), StatusCode::OK);
     }
 
@@ -1176,12 +1681,14 @@ mod tests {
         let tracking = Arc::new(TrackingReplayGuard::new());
         let state =
             nip98_state_with_replay(vec![keys.public_key().to_hex()], tracking.clone()).await;
-        let auth = make_nostr_auth(&keys, "/reports");
+        // Use /probe (no DB dependency) to verify first request succeeds
+        // and second (same event ID) is rejected by the replay guard.
+        let auth = make_nostr_auth(&keys, "/probe");
         // First request succeeds.
         let first = status_for(
             state.clone(),
             Request::builder()
-                .uri("/reports")
+                .uri("/probe")
                 .header(header::HOST, "admin.example")
                 .header(header::AUTHORIZATION, auth.clone())
                 .body(Body::empty())
@@ -1192,7 +1699,7 @@ mod tests {
         let second = status_for(
             state,
             Request::builder()
-                .uri("/reports")
+                .uri("/probe")
                 .header(header::HOST, "admin.example")
                 .header(header::AUTHORIZATION, auth)
                 .body(Body::empty())
@@ -1225,7 +1732,8 @@ mod tests {
 
     #[tokio::test]
     async fn token_mode_regression_pin_valid_credential_is_served() {
-        let response = status_for(test_state().await, status_request(authorized("/reports"))).await;
+        // Use /probe (no DB dependency) to confirm token mode serves valid credentials.
+        let response = status_for(test_state().await, status_request(authorized("/probe"))).await;
         assert_eq!(response.status(), StatusCode::OK);
     }
 
@@ -1255,10 +1763,11 @@ mod tests {
     #[tokio::test]
     async fn disabled_mode_regression_pin_unauthenticated_request_is_served() {
         let state = disabled_mode_state().await;
+        // Use /probe (no DB dependency) to confirm disabled mode allows unauthenticated requests.
         let response = status_for(
             state,
             Request::builder()
-                .uri("/reports")
+                .uri("/probe")
                 .header(header::HOST, "admin.example")
                 .body(Body::empty())
                 .expect("request"),
@@ -1271,38 +1780,39 @@ mod tests {
 
     #[tokio::test]
     async fn nip98_mode_query_bearing_request_signed_with_full_url_is_served() {
-        // The SPA's primary reports request is /reports?status=open&limit=100.
-        // The signed u-tag must include the query; the relay must verify against
-        // the full path-and-query, not just the path component.
+        // Verify that the signed u-tag must include the query string; the relay
+        // verifies against the full path-and-query, not just the path component.
+        // We use /probe with a dummy query string (no DB dependency) to test the
+        // URL-binding without hitting Postgres.
         let keys = nostr::Keys::generate();
         let state = nip98_state(vec![keys.public_key().to_hex()]).await;
-        let auth = make_nostr_auth(&keys, "/reports?status=open&limit=100");
+        let auth = make_nostr_auth(&keys, "/probe?mode=check");
         let response = status_for(
             state,
             Request::builder()
-                .uri("/reports?status=open&limit=100")
+                .uri("/probe?mode=check")
                 .header(header::HOST, "admin.example")
                 .header(header::AUTHORIZATION, auth)
                 .body(Body::empty())
                 .expect("request"),
         )
         .await;
-        // 200 (DB returns empty list) — not 401.
+        // 200 — full URL matched; not 401.
         assert_eq!(response.status(), StatusCode::OK);
     }
 
     #[tokio::test]
     async fn nip98_mode_path_only_event_for_query_bearing_request_is_401() {
-        // A credential signed for just /reports must not authenticate a
-        // request sent to /reports?status=open&limit=100: the u-tag would
-        // not match the full canonical URL.
+        // A credential signed for just /probe must not authenticate a
+        // request sent to /probe?mode=check: the u-tag would not match the
+        // full canonical URL.
         let keys = nostr::Keys::generate();
         let state = nip98_state(vec![keys.public_key().to_hex()]).await;
-        let auth = make_nostr_auth(&keys, "/reports");
+        let auth = make_nostr_auth(&keys, "/probe");
         let response = status_for(
             state,
             Request::builder()
-                .uri("/reports?status=open&limit=100")
+                .uri("/probe?mode=check")
                 .header(header::HOST, "admin.example")
                 .header(header::AUTHORIZATION, auth)
                 .body(Body::empty())
@@ -1505,5 +2015,545 @@ mod tests {
         .await;
         // Should be 403: valid NIP-98 credential, but no grant.
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    // ── Phase 2: mutation routes require nip98 ────────────────────────────
+
+    /// Build a NIP-98 POST body-bearing Authorization header with `payload` sha256.
+    fn make_nostr_auth_post(keys: &nostr::Keys, path: &str, body: &[u8]) -> String {
+        use base64::engine::general_purpose::STANDARD as BASE64;
+        use base64::Engine as _;
+        use nostr::{EventBuilder, Kind, Tag};
+        use sha2::{Digest, Sha256};
+
+        let url = format!("https://admin.example{ADMIN_API_PREFIX}{path}");
+        let payload_hash = hex::encode(Sha256::digest(body));
+        let tags = vec![
+            Tag::parse(["u", &url]).unwrap(),
+            Tag::parse(["method", "POST"]).unwrap(),
+            Tag::parse(["payload", &payload_hash]).unwrap(),
+        ];
+        let event = EventBuilder::new(Kind::HttpAuth, "")
+            .tags(tags)
+            .sign_with_keys(keys)
+            .expect("sign");
+        let json = serde_json::to_string(&event).expect("serialize");
+        format!("Nostr {}", BASE64.encode(json.as_bytes()))
+    }
+
+    fn make_nostr_auth_patch(keys: &nostr::Keys, path: &str, body: &[u8]) -> String {
+        use base64::engine::general_purpose::STANDARD as BASE64;
+        use base64::Engine as _;
+        use nostr::{EventBuilder, Kind, Tag};
+        use sha2::{Digest, Sha256};
+
+        let url = format!("https://admin.example{ADMIN_API_PREFIX}{path}");
+        let payload_hash = hex::encode(Sha256::digest(body));
+        let tags = vec![
+            Tag::parse(["u", &url]).unwrap(),
+            Tag::parse(["method", "PATCH"]).unwrap(),
+            Tag::parse(["payload", &payload_hash]).unwrap(),
+        ];
+        let event = EventBuilder::new(Kind::HttpAuth, "")
+            .tags(tags)
+            .sign_with_keys(keys)
+            .expect("sign");
+        let json = serde_json::to_string(&event).expect("serialize");
+        format!("Nostr {}", BASE64.encode(json.as_bytes()))
+    }
+
+    fn make_nostr_auth_put(keys: &nostr::Keys, path: &str, body: &[u8]) -> String {
+        use base64::engine::general_purpose::STANDARD as BASE64;
+        use base64::Engine as _;
+        use nostr::{EventBuilder, Kind, Tag};
+        use sha2::{Digest, Sha256};
+
+        let url = format!("https://admin.example{ADMIN_API_PREFIX}{path}");
+        let payload_hash = hex::encode(Sha256::digest(body));
+        let tags = vec![
+            Tag::parse(["u", &url]).unwrap(),
+            Tag::parse(["method", "PUT"]).unwrap(),
+            Tag::parse(["payload", &payload_hash]).unwrap(),
+        ];
+        let event = EventBuilder::new(Kind::HttpAuth, "")
+            .tags(tags)
+            .sign_with_keys(keys)
+            .expect("sign");
+        let json = serde_json::to_string(&event).expect("serialize");
+        format!("Nostr {}", BASE64.encode(json.as_bytes()))
+    }
+
+    fn make_nostr_auth_delete(keys: &nostr::Keys, path: &str) -> String {
+        use base64::engine::general_purpose::STANDARD as BASE64;
+        use base64::Engine as _;
+        use nostr::{EventBuilder, Kind, Tag};
+
+        let url = format!("https://admin.example{ADMIN_API_PREFIX}{path}");
+        let tags = vec![
+            Tag::parse(["u", &url]).unwrap(),
+            Tag::parse(["method", "DELETE"]).unwrap(),
+        ];
+        let event = EventBuilder::new(Kind::HttpAuth, "")
+            .tags(tags)
+            .sign_with_keys(keys)
+            .expect("sign");
+        let json = serde_json::to_string(&event).expect("serialize");
+        format!("Nostr {}", BASE64.encode(json.as_bytes()))
+    }
+
+    /// POST /reports/{id}/resolve in token mode → 403 (mutations require nip98).
+    #[tokio::test]
+    async fn mutation_routes_in_token_mode_return_403() {
+        let state = test_state().await; // token mode
+        let id = Uuid::nil();
+        let body = r#"{"action":"dismiss"}"#.as_bytes().to_vec();
+        let response = status_for(
+            state,
+            Request::builder()
+                .method("POST")
+                .uri(format!("/reports/{id}/resolve"))
+                .header(header::HOST, "admin.example")
+                .header(header::AUTHORIZATION, format!("Bearer {TOKEN}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(body))
+                .expect("request"),
+        )
+        .await;
+        // Token mode: valid token passes auth, but require_mutation_principal
+        // returns 403 because there is no AdminPrincipal in token mode.
+        assert_eq!(
+            response.status(),
+            StatusCode::FORBIDDEN,
+            "mutations must require nip98"
+        );
+    }
+
+    /// PATCH /feedback/{id} in token mode → 403.
+    #[tokio::test]
+    async fn feedback_status_patch_in_token_mode_returns_403() {
+        let state = test_state().await;
+        let id = Uuid::nil();
+        let body = r#"{"status":"reviewed"}"#.as_bytes().to_vec();
+        let response = status_for(
+            state,
+            Request::builder()
+                .method("PATCH")
+                .uri(format!("/feedback/{id}"))
+                .header(header::HOST, "admin.example")
+                .header(header::AUTHORIZATION, format!("Bearer {TOKEN}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(body))
+                .expect("request"),
+        )
+        .await;
+        assert_eq!(
+            response.status(),
+            StatusCode::FORBIDDEN,
+            "patch must require nip98"
+        );
+    }
+
+    /// GET /operators in token mode → 403.
+    #[tokio::test]
+    async fn list_operators_in_token_mode_returns_403() {
+        let state = test_state().await;
+        let response = status_for(
+            state,
+            Request::builder()
+                .method("GET")
+                .uri("/operators")
+                .header(header::HOST, "admin.example")
+                .header(header::AUTHORIZATION, format!("Bearer {TOKEN}"))
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await;
+        assert_eq!(
+            response.status(),
+            StatusCode::FORBIDDEN,
+            "operators must require nip98"
+        );
+    }
+
+    /// Moderator cannot access staffing endpoints.
+    #[tokio::test]
+    #[ignore = "requires Postgres — moderator DB lookup"]
+    async fn moderator_cannot_access_staffing_endpoints() {
+        // This test needs DB to resolve moderator role.
+        // Covered by negative-matrix integration test suite.
+    }
+
+    /// Config-backed pubkey upsert → 409 Conflict.
+    #[tokio::test]
+    async fn upsert_config_backed_pubkey_returns_409() {
+        let operator_keys = nostr::Keys::generate();
+        let target_keys = nostr::Keys::generate();
+        let target_hex = target_keys.public_key().to_hex();
+        // Put target in config — makes it config-backed and immutable.
+        let mut config = crate::config::Config::from_env().expect("default config");
+        config.require_relay_membership = false;
+        config.redis_url = "redis://127.0.0.1:1".to_string();
+        config.relay_operator_pubkeys =
+            vec![operator_keys.public_key().to_hex(), target_hex.clone()];
+        config.relay_operator_api_origin = Some("https://admin.example".to_string());
+        config.admin = Some(crate::config::AdminConfig {
+            host: "admin.example".to_string(),
+            auth: crate::config::AdminAuth::Nip98,
+            web_dir: None,
+        });
+        let pool = sqlx::PgPool::connect_lazy(&config.database_url).expect("lazy pg pool");
+        let db = buzz_db::Db::from_pool(pool.clone());
+        let redis_pool = deadpool_redis::Config::from_url(&config.redis_url)
+            .create_pool(Some(deadpool_redis::Runtime::Tokio1))
+            .expect("redis pool");
+        let pubsub = Arc::new(
+            buzz_pubsub::PubSubManager::new(&config.redis_url, redis_pool.clone())
+                .await
+                .expect("pubsub manager"),
+        );
+        let audit = buzz_audit::AuditService::new(pool.clone());
+        let auth = buzz_auth::AuthService::new(config.auth.clone());
+        let search = buzz_search::SearchService::new(pool.clone());
+        let workflow_engine = Arc::new(buzz_workflow::WorkflowEngine::new(
+            db.clone(),
+            buzz_workflow::WorkflowConfig::default(),
+        ));
+        let media_storage = buzz_media::MediaStorage::new(&config.media).expect("media storage");
+        let (mut state, _) = crate::state::AppState::new(
+            config,
+            db,
+            redis_pool,
+            audit,
+            pubsub,
+            auth,
+            search,
+            workflow_engine,
+            nostr::Keys::generate(),
+            media_storage,
+        );
+        state.nip98_replay = Arc::new(AlwaysFreshReplayGuard);
+        let state = Arc::new(state);
+
+        let path = format!("/operators/{target_hex}");
+        let body = r#"{"role":"moderator"}"#.as_bytes();
+        let auth_header = make_nostr_auth_put(&operator_keys, &path, body);
+
+        let response = status_for(
+            state,
+            Request::builder()
+                .method("PUT")
+                .uri(path)
+                .header(header::HOST, "admin.example")
+                .header(header::AUTHORIZATION, auth_header)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(body.to_vec()))
+                .expect("request"),
+        )
+        .await;
+        assert_eq!(
+            response.status(),
+            StatusCode::CONFLICT,
+            "config-backed pubkey must return 409"
+        );
+    }
+
+    /// Config-backed pubkey delete → 409 Conflict.
+    #[tokio::test]
+    async fn delete_config_backed_pubkey_returns_409() {
+        let operator_keys = nostr::Keys::generate();
+        let target_keys = nostr::Keys::generate();
+        let target_hex = target_keys.public_key().to_hex();
+        let mut config = crate::config::Config::from_env().expect("default config");
+        config.require_relay_membership = false;
+        config.redis_url = "redis://127.0.0.1:1".to_string();
+        config.relay_operator_pubkeys =
+            vec![operator_keys.public_key().to_hex(), target_hex.clone()];
+        config.relay_operator_api_origin = Some("https://admin.example".to_string());
+        config.admin = Some(crate::config::AdminConfig {
+            host: "admin.example".to_string(),
+            auth: crate::config::AdminAuth::Nip98,
+            web_dir: None,
+        });
+        let pool = sqlx::PgPool::connect_lazy(&config.database_url).expect("lazy pg pool");
+        let db = buzz_db::Db::from_pool(pool.clone());
+        let redis_pool = deadpool_redis::Config::from_url(&config.redis_url)
+            .create_pool(Some(deadpool_redis::Runtime::Tokio1))
+            .expect("redis pool");
+        let pubsub = Arc::new(
+            buzz_pubsub::PubSubManager::new(&config.redis_url, redis_pool.clone())
+                .await
+                .expect("pubsub manager"),
+        );
+        let audit = buzz_audit::AuditService::new(pool.clone());
+        let auth = buzz_auth::AuthService::new(config.auth.clone());
+        let search = buzz_search::SearchService::new(pool.clone());
+        let workflow_engine = Arc::new(buzz_workflow::WorkflowEngine::new(
+            db.clone(),
+            buzz_workflow::WorkflowConfig::default(),
+        ));
+        let media_storage = buzz_media::MediaStorage::new(&config.media).expect("media storage");
+        let (mut state, _) = crate::state::AppState::new(
+            config,
+            db,
+            redis_pool,
+            audit,
+            pubsub,
+            auth,
+            search,
+            workflow_engine,
+            nostr::Keys::generate(),
+            media_storage,
+        );
+        state.nip98_replay = Arc::new(AlwaysFreshReplayGuard);
+        let state = Arc::new(state);
+
+        let path = format!("/operators/{target_hex}");
+        let auth_header = make_nostr_auth_delete(&operator_keys, &path);
+
+        let response = status_for(
+            state,
+            Request::builder()
+                .method("DELETE")
+                .uri(path)
+                .header(header::HOST, "admin.example")
+                .header(header::AUTHORIZATION, auth_header)
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await;
+        assert_eq!(
+            response.status(),
+            StatusCode::CONFLICT,
+            "config-backed pubkey delete must return 409"
+        );
+    }
+
+    /// Owner-fallback B config-backed pubkey upsert → 409.
+    #[tokio::test]
+    async fn upsert_owner_fallback_b_pubkey_returns_409() {
+        // Owner fallback B: RELAY_OPERATOR_PUBKEYS empty, owner key is implicit operator.
+        let owner_keys = nostr::Keys::generate();
+        let owner_hex = owner_keys.public_key().to_hex();
+        let mut config = crate::config::Config::from_env().expect("default config");
+        config.require_relay_membership = false;
+        config.redis_url = "redis://127.0.0.1:1".to_string();
+        config.relay_operator_pubkeys = vec![]; // activates fallback B
+        config.relay_owner_pubkey = Some(owner_hex.clone());
+        config.admin = Some(crate::config::AdminConfig {
+            host: "admin.example".to_string(),
+            auth: crate::config::AdminAuth::Nip98,
+            web_dir: None,
+        });
+        let pool = sqlx::PgPool::connect_lazy(&config.database_url).expect("lazy pg pool");
+        let db = buzz_db::Db::from_pool(pool.clone());
+        let redis_pool = deadpool_redis::Config::from_url(&config.redis_url)
+            .create_pool(Some(deadpool_redis::Runtime::Tokio1))
+            .expect("redis pool");
+        let pubsub = Arc::new(
+            buzz_pubsub::PubSubManager::new(&config.redis_url, redis_pool.clone())
+                .await
+                .expect("pubsub manager"),
+        );
+        let audit = buzz_audit::AuditService::new(pool.clone());
+        let auth = buzz_auth::AuthService::new(config.auth.clone());
+        let search = buzz_search::SearchService::new(pool.clone());
+        let workflow_engine = Arc::new(buzz_workflow::WorkflowEngine::new(
+            db.clone(),
+            buzz_workflow::WorkflowConfig::default(),
+        ));
+        let media_storage = buzz_media::MediaStorage::new(&config.media).expect("media storage");
+        let (mut state, _) = crate::state::AppState::new(
+            config,
+            db,
+            redis_pool,
+            audit,
+            pubsub,
+            auth,
+            search,
+            workflow_engine,
+            nostr::Keys::generate(),
+            media_storage,
+        );
+        state.nip98_replay = Arc::new(AlwaysFreshReplayGuard);
+        let state = Arc::new(state);
+
+        // Try to upsert the owner key (config-backed via fallback B) — should return 409.
+        let path = format!("/operators/{owner_hex}");
+        let body = r#"{"role":"moderator"}"#.as_bytes();
+        let auth_header = make_nostr_auth_put(&owner_keys, &path, body);
+
+        let response = status_for(
+            state,
+            Request::builder()
+                .method("PUT")
+                .uri(path)
+                .header(header::HOST, "admin.example")
+                .header(header::AUTHORIZATION, auth_header)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(body.to_vec()))
+                .expect("request"),
+        )
+        .await;
+        assert_eq!(
+            response.status(),
+            StatusCode::CONFLICT,
+            "owner fallback B key must return 409 on upsert"
+        );
+    }
+
+    /// Method-substitution: a POST credential cannot authenticate a PATCH.
+    #[tokio::test]
+    async fn nip98_mutation_method_substitution_returns_401() {
+        let keys = nostr::Keys::generate();
+        let state = nip98_state(vec![keys.public_key().to_hex()]).await;
+        let id = Uuid::nil();
+        let body = r#"{"status":"reviewed"}"#.as_bytes();
+
+        // Sign a PATCH credential but send as POST — method mismatch → 401.
+        let auth_header = make_nostr_auth_post(&keys, &format!("/feedback/{id}"), body);
+
+        let response = status_for(
+            state,
+            Request::builder()
+                .method("PATCH")
+                .uri(format!("/feedback/{id}"))
+                .header(header::HOST, "admin.example")
+                .header(header::AUTHORIZATION, auth_header)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(body.to_vec()))
+                .expect("request"),
+        )
+        .await;
+        assert_eq!(
+            response.status(),
+            StatusCode::UNAUTHORIZED,
+            "method substitution must be rejected"
+        );
+    }
+
+    /// Body substitution: credential signed for one body, different body sent → 401.
+    #[tokio::test]
+    async fn nip98_mutation_body_substitution_returns_401() {
+        let keys = nostr::Keys::generate();
+        let state = nip98_state(vec![keys.public_key().to_hex()]).await;
+        let id = Uuid::nil();
+        let original_body = r#"{"status":"reviewed"}"#.as_bytes();
+        let tampered_body = r#"{"status":"archived"}"#.as_bytes();
+
+        // Credential is signed for `original_body` but we send `tampered_body`.
+        let auth_header = make_nostr_auth_patch(&keys, &format!("/feedback/{id}"), original_body);
+
+        let response = status_for(
+            state,
+            Request::builder()
+                .method("PATCH")
+                .uri(format!("/feedback/{id}"))
+                .header(header::HOST, "admin.example")
+                .header(header::AUTHORIZATION, auth_header)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(tampered_body.to_vec()))
+                .expect("request"),
+        )
+        .await;
+        assert_eq!(
+            response.status(),
+            StatusCode::UNAUTHORIZED,
+            "body substitution must be rejected"
+        );
+    }
+
+    /// Missing payload tag on a body-bearing POST → 401.
+    #[tokio::test]
+    async fn nip98_mutation_missing_payload_tag_returns_401() {
+        use base64::engine::general_purpose::STANDARD as BASE64;
+        use base64::Engine as _;
+        use nostr::{EventBuilder, Kind, Tag};
+
+        let keys = nostr::Keys::generate();
+        let state = nip98_state(vec![keys.public_key().to_hex()]).await;
+        let id = Uuid::nil();
+        let body = r#"{"action":"dismiss"}"#.as_bytes();
+
+        // Sign NIP-98 for the URL and method but omit the `payload` tag.
+        let url = format!("https://admin.example{ADMIN_API_PREFIX}/reports/{id}/resolve");
+        let tags = vec![
+            Tag::parse(["u", &url]).unwrap(),
+            Tag::parse(["method", "POST"]).unwrap(),
+            // Intentionally no payload tag.
+        ];
+        let event = EventBuilder::new(Kind::HttpAuth, "")
+            .tags(tags)
+            .sign_with_keys(&keys)
+            .expect("sign");
+        let json = serde_json::to_string(&event).expect("serialize");
+        let auth_header = format!("Nostr {}", BASE64.encode(json.as_bytes()));
+
+        let response = status_for(
+            state,
+            Request::builder()
+                .method("POST")
+                .uri(format!("/reports/{id}/resolve"))
+                .header(header::HOST, "admin.example")
+                .header(header::AUTHORIZATION, auth_header)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(body.to_vec()))
+                .expect("request"),
+        )
+        .await;
+        assert_eq!(
+            response.status(),
+            StatusCode::UNAUTHORIZED,
+            "missing payload tag must be rejected"
+        );
+    }
+
+    // ── Phase 2: DB-backed acceptance tests ───────────────────────────────
+    //
+    // These tests require Postgres and are tagged #[ignore]. They exercise the
+    // full enforcement state machine including racing moderators, retry
+    // idempotency, and community 9044 vs processing report.
+
+    #[tokio::test]
+    #[ignore = "requires Postgres — racing moderators, exactly one claim"]
+    async fn racing_moderators_one_succeeds_one_gets_409() {
+        // Two concurrent POST /reports/{id}/resolve with different request_ids
+        // against the same open report. Exactly one must succeed (200) and one
+        // must return 409 (report not open). No orphan audit row.
+        todo!("implement once full e2e stack is available")
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres — same request_id retry returns existing action record"]
+    async fn same_request_id_retry_returns_existing_action() {
+        // POST /reports/{id}/resolve with the same requestId twice.
+        // Both should return 200 with the same actionId.
+        todo!("implement once full e2e stack is available")
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres — community 9044 against processing report fails cleanly"]
+    async fn community_9044_against_processing_report_fails_cleanly() {
+        // A community 9044 event against a processing report must fail the CAS
+        // on status='open' and return an error. The enforcement must not be
+        // duplicated.
+        todo!("implement once full e2e stack is available")
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres — cancel rejected after mutation success"]
+    async fn cancel_after_mutation_success_is_rejected() {
+        // After an enforcement action reaches mutation_committed step_marker,
+        // attempting to cancel the action record must fail (cancel is only
+        // legal pre-mutation).
+        todo!("implement once full e2e stack is available")
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres — worker crash re-drive convergence"]
+    async fn worker_crash_redrive_converges_to_exactly_one_enforcement() {
+        // Simulate a crash after mutation_committed but before finalization.
+        // Re-drive from persisted step state must produce exactly one
+        // enforcement, one report transition, one audit chain, one reporter notice.
+        todo!("implement once full e2e stack is available")
     }
 }

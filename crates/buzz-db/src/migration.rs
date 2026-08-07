@@ -349,6 +349,8 @@ mod tests {
             "product_feedback",
             "replica_heartbeat",
             "relay_operators",
+            "relay_admin_actions",
+            "relay_admin_outbox",
         ] {
             if normalized[insert_pos..].contains(&format!("'{value}'")) {
                 globals.insert(value.to_owned());
@@ -562,7 +564,7 @@ mod tests {
         let mut migrations: Vec<_> = MIGRATOR.iter().collect();
         migrations.sort_by_key(|migration| migration.version);
 
-        assert_eq!(migrations.len(), 29);
+        assert_eq!(migrations.len(), 30);
         assert_eq!(migrations[0].version, 1);
         assert_eq!(&*migrations[0].description, "initial schema");
         assert!(migrations[0]
@@ -965,6 +967,25 @@ mod tests {
         assert!(
             relay_operators.contains("processing"),
             "migration 29 must add processing status to moderation_reports"
+        );
+
+        assert_eq!(migrations[29].version, 30);
+        let relay_admin_actions = migrations[29].sql.as_str();
+        assert!(
+            relay_admin_actions.contains("CREATE TABLE relay_admin_actions"),
+            "migration 30 must create relay_admin_actions"
+        );
+        assert!(
+            relay_admin_actions.contains("CREATE TABLE relay_admin_outbox"),
+            "migration 30 must create relay_admin_outbox"
+        );
+        assert!(
+            relay_admin_actions.contains("request_id"),
+            "migration 30 relay_admin_actions must include request_id for idempotency"
+        );
+        assert!(
+            relay_admin_actions.contains("step_marker"),
+            "migration 30 relay_admin_actions must include step_marker for crash recovery"
         );
     }
 

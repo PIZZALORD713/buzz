@@ -9,7 +9,7 @@ use serde::Serialize;
 pub struct ApiError {
     pub status: StatusCode,
     pub code: &'static str,
-    pub message: &'static str,
+    pub message: String,
     /// The `WWW-Authenticate` header value for 401 responses. Defaults to
     /// `Bearer`; set to `Nostr` in NIP-98 mode via `with_www_authenticate`.
     pub www_authenticate: &'static str,
@@ -24,16 +24,34 @@ struct ErrorEnvelope {
 #[serde(rename_all = "camelCase")]
 struct ErrorBody {
     code: &'static str,
-    message: &'static str,
+    message: String,
     request_id: uuid::Uuid,
 }
 
 impl ApiError {
-    pub fn bad_request(code: &'static str, message: &'static str) -> Self {
+    pub fn bad_request(code: &'static str, message: &str) -> Self {
         Self {
             status: StatusCode::BAD_REQUEST,
             code,
-            message,
+            message: message.to_owned(),
+            www_authenticate: "Bearer",
+        }
+    }
+
+    pub fn conflict(message: &str) -> Self {
+        Self {
+            status: StatusCode::CONFLICT,
+            code: "conflict",
+            message: message.to_owned(),
+            www_authenticate: "Bearer",
+        }
+    }
+
+    pub fn unprocessable(message: &str) -> Self {
+        Self {
+            status: StatusCode::UNPROCESSABLE_ENTITY,
+            code: "enforcement_failed",
+            message: message.to_owned(),
             www_authenticate: "Bearer",
         }
     }
@@ -42,7 +60,7 @@ impl ApiError {
         Self {
             status: StatusCode::FORBIDDEN,
             code: "forbidden",
-            message: "request is not authorized",
+            message: "request is not authorized".to_owned(),
             www_authenticate: "Bearer",
         }
     }
@@ -51,7 +69,7 @@ impl ApiError {
         Self {
             status: StatusCode::FORBIDDEN,
             code: "forbidden",
-            message,
+            message: message.to_owned(),
             www_authenticate: "Bearer",
         }
     }
@@ -60,7 +78,7 @@ impl ApiError {
         Self {
             status: StatusCode::UNAUTHORIZED,
             code: "unauthorized",
-            message: "a valid admin credential is required",
+            message: "a valid admin credential is required".to_owned(),
             www_authenticate: "Bearer",
         }
     }
@@ -69,7 +87,7 @@ impl ApiError {
         Self {
             status: StatusCode::NOT_FOUND,
             code: "not_found",
-            message: "record was not found",
+            message: "record was not found".to_owned(),
             www_authenticate: "Bearer",
         }
     }
@@ -78,7 +96,7 @@ impl ApiError {
         Self {
             status: StatusCode::INTERNAL_SERVER_ERROR,
             code: "internal_error",
-            message: "request failed",
+            message: "request failed".to_owned(),
             www_authenticate: "Bearer",
         }
     }
