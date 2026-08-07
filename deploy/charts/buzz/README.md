@@ -119,6 +119,9 @@ intentionally starts the staged migration. Do not roll `sharded-only` writers
 back to a Buzz version that predates sharded reads. Returning from
 `sharded-only` to `dual-read-and-write` does not retroactively recreate legacy
 copies; run and verify the backfill before relying on old-version rollback.
+Never set the phase back to `legacy-only` after any upload has been accepted
+in `sharded-only`: `legacy-only` reads only flat keys, so objects that exist
+only in the sharded layout return 404 until the phase is raised again.
 
 ## Relay Pod extensions
 
@@ -322,6 +325,6 @@ For an **existing deployment**:
 For a **new empty deployment**, set `BUZZ_MEDIA_MIGRATION_PHASE=sharded-only`
 (or Helm `relay.mediaMigrationPhase: sharded-only`) before accepting the first
 upload. This is the recommended starting mode: no legacy objects are created,
-so no backfill or deletion Job is ever needed. The chart and Compose defaults
-remain `legacy-only` solely to make upgrades behavior-preserving for existing
-deployments.
+so no backfill or deletion Job is ever needed. The Compose example environment
+ships `sharded-only` for this reason; the chart default remains `legacy-only`
+solely to keep `helm upgrade` behavior-preserving for existing deployments.
