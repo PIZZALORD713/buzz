@@ -1,7 +1,10 @@
 //! Idempotently copy legacy media payloads into the sharded layout.
 
 use anyhow::{Context, Result};
-use buzz_media::migration::{objects_for_sidecar, parse_sidecar_key, RequestPacer};
+use buzz_media::migration::{
+    objects_for_sidecar, parse_sidecar_key, MigrationObject, RequestPacer,
+};
+use buzz_media::MediaStorage;
 use clap::Parser;
 
 mod media_layout_common;
@@ -15,6 +18,34 @@ struct Args {
     /// Report actions without copying objects.
     #[arg(long, env = "BUZZ_MEDIA_MIGRATION_DRY_RUN", default_value_t = false)]
     dry_run: bool,
+}
+
+async fn verify_destination(
+    storage: &MediaStorage,
+    pacer: &mut RequestPacer,
+    object: &MigrationObject,
+) -> Result<bool> {
+    pacer.wait().await;
+    let source = storage
+        .get(&object.legacy)
+        .await
+        .with_context(|| format!("read legacy source for verification: {}", object.legacy))?;
+
+    pacer.wait().await;
+    let destination = match storage.get(&object.sharded).await {
+        Ok(bytes) => bytes,
+        Err(buzz_media::MediaError::NotFound) => return Ok(false),
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "read sharded destination for verification: {}",
+                    object.sharded
+                )
+            });
+        }
+    };
+
+    Ok(destination == source)
 }
 
 #[tokio::main]
@@ -55,7 +86,7 @@ async fn main() -> Result<()> {
             for object in objects_for_sidecar(community, sha, &meta)? {
                 processed += 1;
                 pacer.wait().await;
-                if storage.head(&object.sharded).await? {
+                if verify_destination(&storage, &mut pacer, &object).await? {
                     skipped += 1;
                     continue;
                 }
@@ -72,8 +103,7 @@ async fn main() -> Result<()> {
                 } else {
                     pacer.wait().await;
                     storage.copy(&object.legacy, &object.sharded).await?;
-                    pacer.wait().await;
-                    if !storage.head(&object.sharded).await? {
+                    if !verify_destination(&storage, &mut pacer, &object).await? {
                         anyhow::bail!("destination verification failed: {}", object.sharded);
                     }
                     copied += 1;
