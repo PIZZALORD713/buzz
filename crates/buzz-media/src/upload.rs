@@ -95,11 +95,11 @@ where
     // Idempotent: short-circuit only if BOTH sidecar and blob exist. If the
     // sidecar exists but the blob is missing, fall through to re-upload.
     let sidecar_exists = storage.head(&meta_key).await?;
-    let existing_blob_key = match storage.existing_write_key(ctx, &legacy_key).await {
-        Ok(key) => key,
-        Err(error) => return Err(error),
-    };
-    if sidecar_exists && existing_blob_key.is_some() {
+    let existing_blob_key = storage
+        .existing_write_key(ctx, &legacy_key)
+        .await?
+        .filter(|_| sidecar_exists);
+    if let Some(existing_blob_key) = existing_blob_key {
         let meta = storage.get_sidecar(ctx, &sha256).await?;
         // A re-upload of known bytes is still a distinct upload *event*: no
         // blob PUT happens, so without this record the uploader would be
@@ -114,7 +114,7 @@ where
                 UploadEventFacts {
                     sha256: &sha256,
                     ext: &ext,
-                    blob_key: existing_blob_key.as_deref().expect("checked above"),
+                    blob_key: &existing_blob_key,
                     mime: &mime,
                     size: body.len() as u64,
                     uploaded_at: chrono::Utc::now().timestamp(),
@@ -437,11 +437,11 @@ pub async fn process_video_upload(
 
     // --- 5. Idempotency check ---
     let sidecar_exists = storage.head(&meta_key).await?;
-    let existing_blob_key = match storage.existing_write_key(ctx, &legacy_key).await {
-        Ok(key) => key,
-        Err(error) => return Err(error),
-    };
-    if sidecar_exists && existing_blob_key.is_some() {
+    let existing_blob_key = storage
+        .existing_write_key(ctx, &legacy_key)
+        .await?
+        .filter(|_| sidecar_exists);
+    if let Some(existing_blob_key) = existing_blob_key {
         let meta = storage.get_sidecar(ctx, &sha256_hex).await?;
         // Re-upload of known bytes: still a distinct upload event — see the
         // buffered path's short-circuit for the rationale.
@@ -454,7 +454,7 @@ pub async fn process_video_upload(
                 UploadEventFacts {
                     sha256: &sha256_hex,
                     ext,
-                    blob_key: existing_blob_key.as_deref().expect("checked above"),
+                    blob_key: &existing_blob_key,
                     mime: &mime,
                     size: file_size,
                     uploaded_at: chrono::Utc::now().timestamp(),
