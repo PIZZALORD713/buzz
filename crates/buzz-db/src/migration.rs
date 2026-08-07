@@ -562,7 +562,7 @@ mod tests {
         let mut migrations: Vec<_> = MIGRATOR.iter().collect();
         migrations.sort_by_key(|migration| migration.version);
 
-        assert_eq!(migrations.len(), 28);
+        assert_eq!(migrations.len(), 29);
         assert_eq!(migrations[0].version, 1);
         assert_eq!(&*migrations[0].description, "initial schema");
         assert!(migrations[0]
@@ -920,7 +920,6 @@ mod tests {
         assert!(heartbeat.contains("epoch"));
         assert!(heartbeat.contains("INSERT INTO replica_heartbeat (id) VALUES (1)"));
         assert!(heartbeat.contains("_operator_global_tables"));
-
         // Channel-id lookup index (0027): serves the tenant-independent
         // `channels` lookups that carry no community_id predicate, which no
         // community_id-leading index can satisfy. Covering + partial so the
@@ -943,22 +942,29 @@ mod tests {
         );
 
         assert_eq!(migrations[27].version, 28);
-        let relay_operators = migrations[27].sql.as_str();
+        let long_reactions = migrations[27].sql.as_str();
+        assert!(
+            long_reactions.contains("ALTER TABLE reactions ALTER COLUMN emoji TYPE VARCHAR(66)")
+        );
+        assert!(desired_schema.contains("emoji               VARCHAR(66) NOT NULL"));
+
+        assert_eq!(migrations[28].version, 29);
+        let relay_operators = migrations[28].sql.as_str();
         assert!(
             relay_operators.contains("CREATE TABLE relay_operators"),
-            "migration 28 must create relay_operators"
+            "migration 29 must create relay_operators"
         );
         assert!(
             relay_operators.contains("_operator_global_tables"),
-            "migration 28 must register relay_operators in _operator_global_tables"
+            "migration 29 must register relay_operators in _operator_global_tables"
         );
         assert!(
             relay_operators.contains("actor_authority"),
-            "migration 28 must add actor_authority to moderation_actions"
+            "migration 29 must add actor_authority to moderation_actions"
         );
         assert!(
             relay_operators.contains("processing"),
-            "migration 28 must add processing status to moderation_reports"
+            "migration 29 must add processing status to moderation_reports"
         );
     }
 
@@ -1202,7 +1208,7 @@ mod tests {
         run_migrations(&pool)
             .await
             .expect("retry succeeds after operator repair");
-        assert_eq!(applied_versions(&pool).await.last().copied(), Some(28));
+        assert_eq!(applied_versions(&pool).await.last().copied(), Some(29));
     }
 
     #[tokio::test]
