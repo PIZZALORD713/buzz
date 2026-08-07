@@ -4,17 +4,21 @@
 //!
 //! - [`resolve_report_decision_only`] — HTTP `dismiss`/`escalate` and 9044
 //!   community-moderation. Atomically CASes report to terminal status with
-//!   a linked decision audit row in one transaction.
+//!   a linked decision audit row in **one transaction**.
 //!
 //! - [`resolve_report_with_enforcement`] — HTTP `delete`/`kick`/`ban`/`timeout`.
-//!   Claims the report (`open → processing`), runs enforcement, finalizes.
+//!   Claims the report (`open → processing`) in one transaction, runs the
+//!   durable enforcement mutation, commits the step marker, then enqueues
+//!   artifact delivery into `relay_admin_outbox`. Delivery is driven by the
+//!   outbox worker ([`crate::handlers::admin_outbox_worker`]) — **never from
+//!   this request path**.
 //!
-//! ## Adapter-specific status semantics
+//! ## Crash safety
 //!
-//! HTTP derives terminal status from action: `dismiss`→`dismissed`,
-//! `escalate`→`escalated`, enforcement→`resolved`.
-//!
-//! 9044 preserves its signed `status` field exactly (caller passes it).
+//! A crash after `mutation_committed` is committed re-drives by checking
+//! `step_marker` and skipping the already-idempotent mutation. The finalization
+//! transaction requires both `step_marker = 'mutation_committed'` and the
+//! matching `active_action_id` on the report row.
 //!
 //! ## Action matrix (frozen per Plan v3/v4 §7)
 //!
@@ -32,11 +36,8 @@ use uuid::Uuid;
 
 use buzz_core::tenant::TenantContext;
 use buzz_db::admin_moderation::AdminReportDetail;
-use buzz_db::moderation::NewAction;
-use buzz_db::relay_admin_actions::{AdminActionRecord, ClaimResult};
+use buzz_db::relay_admin_actions::{AdminActionRecord, ClaimResult, KickResult};
 
-use crate::handlers::moderation_notices::{send_moderation_notice, ModerationNotice};
-use crate::handlers::side_effects::emit_system_message;
 use crate::state::AppState;
 
 /// Error returned by the resolution orchestrations.
@@ -92,12 +93,14 @@ pub fn http_validate_and_derive_status(
     timeout_until: Option<DateTime<Utc>>,
 ) -> Result<String, String> {
     // Validate action/target matrix.
-    let valid = match (action, target_kind) {
-        ("delete" | "kick" | "ban" | "timeout" | "dismiss" | "escalate", "event") => true,
-        ("ban" | "timeout" | "dismiss" | "escalate", "pubkey") => true,
-        ("dismiss" | "escalate", "blob") => true,
-        _ => false,
-    };
+    let valid = matches!(
+        (action, target_kind),
+        (
+            "delete" | "kick" | "ban" | "timeout" | "dismiss" | "escalate",
+            "event"
+        ) | ("ban" | "timeout" | "dismiss" | "escalate", "pubkey")
+            | ("dismiss" | "escalate", "blob")
+    );
     if !valid {
         return Err(format!(
             "action `{action}` is not valid for `{target_kind}` reports"
@@ -148,8 +151,10 @@ pub fn enforcement_audit_action(action: &str) -> &'static str {
 /// - The 9044 community-moderation adapter (caller passes the event's signed
 ///   `status`; `actor_authority` = `"community"`).
 ///
-/// Writes the decision audit row + CAS report to `terminal_status` in one
-/// transaction. Reporter notice is best-effort.
+/// Performs the CAS `open→terminal` AND the decision audit row insert in one
+/// transaction via `db.resolve_report_decision_atomic`. A concurrent close
+/// rolls back both — no orphan audit row. Reporter notice is best-effort
+/// after commit.
 #[allow(clippy::too_many_arguments)]
 pub async fn resolve_report_decision_only(
     state: &Arc<AppState>,
@@ -167,36 +172,20 @@ pub async fn resolve_report_decision_only(
 ) -> Result<DecisionResolved, ResolutionError> {
     let community_id = tenant.community();
 
-    // Write audit row.
-    let action_id = state
-        .db
-        .insert_moderation_action(
-            community_id,
-            NewAction {
-                actor_pubkey,
-                action: audit_action,
-                target_pubkey,
-                target_event_id,
-                channel_id,
-                reason_code: None,
-                public_reason: reason,
-                private_reason: None,
-                matched_principal: None,
-                actor_authority: Some(actor_authority),
-            },
-        )
-        .await
-        .map_err(ResolutionError::from)?;
-
-    // CAS report to terminal status.
+    // Single-transaction CAS + audit — no orphan row on concurrent close.
     let resolved = state
         .db
-        .resolve_moderation_report(
+        .resolve_report_decision_atomic(
             community_id,
             report_id,
             terminal_status,
+            audit_action,
             actor_pubkey,
-            Some(action_id),
+            actor_authority,
+            target_pubkey,
+            target_event_id,
+            channel_id,
+            reason,
         )
         .await
         .map_err(ResolutionError::from)?;
@@ -205,7 +194,8 @@ pub async fn resolve_report_decision_only(
         return Err(ResolutionError::NotOpen("concurrent_close".to_string()));
     }
 
-    // Best-effort reporter notice.
+    // Best-effort reporter notice after commit.
+    use crate::handlers::moderation_notices::{send_moderation_notice, ModerationNotice};
     let summary = reason
         .map(|r| r.to_string())
         .unwrap_or_else(|| match terminal_status {
@@ -236,10 +226,9 @@ pub async fn resolve_report_decision_only(
 
 /// Resolve a report with server-side enforcement.
 ///
-/// For HTTP `delete`/`kick`/`ban`/`timeout`. Claims report via CAS
-/// (`open → processing`), runs enforcement, finalizes to `resolved`.
-///
-/// The `tenant` is constructed from the report's community provenance.
+/// Claims report via CAS (`open → processing`) in one transaction, runs the
+/// durable enforcement mutation, commits the step marker, then enqueues
+/// outbox delivery commands. Artifact delivery never runs from this path.
 #[allow(clippy::too_many_arguments)]
 pub async fn resolve_report_with_enforcement(
     state: &Arc<AppState>,
@@ -257,13 +246,12 @@ pub async fn resolve_report_with_enforcement(
     let report_id = report.report.id;
     let channel_id = report.report.channel_id;
 
-    // Derive target bytes from the report row.
     let (target_pubkey_opt, target_event_id_opt) =
         decode_report_target(&report.report.target_kind, &report.report.target)?;
 
     let audit_action = enforcement_audit_action(action);
 
-    // Claim: CAS open → processing.
+    // Claim: one transaction — audit row + action record + report CAS open→processing.
     let action_record = match state
         .db
         .claim_report_for_enforcement(
@@ -307,6 +295,25 @@ pub async fn resolve_report_with_enforcement(
     .await
 }
 
+/// Context for the enforcement mutation — reduces argument count.
+struct EnforcementCtx<'a> {
+    community_id: buzz_core::tenant::CommunityId,
+    action: &'a str,
+    reason: Option<&'a str>,
+    timeout_until: Option<DateTime<Utc>>,
+    actor_pubkey: &'a [u8],
+    target_pubkey: Option<&'a [u8]>,
+    target_event_id: Option<&'a [u8]>,
+    channel_id: Option<Uuid>,
+}
+
+/// Drive the enforcement state machine from the given action record forward to
+/// completion, then enqueue outbox delivery tasks.
+///
+/// Uses a loop rather than recursion to advance through CAS contention without
+/// boxing async futures. The loop terminates because each iteration either
+/// returns or advances the action to a strictly later state (pending →
+/// enforcing → succeeded/failed).
 #[allow(clippy::too_many_arguments)]
 async fn drive_enforcement(
     state: &Arc<AppState>,
@@ -321,137 +328,223 @@ async fn drive_enforcement(
     target_event_id: Option<&[u8]>,
     channel_id: Option<Uuid>,
     reporter_pubkey_hex: &str,
-    action_record: &AdminActionRecord,
+    initial_record: &AdminActionRecord,
 ) -> Result<EnforcementResolved, ResolutionError> {
-    let action_id = action_record.id;
+    // Work on an owned copy so we can replace it when reloading.
+    let mut rec = initial_record.clone();
+    let action_id = rec.id;
 
-    // Already finalized by a prior run.
-    if action_record.state == "succeeded" {
-        return Ok(EnforcementResolved { action_id });
-    }
+    loop {
+        // Already finalized — idempotent success.
+        if rec.state == "succeeded" {
+            return Ok(EnforcementResolved { action_id });
+        }
 
-    // A failed action can only be retried by the caller; surface the error.
-    if action_record.state == "failed" {
-        return Err(ResolutionError::EnforcementFailed {
-            action_id,
-            error: action_record.error_message.clone().unwrap_or_default(),
-        });
-    }
+        // Pre-mutation failure — surface error; caller retries with a new request_id.
+        if rec.state == "failed" {
+            return Err(ResolutionError::EnforcementFailed {
+                action_id,
+                error: rec.error_message.clone().unwrap_or_default(),
+            });
+        }
 
-    // Advance to enforcing if still pending.
-    if action_record.state == "pending" {
-        let _ = state.db.begin_enforcing_action(action_id).await;
-    }
+        // Advance to enforcing if still pending. False CAS = another driver won;
+        // reload and loop — the reloaded state will be enforcing/succeeded/failed.
+        if rec.state == "pending" {
+            let advanced = state
+                .db
+                .begin_enforcing_action(action_id)
+                .await
+                .map_err(ResolutionError::from)?;
+            if !advanced {
+                rec = state
+                    .db
+                    .get_admin_action(action_id)
+                    .await
+                    .map_err(ResolutionError::from)?
+                    .ok_or_else(|| {
+                        ResolutionError::Internal("action disappeared after claim".to_string())
+                    })?;
+                continue;
+            }
+            // Re-read the updated record so step_marker check below is correct.
+            rec = state
+                .db
+                .get_admin_action(action_id)
+                .await
+                .map_err(ResolutionError::from)?
+                .ok_or_else(|| {
+                    ResolutionError::Internal(
+                        "action disappeared after begin_enforcing".to_string(),
+                    )
+                })?;
+        }
 
-    // Run durable mutation if not already committed.
-    if action_record.step_marker.is_none() {
-        let result = run_enforcement_mutation(
+        // Run mutation only if step marker is not yet committed. After a crash that
+        // lands here on re-drive, step_marker is still None so the mutation runs
+        // again — all mutations are idempotent (ban/timeout: upsert; kick/delete:
+        // no-op if already done, except kick-AlreadyGone which is surfaced distinctly).
+        if rec.step_marker.is_none() {
+            let ctx = EnforcementCtx {
+                community_id,
+                action,
+                reason,
+                timeout_until,
+                actor_pubkey,
+                target_pubkey,
+                target_event_id,
+                channel_id,
+            };
+            match run_enforcement_mutation(state, &ctx).await {
+                Ok(()) => {
+                    // Commit step marker. A crash before this commit restarts here
+                    // and re-runs the idempotent mutation.
+                    let committed = state
+                        .db
+                        .commit_action_mutation_step(action_id)
+                        .await
+                        .map_err(ResolutionError::from)?;
+                    if !committed {
+                        // Lost ownership: reload and loop.
+                        rec = state
+                            .db
+                            .get_admin_action(action_id)
+                            .await
+                            .map_err(ResolutionError::from)?
+                            .ok_or_else(|| {
+                                ResolutionError::Internal(
+                                    "action disappeared after mutation".to_string(),
+                                )
+                            })?;
+                        continue;
+                    }
+                }
+                Err(e) => {
+                    let _ = state
+                        .db
+                        .record_action_failure(action_id, &e.to_string())
+                        .await;
+                    return Err(ResolutionError::EnforcementFailed {
+                        action_id,
+                        error: e.to_string(),
+                    });
+                }
+            }
+        }
+
+        // Finalize: action → succeeded, report → resolved.
+        // Requires step_marker = 'mutation_committed' AND active_action_id = this action.
+        let finalized = state
+            .db
+            .finalize_action_success(action_id, community_id, report_id, "resolved", actor_pubkey)
+            .await
+            .map_err(ResolutionError::from)?;
+
+        if !finalized {
+            rec = state
+                .db
+                .get_admin_action(action_id)
+                .await
+                .map_err(ResolutionError::from)?
+                .ok_or_else(|| {
+                    ResolutionError::Internal("action disappeared during finalization".to_string())
+                })?;
+            if rec.state == "succeeded" {
+                return Ok(EnforcementResolved { action_id });
+            }
+            return Err(ResolutionError::Internal(format!(
+                "finalize_success failed (state={}, step={:?})",
+                rec.state, rec.step_marker
+            )));
+        }
+
+        // Enqueue outbox delivery tasks. Processed by the admin outbox worker.
+        // ON CONFLICT DO NOTHING makes this idempotent on re-drive.
+        enqueue_delivery_tasks(
             state,
-            community_id,
+            tenant,
+            action_id,
             action,
             reason,
-            timeout_until,
             actor_pubkey,
             target_pubkey,
             target_event_id,
             channel_id,
+            reporter_pubkey_hex,
+            report_id,
         )
         .await;
 
-        match result {
-            Ok(()) => {
-                // Commit step marker. If this call fails, re-drive will retry
-                // the mutation (idempotent) and re-commit.
-                let _ = state.db.commit_action_mutation_step(action_id).await;
-            }
-            Err(e) => {
-                let _ = state
-                    .db
-                    .record_action_failure(action_id, &e.to_string())
-                    .await;
-                return Err(ResolutionError::EnforcementFailed {
-                    action_id,
-                    error: e.to_string(),
-                });
-            }
-        }
+        info!(action_id = %action_id, report_id = %report_id, action = %action, "enforcement resolved");
+        return Ok(EnforcementResolved { action_id });
     }
-
-    // Finalize: action → succeeded, report → resolved.
-    let _ = state
-        .db
-        .finalize_action_success(action_id, community_id, report_id, "resolved", actor_pubkey)
-        .await;
-
-    // Best-effort artifact/notice delivery (delivery states — never reopen report).
-    deliver_post_enforcement(
-        state,
-        tenant,
-        action,
-        reason,
-        actor_pubkey,
-        target_pubkey,
-        target_event_id,
-        channel_id,
-        reporter_pubkey_hex,
-        report_id,
-        action_id,
-    )
-    .await;
-
-    info!(action_id = %action_id, report_id = %report_id, action = %action, "enforcement resolved");
-    Ok(EnforcementResolved { action_id })
 }
 
 async fn run_enforcement_mutation(
     state: &Arc<AppState>,
-    community_id: buzz_core::tenant::CommunityId,
-    action: &str,
-    reason: Option<&str>,
-    timeout_until: Option<DateTime<Utc>>,
-    actor_pubkey: &[u8],
-    target_pubkey: Option<&[u8]>,
-    target_event_id: Option<&[u8]>,
-    channel_id: Option<Uuid>,
+    ctx: &EnforcementCtx<'_>,
 ) -> anyhow::Result<()> {
-    match action {
+    match ctx.action {
         "ban" => {
-            let target =
-                target_pubkey.ok_or_else(|| anyhow::anyhow!("ban requires target_pubkey"))?;
+            let target = ctx
+                .target_pubkey
+                .ok_or_else(|| anyhow::anyhow!("ban requires target_pubkey"))?;
             state
                 .db
-                .ban_community_member(community_id, target, actor_pubkey, reason, None)
+                .ban_community_member(ctx.community_id, target, ctx.actor_pubkey, ctx.reason, None)
                 .await
                 .map_err(|e| anyhow::anyhow!("ban failed: {e}"))?;
         }
         "timeout" => {
-            let target =
-                target_pubkey.ok_or_else(|| anyhow::anyhow!("timeout requires target_pubkey"))?;
-            let until =
-                timeout_until.ok_or_else(|| anyhow::anyhow!("timeout requires timeout_until"))?;
+            let target = ctx
+                .target_pubkey
+                .ok_or_else(|| anyhow::anyhow!("timeout requires target_pubkey"))?;
+            let until = ctx
+                .timeout_until
+                .ok_or_else(|| anyhow::anyhow!("timeout requires timeout_until"))?;
             state
                 .db
-                .timeout_community_member(community_id, target, actor_pubkey, until, reason)
+                .timeout_community_member(
+                    ctx.community_id,
+                    target,
+                    ctx.actor_pubkey,
+                    until,
+                    ctx.reason,
+                )
                 .await
                 .map_err(|e| anyhow::anyhow!("timeout failed: {e}"))?;
         }
         "kick" => {
-            let target =
-                target_pubkey.ok_or_else(|| anyhow::anyhow!("kick requires target_pubkey"))?;
-            let ch = channel_id.ok_or_else(|| anyhow::anyhow!("kick requires channel_id"))?;
-            // KickResult::AlreadyGone is idempotent success.
-            let _ = state
+            let target = ctx
+                .target_pubkey
+                .ok_or_else(|| anyhow::anyhow!("kick requires target_pubkey"))?;
+            let ch = ctx
+                .channel_id
+                .ok_or_else(|| anyhow::anyhow!("kick requires channel_id"))?;
+            // Distinguish provenance: AlreadyGone = target was absent BEFORE this
+            // action. That is not successful enforcement — surface it distinctly
+            // so the operator knows vs. Removed (new removal this action performed).
+            match state
                 .db
-                .deploy_kick_member(community_id, ch, target, actor_pubkey)
+                .deploy_kick_member(ctx.community_id, ch, target, ctx.actor_pubkey)
                 .await
-                .map_err(|e| anyhow::anyhow!("kick failed: {e}"))?;
+                .map_err(|e| anyhow::anyhow!("kick failed: {e}"))?
+            {
+                KickResult::Removed => {}
+                KickResult::AlreadyGone => {
+                    return Err(anyhow::anyhow!(
+                        "kick target was already absent before this action"
+                    ))
+                }
+            }
         }
         "delete" => {
-            let target = target_event_id
+            let target = ctx
+                .target_event_id
                 .ok_or_else(|| anyhow::anyhow!("delete requires target_event_id"))?;
             let meta = state
                 .db
-                .get_thread_metadata_by_event(community_id, target)
+                .get_thread_metadata_by_event(ctx.community_id, target)
                 .await
                 .map_err(|e| anyhow::anyhow!("thread metadata lookup failed: {e}"))?;
             let parent_id = meta.as_ref().and_then(|m| m.parent_event_id.clone());
@@ -460,7 +553,7 @@ async fn run_enforcement_mutation(
             let _ = state
                 .db
                 .soft_delete_event_and_update_thread(
-                    community_id,
+                    ctx.community_id,
                     target,
                     parent_id.as_deref(),
                     root_id.as_deref(),
@@ -473,12 +566,13 @@ async fn run_enforcement_mutation(
     Ok(())
 }
 
-/// Deliver durable artifacts and best-effort notices after enforcement committed.
-/// All failures are logged and do not affect report state.
+/// Enqueue outbox delivery tasks. Processed by admin outbox worker, not this path.
+/// All tasks use `dedup_key` so re-enqueue on re-drive is idempotent.
 #[allow(clippy::too_many_arguments)]
-async fn deliver_post_enforcement(
+async fn enqueue_delivery_tasks(
     state: &Arc<AppState>,
     tenant: &TenantContext,
+    action_id: Uuid,
     action: &str,
     reason: Option<&str>,
     actor_pubkey: &[u8],
@@ -487,66 +581,87 @@ async fn deliver_post_enforcement(
     channel_id: Option<Uuid>,
     reporter_pubkey_hex: &str,
     report_id: Uuid,
-    action_id: Uuid,
 ) {
-    // Tombstone for delete.
     if action == "delete" {
         if let (Some(ch), Some(target_id)) = (channel_id, target_event_id) {
-            let tombstone = serde_json::json!({
-                "type": "message_deleted",
+            let payload = serde_json::json!({
+                "community_id": tenant.community().to_string(),
+                "channel_id": ch.to_string(),
                 "actor": hex::encode(actor_pubkey),
                 "target_event_id": hex::encode(target_id),
                 "action_id": action_id.to_string(),
                 "reason_code": reason.unwrap_or(""),
             });
-            if let Err(e) = emit_system_message(tenant, state, ch, tombstone).await {
-                warn!(error = %e, action_id = %action_id, "tombstone emission failed");
+            if let Err(e) = state
+                .db
+                .enqueue_admin_outbox(
+                    action_id,
+                    "tombstone",
+                    payload,
+                    &format!("tombstone:{action_id}"),
+                )
+                .await
+            {
+                warn!(error = %e, action_id = %action_id, "tombstone enqueue failed");
             }
         }
     }
 
-    // System message for kick.
     if action == "kick" {
         if let (Some(ch), Some(target)) = (channel_id, target_pubkey) {
-            let msg = serde_json::json!({
-                "type": "member_removed",
+            let payload = serde_json::json!({
+                "community_id": tenant.community().to_string(),
+                "channel_id": ch.to_string(),
                 "actor": hex::encode(actor_pubkey),
                 "target": hex::encode(target),
                 "action_id": action_id.to_string(),
             });
-            if let Err(e) = emit_system_message(tenant, state, ch, msg).await {
-                warn!(error = %e, action_id = %action_id, "kick system message failed");
+            if let Err(e) = state
+                .db
+                .enqueue_admin_outbox(
+                    action_id,
+                    "system_message",
+                    payload,
+                    &format!("system_message:{action_id}"),
+                )
+                .await
+            {
+                warn!(error = %e, action_id = %action_id, "kick system message enqueue failed");
             }
         }
     }
 
-    // Reporter notice DM.
-    if let Ok(reporter_bytes) = hex::decode(reporter_pubkey_hex) {
-        let summary = reason
-            .map(|r| r.to_string())
-            .unwrap_or_else(|| "Your report was reviewed and acted on.".to_string());
-        if let Err(e) = send_moderation_notice(
-            tenant,
-            state,
-            &reporter_bytes,
-            ModerationNotice::ReportResolved {
-                report_id,
-                status: "resolved".to_string(),
-                summary,
-            },
+    let summary = reason
+        .map(|r| r.to_string())
+        .unwrap_or_else(|| "Your report was reviewed and acted on.".to_string());
+    let payload = serde_json::json!({
+        "reporter_pubkey_hex": reporter_pubkey_hex,
+        "report_id": report_id.to_string(),
+        "action_id": action_id.to_string(),
+        "community_id": tenant.community().to_string(),
+        "summary": summary,
+    });
+    if let Err(e) = state
+        .db
+        .enqueue_admin_outbox(
+            action_id,
+            "reporter_notice",
+            payload,
+            &format!("reporter_notice:{action_id}"),
         )
         .await
-        {
-            warn!(error = %e, action_id = %action_id, "reporter notice failed");
-        }
+    {
+        warn!(error = %e, action_id = %action_id, "reporter notice enqueue failed");
     }
 }
 
 /// Decode the report target hex into binary.
+type TargetPair = (Option<Vec<u8>>, Option<Vec<u8>>);
+
 fn decode_report_target(
     target_kind: &str,
     target_hex: &str,
-) -> Result<(Option<Vec<u8>>, Option<Vec<u8>>), ResolutionError> {
+) -> Result<TargetPair, ResolutionError> {
     match target_kind {
         "event" => {
             let bytes = hex::decode(target_hex)

@@ -718,6 +718,17 @@ async fn main() -> anyhow::Result<()> {
         info!("NIP-PL push matcher and delivery worker started");
     }
 
+    // Admin outbox delivery worker — drives `relay_admin_outbox` rows.
+    // Uses DB-level leases (held_by / lease_expires_at) so multiple pods can
+    // run the worker concurrently without double-delivery.
+    {
+        let outbox_state = Arc::clone(&state);
+        tokio::spawn(
+            async move { buzz_relay::handlers::admin_outbox_worker::run(outbox_state).await },
+        );
+        info!("Admin outbox delivery worker started");
+    }
+
     // NIP-ER reminder scheduler — polls for due reminders and publishes them
     // to Redis pub/sub for cross-pod fan-out. Each pod's existing
     // subscribe_local consumer picks them up and applies the author-only gate.

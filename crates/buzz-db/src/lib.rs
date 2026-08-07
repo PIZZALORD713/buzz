@@ -4189,6 +4189,37 @@ impl Db {
 
     // ── relay_admin_actions (HTTP enforcement state machine) ──────────────────
 
+    /// Atomic decision-only report closure: CAS open→terminal + audit row in one transaction.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn resolve_report_decision_atomic(
+        &self,
+        community_id: CommunityId,
+        report_id: uuid::Uuid,
+        terminal_status: &str,
+        audit_action: &str,
+        actor_pubkey: &[u8],
+        actor_authority: &str,
+        target_pubkey: Option<&[u8]>,
+        target_event_id: Option<&[u8]>,
+        channel_id: Option<uuid::Uuid>,
+        reason: Option<&str>,
+    ) -> Result<bool> {
+        relay_admin_actions::resolve_report_decision_atomic(
+            &self.pool,
+            community_id,
+            report_id,
+            terminal_status,
+            audit_action,
+            actor_pubkey,
+            actor_authority,
+            target_pubkey,
+            target_event_id,
+            channel_id,
+            reason,
+        )
+        .await
+    }
+
     /// Attempt to claim a report for HTTP enforcement (CAS open → processing).
     #[allow(clippy::too_many_arguments)]
     pub async fn claim_report_for_enforcement(
@@ -4294,6 +4325,27 @@ impl Db {
     /// Mark an outbox record as delivered.
     pub async fn mark_admin_outbox_delivered(&self, outbox_id: uuid::Uuid) -> Result<()> {
         relay_admin_actions::mark_outbox_delivered(&self.pool, outbox_id).await
+    }
+
+    /// Mark an outbox record as failed.
+    pub async fn fail_admin_outbox_row(&self, outbox_id: uuid::Uuid, error: &str) -> Result<()> {
+        relay_admin_actions::fail_outbox_row(&self.pool, outbox_id, error).await
+    }
+
+    /// Claim a batch of pending outbox rows for the given worker pod.
+    pub async fn claim_pending_admin_outbox_batch(
+        &self,
+        worker_id: &str,
+        lease_until: chrono::DateTime<chrono::Utc>,
+        batch_size: i64,
+    ) -> Result<Vec<relay_admin_actions::OutboxRecord>> {
+        relay_admin_actions::claim_pending_outbox_batch(
+            &self.pool,
+            worker_id,
+            lease_until,
+            batch_size,
+        )
+        .await
     }
 
     /// List pending outbox records for an action.

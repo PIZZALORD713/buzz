@@ -1610,9 +1610,8 @@ mod tests {
         std::env::set_var("RELAY_OWNER_PUBKEY", &valid);
         let config = Config::from_env().expect("valid RELAY_OWNER_PUBKEY parses");
         std::env::remove_var("RELAY_OWNER_PUBKEY");
-        match previous {
-            Some(v) => std::env::set_var("RELAY_OWNER_PUBKEY", v),
-            None => {}
+        if let Some(v) = previous {
+            std::env::set_var("RELAY_OWNER_PUBKEY", v);
         }
         assert_eq!(config.relay_owner_pubkey, Some(valid));
     }

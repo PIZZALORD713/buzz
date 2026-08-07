@@ -439,10 +439,9 @@ async fn resolve_report(
         .ok_or_else(ApiError::not_found)?;
 
     // Compute timeout_until if needed.
-    let timeout_until: Option<DateTime<Utc>> = match body.expiration_secs {
-        Some(secs) => Some(Utc::now() + chrono::Duration::seconds(secs as i64)),
-        None => None,
-    };
+    let timeout_until: Option<DateTime<Utc>> = body
+        .expiration_secs
+        .map(|secs| Utc::now() + chrono::Duration::seconds(secs as i64));
 
     // Validate action/target matrix and derive HTTP terminal status.
     let _derived_status = http_validate_and_derive_status(
@@ -852,10 +851,9 @@ fn decode_hex_pubkey(hex_str: &str) -> Result<Vec<u8>, ApiError> {
 }
 
 /// Decode a hex-encoded report target into (pubkey_bytes, event_id_bytes).
-fn decode_report_target_hex(
-    target_kind: &str,
-    target_hex: &str,
-) -> Result<(Option<Vec<u8>>, Option<Vec<u8>>), String> {
+type TargetPairMod = (Option<Vec<u8>>, Option<Vec<u8>>);
+
+fn decode_report_target_hex(target_kind: &str, target_hex: &str) -> Result<TargetPairMod, String> {
     match target_kind {
         "event" => {
             let bytes = hex::decode(target_hex).map_err(|e| e.to_string())?;
@@ -965,7 +963,9 @@ mod tests {
         body::Body,
         http::{Request, StatusCode},
     };
+    use sqlx::Row as _;
     use tower::ServiceExt;
+    use uuid::Uuid;
 
     const TOKEN: &str = "5f0e1d2c3b4a59687786958493a2b1c0decadebeefcafe0123456789abcdef01";
 
@@ -2514,31 +2514,309 @@ mod tests {
     // These tests require Postgres and are tagged #[ignore]. They exercise the
     // full enforcement state machine including racing moderators, retry
     // idempotency, and community 9044 vs processing report.
+    //
+    // They delegate to the DB-layer tests in buzz_db::relay_admin_actions::tests
+    // which directly exercise the state machine functions, proving the contracts
+    // Paul's dispatch requires without needing the full HTTP stack.
 
     #[tokio::test]
     #[ignore = "requires Postgres — racing moderators, exactly one claim"]
     async fn racing_moderators_one_succeeds_one_gets_409() {
+        // Covered by buzz_db relay_admin_actions::tests::racing_moderators_exactly_one_claim_one_conflict
+        // Run: cargo test -p buzz-db relay_admin_actions::tests::racing -- --ignored
+        //
         // Two concurrent POST /reports/{id}/resolve with different request_ids
         // against the same open report. Exactly one must succeed (200) and one
         // must return 409 (report not open). No orphan audit row.
-        todo!("implement once full e2e stack is available")
+        //
+        // At the DB level: claim_report with two concurrent UUIDs on the same report_id.
+        // FOR UPDATE row lock ensures serial execution; first commit wins, second
+        // returns NotOpen. moderation_actions must have exactly 1 row.
+        let pool = sqlx::PgPool::connect(
+            &std::env::var("BUZZ_TEST_DATABASE_URL")
+                .unwrap_or_else(|_| "postgres://buzz:buzz_dev@localhost:5432/buzz".to_string()),
+        )
+        .await
+        .expect("connect to test DB");
+
+        let community_id = {
+            let id = uuid::Uuid::new_v4();
+            let host = format!("admin-racing-test-{}.example", id.simple());
+            sqlx::query("INSERT INTO communities (id, host) VALUES ($1, $2)")
+                .bind(id)
+                .bind(host)
+                .execute(&pool)
+                .await
+                .expect("insert community");
+            id
+        };
+        let report_id = {
+            let row = sqlx::query(
+                r#"
+                INSERT INTO moderation_reports (community_id, report_event_id, reporter_pubkey, target_kind, target_pubkey, report_type)
+                VALUES ($1, $2, $3, 'pubkey', $4, 'harassment')
+                RETURNING id
+                "#,
+            )
+            .bind(community_id)
+            .bind(uuid::Uuid::new_v4().as_bytes().as_slice())
+            .bind(vec![0u8; 32])
+            .bind(vec![1u8; 32])
+            .fetch_one(&pool)
+            .await
+            .expect("insert report");
+            row.try_get::<uuid::Uuid, _>("id").expect("id")
+        };
+
+        let actor = vec![2u8; 32];
+        let target = vec![1u8; 32];
+        let cid = buzz_core::CommunityId::from_uuid(community_id);
+        let req_a = uuid::Uuid::new_v4();
+        let req_b = uuid::Uuid::new_v4();
+
+        let claim = |request_id: uuid::Uuid,
+                     pool: sqlx::PgPool,
+                     actor: Vec<u8>,
+                     target: Vec<u8>| async move {
+            buzz_db::relay_admin_actions::claim_report(
+                &pool,
+                cid,
+                report_id,
+                request_id,
+                &actor,
+                "operator",
+                "ban",
+                None,
+                None,
+                "resolve:ban",
+                "config",
+                Some(&target),
+                None,
+                None,
+            )
+            .await
+            .expect("claim_report")
+        };
+
+        let (ra, rb) = tokio::join!(
+            claim(req_a, pool.clone(), actor.clone(), target.clone()),
+            claim(req_b, pool.clone(), actor.clone(), target.clone()),
+        );
+
+        let outcomes = [&ra, &rb];
+        let claimed_count = outcomes
+            .iter()
+            .filter(|r| matches!(r, buzz_db::relay_admin_actions::ClaimResult::Claimed(_)))
+            .count();
+        let conflict_count = outcomes
+            .iter()
+            .filter(|r| matches!(r, buzz_db::relay_admin_actions::ClaimResult::NotOpen(_)))
+            .count();
+        assert_eq!(claimed_count, 1, "exactly one claim must succeed");
+        assert_eq!(conflict_count, 1, "exactly one must be rejected");
+
+        let audit_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM moderation_actions WHERE community_id = $1")
+                .bind(community_id)
+                .fetch_one(&pool)
+                .await
+                .expect("count");
+        assert_eq!(audit_count, 1, "no orphan audit row");
     }
 
     #[tokio::test]
     #[ignore = "requires Postgres — same request_id retry returns existing action record"]
     async fn same_request_id_retry_returns_existing_action() {
-        // POST /reports/{id}/resolve with the same requestId twice.
+        // Two POST /reports/{id}/resolve calls with the same requestId UUID.
         // Both should return 200 with the same actionId.
-        todo!("implement once full e2e stack is available")
+        let pool = sqlx::PgPool::connect(
+            &std::env::var("BUZZ_TEST_DATABASE_URL")
+                .unwrap_or_else(|_| "postgres://buzz:buzz_dev@localhost:5432/buzz".to_string()),
+        )
+        .await
+        .expect("connect to test DB");
+
+        let community_id = {
+            let id = uuid::Uuid::new_v4();
+            let host = format!("admin-idempotent-test-{}.example", id.simple());
+            sqlx::query("INSERT INTO communities (id, host) VALUES ($1, $2)")
+                .bind(id)
+                .bind(host)
+                .execute(&pool)
+                .await
+                .expect("insert community");
+            id
+        };
+        let report_id = {
+            let row = sqlx::query(
+                r#"
+                INSERT INTO moderation_reports (community_id, report_event_id, reporter_pubkey, target_kind, target_pubkey, report_type)
+                VALUES ($1, $2, $3, 'pubkey', $4, 'harassment')
+                RETURNING id
+                "#,
+            )
+            .bind(community_id)
+            .bind(uuid::Uuid::new_v4().as_bytes().as_slice())
+            .bind(vec![0u8; 32])
+            .bind(vec![1u8; 32])
+            .fetch_one(&pool)
+            .await
+            .expect("insert report");
+            row.try_get::<uuid::Uuid, _>("id").expect("id")
+        };
+
+        let actor = vec![2u8; 32];
+        let target = vec![1u8; 32];
+        let cid = buzz_core::CommunityId::from_uuid(community_id);
+        let request_id = uuid::Uuid::new_v4();
+
+        let first = buzz_db::relay_admin_actions::claim_report(
+            &pool,
+            cid,
+            report_id,
+            request_id,
+            &actor,
+            "operator",
+            "ban",
+            None,
+            None,
+            "resolve:ban",
+            "config",
+            Some(&target),
+            None,
+            None,
+        )
+        .await
+        .expect("first claim");
+        let first_id = match first {
+            buzz_db::relay_admin_actions::ClaimResult::Claimed(a) => a.id,
+            other => panic!("expected Claimed, got {other:?}"),
+        };
+
+        let second = buzz_db::relay_admin_actions::claim_report(
+            &pool,
+            cid,
+            report_id,
+            request_id,
+            &actor,
+            "operator",
+            "ban",
+            None,
+            None,
+            "resolve:ban",
+            "config",
+            Some(&target),
+            None,
+            None,
+        )
+        .await
+        .expect("second claim");
+        let second_id = match second {
+            buzz_db::relay_admin_actions::ClaimResult::AlreadyClaimed(a) => a.id,
+            other => panic!("expected AlreadyClaimed, got {other:?}"),
+        };
+
+        assert_eq!(
+            first_id, second_id,
+            "same request_id must return same action id"
+        );
     }
 
     #[tokio::test]
     #[ignore = "requires Postgres — community 9044 against processing report fails cleanly"]
     async fn community_9044_against_processing_report_fails_cleanly() {
         // A community 9044 event against a processing report must fail the CAS
-        // on status='open' and return an error. The enforcement must not be
-        // duplicated.
-        todo!("implement once full e2e stack is available")
+        // on status='open' and return an error. The enforcement must not be duplicated.
+        //
+        // resolve_report_decision_atomic CASes on status='open'; if the report is
+        // already 'processing', the transaction rolls back with no audit row.
+        let pool = sqlx::PgPool::connect(
+            &std::env::var("BUZZ_TEST_DATABASE_URL")
+                .unwrap_or_else(|_| "postgres://buzz:buzz_dev@localhost:5432/buzz".to_string()),
+        )
+        .await
+        .expect("connect to test DB");
+
+        let community_id = {
+            let id = uuid::Uuid::new_v4();
+            let host = format!("admin-9044-test-{}.example", id.simple());
+            sqlx::query("INSERT INTO communities (id, host) VALUES ($1, $2)")
+                .bind(id)
+                .bind(host)
+                .execute(&pool)
+                .await
+                .expect("insert community");
+            id
+        };
+        let report_id = {
+            let row = sqlx::query(
+                r#"
+                INSERT INTO moderation_reports (community_id, report_event_id, reporter_pubkey, target_kind, target_pubkey, report_type)
+                VALUES ($1, $2, $3, 'pubkey', $4, 'harassment')
+                RETURNING id
+                "#,
+            )
+            .bind(community_id)
+            .bind(uuid::Uuid::new_v4().as_bytes().as_slice())
+            .bind(vec![0u8; 32])
+            .bind(vec![1u8; 32])
+            .fetch_one(&pool)
+            .await
+            .expect("insert report");
+            row.try_get::<uuid::Uuid, _>("id").expect("id")
+        };
+
+        let actor = vec![2u8; 32];
+        let target = vec![1u8; 32];
+        let cid = buzz_core::CommunityId::from_uuid(community_id);
+
+        // HTTP enforcement claim moves report to 'processing'.
+        let _ = buzz_db::relay_admin_actions::claim_report(
+            &pool,
+            cid,
+            report_id,
+            uuid::Uuid::new_v4(),
+            &actor,
+            "operator",
+            "ban",
+            None,
+            None,
+            "resolve:ban",
+            "config",
+            Some(&target),
+            None,
+            None,
+        )
+        .await
+        .expect("enforcement claim");
+
+        // Community 9044 (decision-only) against the now-processing report must fail.
+        let result = buzz_db::relay_admin_actions::resolve_report_decision_atomic(
+            &pool,
+            cid,
+            report_id,
+            "dismissed",
+            "dismiss_report",
+            &actor,
+            "community",
+            Some(&target),
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("decision-only attempt");
+
+        assert!(!result, "9044 against processing report must fail the CAS");
+
+        // Only one audit row — from the enforcement claim.
+        let count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM moderation_actions WHERE community_id = $1")
+                .bind(community_id)
+                .fetch_one(&pool)
+                .await
+                .expect("count");
+        assert_eq!(count, 1, "no duplicate audit rows from failed 9044");
     }
 
     #[tokio::test]
@@ -2547,7 +2825,84 @@ mod tests {
         // After an enforcement action reaches mutation_committed step_marker,
         // attempting to cancel the action record must fail (cancel is only
         // legal pre-mutation).
-        todo!("implement once full e2e stack is available")
+        let pool = sqlx::PgPool::connect(
+            &std::env::var("BUZZ_TEST_DATABASE_URL")
+                .unwrap_or_else(|_| "postgres://buzz:buzz_dev@localhost:5432/buzz".to_string()),
+        )
+        .await
+        .expect("connect to test DB");
+
+        let community_id = {
+            let id = uuid::Uuid::new_v4();
+            let host = format!("admin-cancel-test-{}.example", id.simple());
+            sqlx::query("INSERT INTO communities (id, host) VALUES ($1, $2)")
+                .bind(id)
+                .bind(host)
+                .execute(&pool)
+                .await
+                .expect("insert community");
+            id
+        };
+        let report_id = {
+            let row = sqlx::query(
+                r#"
+                INSERT INTO moderation_reports (community_id, report_event_id, reporter_pubkey, target_kind, target_pubkey, report_type)
+                VALUES ($1, $2, $3, 'pubkey', $4, 'harassment')
+                RETURNING id
+                "#,
+            )
+            .bind(community_id)
+            .bind(uuid::Uuid::new_v4().as_bytes().as_slice())
+            .bind(vec![0u8; 32])
+            .bind(vec![1u8; 32])
+            .fetch_one(&pool)
+            .await
+            .expect("insert report");
+            row.try_get::<uuid::Uuid, _>("id").expect("id")
+        };
+
+        let actor = vec![2u8; 32];
+        let target = vec![1u8; 32];
+        let cid = buzz_core::CommunityId::from_uuid(community_id);
+
+        let action_id = match buzz_db::relay_admin_actions::claim_report(
+            &pool,
+            cid,
+            report_id,
+            uuid::Uuid::new_v4(),
+            &actor,
+            "operator",
+            "ban",
+            None,
+            None,
+            "resolve:ban",
+            "config",
+            Some(&target),
+            None,
+            None,
+        )
+        .await
+        .expect("claim")
+        {
+            buzz_db::relay_admin_actions::ClaimResult::Claimed(a) => a.id,
+            other => panic!("expected Claimed, got {other:?}"),
+        };
+
+        let _ = buzz_db::relay_admin_actions::begin_enforcing(&pool, action_id)
+            .await
+            .expect("begin_enforcing");
+        let _ = buzz_db::relay_admin_actions::commit_mutation_step(&pool, action_id)
+            .await
+            .expect("commit_mutation_step");
+
+        let cancelled =
+            buzz_db::relay_admin_actions::cancel_action(&pool, action_id, cid, report_id)
+                .await
+                .expect("cancel_action");
+        assert!(
+            !cancelled,
+            "cancel after mutation_committed must be rejected"
+        );
     }
 
     #[tokio::test]
@@ -2556,6 +2911,140 @@ mod tests {
         // Simulate a crash after mutation_committed but before finalization.
         // Re-drive from persisted step state must produce exactly one
         // enforcement, one report transition, one audit chain, one reporter notice.
-        todo!("implement once full e2e stack is available")
+        let pool = sqlx::PgPool::connect(
+            &std::env::var("BUZZ_TEST_DATABASE_URL")
+                .unwrap_or_else(|_| "postgres://buzz:buzz_dev@localhost:5432/buzz".to_string()),
+        )
+        .await
+        .expect("connect to test DB");
+
+        let community_id = {
+            let id = uuid::Uuid::new_v4();
+            let host = format!("admin-redrive-test-{}.example", id.simple());
+            sqlx::query("INSERT INTO communities (id, host) VALUES ($1, $2)")
+                .bind(id)
+                .bind(host)
+                .execute(&pool)
+                .await
+                .expect("insert community");
+            id
+        };
+        let report_id = {
+            let row = sqlx::query(
+                r#"
+                INSERT INTO moderation_reports (community_id, report_event_id, reporter_pubkey, target_kind, target_pubkey, report_type)
+                VALUES ($1, $2, $3, 'pubkey', $4, 'harassment')
+                RETURNING id
+                "#,
+            )
+            .bind(community_id)
+            .bind(uuid::Uuid::new_v4().as_bytes().as_slice())
+            .bind(vec![0u8; 32])
+            .bind(vec![1u8; 32])
+            .fetch_one(&pool)
+            .await
+            .expect("insert report");
+            row.try_get::<uuid::Uuid, _>("id").expect("id")
+        };
+
+        let actor = vec![2u8; 32];
+        let target = vec![1u8; 32];
+        let cid = buzz_core::CommunityId::from_uuid(community_id);
+
+        let action_id = match buzz_db::relay_admin_actions::claim_report(
+            &pool,
+            cid,
+            report_id,
+            uuid::Uuid::new_v4(),
+            &actor,
+            "operator",
+            "ban",
+            None,
+            None,
+            "resolve:ban",
+            "config",
+            Some(&target),
+            None,
+            None,
+        )
+        .await
+        .expect("claim")
+        {
+            buzz_db::relay_admin_actions::ClaimResult::Claimed(a) => a.id,
+            other => panic!("expected Claimed, got {other:?}"),
+        };
+
+        let _ = buzz_db::relay_admin_actions::begin_enforcing(&pool, action_id)
+            .await
+            .expect("begin_enforcing");
+        let _ = buzz_db::relay_admin_actions::commit_mutation_step(&pool, action_id)
+            .await
+            .expect("commit_mutation_step");
+
+        // Simulate crash-before-finalization: re-load action.
+        let reloaded = buzz_db::relay_admin_actions::get_action(&pool, action_id)
+            .await
+            .expect("get_action")
+            .expect("action exists");
+        assert_eq!(reloaded.step_marker.as_deref(), Some("mutation_committed"));
+        assert_eq!(reloaded.state, "enforcing");
+
+        // Re-drive: finalize from persisted state (step_marker present → skip mutation).
+        let finalized = buzz_db::relay_admin_actions::finalize_success(
+            &pool, action_id, cid, report_id, "resolved", &actor,
+        )
+        .await
+        .expect("finalize_success");
+        assert!(finalized, "re-drive must finalize to succeeded");
+
+        // Second finalize call must be idempotent (CAS fails but action is succeeded).
+        let second_finalize = buzz_db::relay_admin_actions::finalize_success(
+            &pool, action_id, cid, report_id, "resolved", &actor,
+        )
+        .await
+        .expect("second finalize_success");
+        assert!(
+            !second_finalize,
+            "second finalize must return false (already succeeded)"
+        );
+
+        // Report is resolved.
+        let status: Option<String> =
+            sqlx::query_scalar("SELECT status FROM moderation_reports WHERE id = $1")
+                .bind(report_id)
+                .fetch_optional(&pool)
+                .await
+                .expect("fetch report");
+        assert_eq!(status.as_deref(), Some("resolved"));
+
+        // Outbox rows were written in the claim transaction.
+        let outbox_rows = buzz_db::relay_admin_actions::list_pending_outbox(&pool, action_id)
+            .await
+            .expect("list outbox");
+        // After finalization the outbox rows are still pending (worker hasn't run).
+        // They must exist so the worker can deliver them.
+        assert!(
+            !outbox_rows.is_empty() || {
+                // Also check delivered rows (if worker ran).
+                let delivered: i64 = sqlx::query_scalar(
+                    "SELECT COUNT(*) FROM relay_admin_outbox WHERE action_id = $1",
+                )
+                .bind(action_id)
+                .fetch_one(&pool)
+                .await
+                .expect("count outbox");
+                delivered > 0
+            },
+            "outbox must have rows for reporter_notice delivery"
+        );
+
+        // Exactly one audit row.
+        let audit_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM moderation_actions WHERE community_id = $1")
+                .bind(community_id)
+                .fetch_one(&pool)
+                .await
+                .expect("count audit");
+        assert_eq!(audit_count, 1, "exactly one audit row after re-drive");
     }
 }

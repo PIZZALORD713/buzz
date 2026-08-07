@@ -13,11 +13,13 @@
     logs a `WARN` on every startup. The dashboard skips the token prompt.
   - **`BUZZ_ADMIN_AUTH=nip98`:** NIP-98 HTTP Auth. Every request must carry an
     `Authorization: Nostr <base64 event>` header containing a signed kind-27235
-    event. The signer's pubkey must be listed in `BUZZ_ADMIN_PUBKEYS`
-    (comma-separated 64-char hex pubkeys). The dashboard requires a NIP-07
-    browser extension (nos2x or Alby); without one it shows an installation
-    screen. Individual operator access is revocable without rotating a shared
-    secret.
+    event. Authorized principals resolve from `RELAY_OPERATOR_PUBKEYS`
+    (comma-separated 64-char hex pubkeys for config-backed Operators),
+    `RELAY_OWNER_PUBKEY` (implicit Operator fallback when `RELAY_OPERATOR_PUBKEYS`
+    is unset), and the `relay_operators` table (DB-managed Operator/Moderator
+    roster). The dashboard requires a NIP-07 browser extension (nos2x or Alby);
+    without one it shows an installation screen. Individual operator access is
+    revocable without rotating a shared secret.
   - Any unrecognised value for `BUZZ_ADMIN_AUTH` is a startup error
     (typo-proofing). `BUZZ_ADMIN_TOKEN` set alongside `disabled` or `nip98` is
     also a startup error.

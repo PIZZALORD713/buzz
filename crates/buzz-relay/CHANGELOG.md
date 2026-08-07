@@ -9,18 +9,20 @@
     startup fails closed without it. Every request requires
     `Authorization: Bearer <token>`. Unauthenticated requests get a uniform
     `401 WWW-Authenticate: Bearer` before any database or media access.
-  - **NIP-98 mode** (`BUZZ_ADMIN_AUTH=nip98`): set `BUZZ_ADMIN_PUBKEYS` to a
-    comma-separated list of 64-hex Nostr pubkeys. Every request requires
-    `Authorization: Nostr <base64-encoded kind-27235 event>` signed by a key
-    in the allowlist, with a deployment-scoped replay guard. The dashboard signs
-    requests automatically via a NIP-07 browser extension (nos2x, Alby).
+  - **NIP-98 mode** (`BUZZ_ADMIN_AUTH=nip98`): principals resolve from
+    `RELAY_OPERATOR_PUBKEYS` (comma-separated 64-char hex pubkeys; config Operators),
+    `RELAY_OWNER_PUBKEY` (implicit Operator fallback when `RELAY_OPERATOR_PUBKEYS`
+    is unset), and the `relay_operators` table (DB-managed Operator/Moderator
+    roster). Every request requires `Authorization: Nostr <base64-encoded
+    kind-27235 event>` signed by an authorized key, with a deployment-scoped
+    replay guard. The dashboard signs requests automatically via a NIP-07 browser
+    extension (nos2x, Alby).
   - **Disabled mode** (`BUZZ_ADMIN_AUTH=disabled`): no credential required; use
     only when the admin API is already protected at the network layer (VPN,
     firewall, private ingress). The relay logs a `WARN` on every startup.
     Replaces the former `BUZZ_ADMIN_INSECURE_NO_AUTH=true` variable.
   - `BUZZ_ADMIN_AUTH` junk value, `BUZZ_ADMIN_TOKEN` set alongside `nip98` or
-    `disabled`, `BUZZ_ADMIN_PUBKEYS` empty/invalid in `nip98` mode, or
-    neither auth variable set, are all startup errors.
+    `disabled`, or neither auth variable set, are all startup errors.
   `Host`/`Origin` checks are demoted to defense-in-depth in all modes.
 
 ## relay-v0.2.0
