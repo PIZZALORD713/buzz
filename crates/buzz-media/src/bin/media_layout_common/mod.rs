@@ -1,5 +1,6 @@
 use anyhow::{bail, Context, Result};
-use buzz_media::{MediaConfig, MediaMigrationPhase, MediaStorage, S3AddressingStyle};
+use buzz_media::migration::{MigrationObject, RequestPacer};
+use buzz_media::{MediaConfig, MediaError, MediaMigrationPhase, MediaStorage, S3AddressingStyle};
 use clap::Args;
 
 #[derive(Debug, Args)]
@@ -28,6 +29,34 @@ pub struct CommonArgs {
     pub start_after: Option<String>,
     #[arg(long, env = "BUZZ_MEDIA_MIGRATION_PAGE_SIZE", default_value_t = 100)]
     pub page_size: usize,
+}
+
+pub async fn verify_destination(
+    storage: &MediaStorage,
+    pacer: &mut RequestPacer,
+    object: &MigrationObject,
+) -> Result<bool> {
+    pacer.wait().await;
+    let source = storage
+        .get(&object.legacy)
+        .await
+        .with_context(|| format!("read legacy source for verification: {}", object.legacy))?;
+
+    pacer.wait().await;
+    let destination = match storage.get(&object.sharded).await {
+        Ok(bytes) => bytes,
+        Err(MediaError::NotFound) => return Ok(false),
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "read sharded destination for verification: {}",
+                    object.sharded
+                )
+            });
+        }
+    };
+
+    Ok(destination == source)
 }
 
 impl CommonArgs {

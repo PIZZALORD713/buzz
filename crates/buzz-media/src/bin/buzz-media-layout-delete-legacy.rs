@@ -6,7 +6,7 @@ use buzz_media::MediaStorage;
 use clap::Parser;
 
 mod media_layout_common;
-use media_layout_common::CommonArgs;
+use media_layout_common::{verify_destination, CommonArgs};
 
 const CONFIRMATION: &str = "delete-verified-legacy-media";
 
@@ -61,14 +61,14 @@ async fn scan(
                 .context("read media sidecar")?;
             let meta = serde_json::from_slice(&bytes).context("parse media sidecar")?;
             for object in objects_for_sidecar(community, sha, &meta)? {
-                pacer.wait().await;
-                if !storage.head(&object.sharded).await? {
-                    anyhow::bail!(
-                        "refusing deletion: sharded destination missing: {} (checkpoint: {sidecar_key})",
-                        object.sharded
-                    );
-                }
                 if !delete {
+                    pacer.wait().await;
+                    if !storage.head(&object.sharded).await? {
+                        anyhow::bail!(
+                            "refusing deletion: sharded destination missing: {} (checkpoint: {sidecar_key})",
+                            object.sharded
+                        );
+                    }
                     continue;
                 }
                 pacer.wait().await;
@@ -79,6 +79,12 @@ async fn scan(
                 if dry_run {
                     tracing::info!(key = %object.legacy, "would delete verified legacy object");
                 } else {
+                    if !verify_destination(storage, pacer, &object).await? {
+                        anyhow::bail!(
+                            "refusing deletion: sharded destination bytes do not match legacy source: {} (checkpoint: {sidecar_key})",
+                            object.sharded
+                        );
+                    }
                     pacer.wait().await;
                     storage.delete(&object.legacy).await?;
                     changed += 1;
@@ -108,7 +114,7 @@ async fn main() -> Result<()> {
     let mut pacer = RequestPacer::new(args.common.requests_per_second);
     let (_, _, verified_checkpoint) =
         scan(&storage, &args.common, &mut pacer, false, args.dry_run).await?;
-    tracing::info!(checkpoint = ?verified_checkpoint, "all selected sharded destinations verified; beginning deletion pass");
+    tracing::info!(checkpoint = ?verified_checkpoint, "all selected sharded destinations exist; beginning deletion pass");
     let (deleted, skipped, checkpoint) =
         scan(&storage, &args.common, &mut pacer, true, args.dry_run).await?;
     tracing::info!(deleted, skipped, dry_run = args.dry_run, checkpoint = ?checkpoint, "legacy deletion complete");

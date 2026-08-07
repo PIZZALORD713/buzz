@@ -1,14 +1,11 @@
 //! Idempotently copy legacy media payloads into the sharded layout.
 
 use anyhow::{Context, Result};
-use buzz_media::migration::{
-    objects_for_sidecar, parse_sidecar_key, MigrationObject, RequestPacer,
-};
-use buzz_media::MediaStorage;
+use buzz_media::migration::{objects_for_sidecar, parse_sidecar_key, RequestPacer};
 use clap::Parser;
 
 mod media_layout_common;
-use media_layout_common::CommonArgs;
+use media_layout_common::{verify_destination, CommonArgs};
 
 #[derive(Debug, Parser)]
 #[command(name = "buzz-media-layout-backfill")]
@@ -18,34 +15,6 @@ struct Args {
     /// Report actions without copying objects.
     #[arg(long, env = "BUZZ_MEDIA_MIGRATION_DRY_RUN", default_value_t = false)]
     dry_run: bool,
-}
-
-async fn verify_destination(
-    storage: &MediaStorage,
-    pacer: &mut RequestPacer,
-    object: &MigrationObject,
-) -> Result<bool> {
-    pacer.wait().await;
-    let source = storage
-        .get(&object.legacy)
-        .await
-        .with_context(|| format!("read legacy source for verification: {}", object.legacy))?;
-
-    pacer.wait().await;
-    let destination = match storage.get(&object.sharded).await {
-        Ok(bytes) => bytes,
-        Err(buzz_media::MediaError::NotFound) => return Ok(false),
-        Err(error) => {
-            return Err(error).with_context(|| {
-                format!(
-                    "read sharded destination for verification: {}",
-                    object.sharded
-                )
-            });
-        }
-    };
-
-    Ok(destination == source)
 }
 
 #[tokio::main]
