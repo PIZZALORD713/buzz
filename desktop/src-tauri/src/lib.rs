@@ -839,6 +839,11 @@ pub fn run() {
             admin_list_feedback,
             admin_get_feedback,
             admin_fetch_feedback_attachment,
+            admin_resolve_report,
+            admin_patch_feedback,
+            admin_list_operators,
+            admin_put_operator,
+            admin_delete_operator,
             get_admin_origin,
             set_admin_origin,
         ])

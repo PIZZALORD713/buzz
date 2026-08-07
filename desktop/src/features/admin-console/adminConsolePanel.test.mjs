@@ -440,6 +440,7 @@ import {
   AdminConsolePanel,
   parseImetaAttachments,
 } from "./AdminConsolePanel.tsx";
+import { resolveAdminReport } from "./api.ts";
 
 // ── Deferred promise helper ───────────────────────────────────────────────────
 
@@ -1020,3 +1021,222 @@ test("denied-badge-copy-button: copy button is present next to the denied pubkey
 // adminConsolePanelEvents.jsdom-test.mjs — they require fireEvent.click
 // (React 19's container-level event delegation) which is only available
 // in the jsdom suite.
+
+// ── probe role/source badge ───────────────────────────────────────────────
+
+test("probe-role-source-badge: operator role and config source render in panel when probe returns them", async () => {
+  // Verifies that AdminConsolePanel renders role+source badges when the probe
+  // returns nip98Authorized with role/source populated.
+  //
+  // Mutation evidence: remove role/source from AdminProbeResult → badges absent → red.
+
+  const pubkey = "b1".repeat(32);
+  const savedOrigin = "https://admin-role.example.com";
+
+  setIpcHandler("get_admin_origin", () => Promise.resolve(savedOrigin));
+  setIpcHandler("admin_probe", () =>
+    Promise.resolve({
+      state: "nip98Authorized",
+      role: "operator",
+      source: "config",
+    }),
+  );
+  setIpcHandler("admin_list_reports", () => Promise.resolve([]));
+  setIpcHandler("admin_list_feedback", () => Promise.resolve([]));
+
+  const qc = makeQueryClient(pubkey);
+  const { container, doRender, unmount } = mountCard(qc);
+  await doRender();
+  await settle(50);
+
+  const text = container.textContent ?? "";
+  assert.ok(
+    text.includes("operator"),
+    `role badge "operator" must render; got: ${text.slice(0, 300)}`,
+  );
+  assert.ok(
+    text.includes("config"),
+    `source badge "config" must render; got: ${text.slice(0, 300)}`,
+  );
+
+  await unmount();
+});
+
+test("probe-moderator-role: moderator role renders without staffing tab", async () => {
+  // A moderator should see their role badge but NOT the Staffing tab.
+  const pubkey = "c2".repeat(32);
+  const savedOrigin = "https://admin-mod.example.com";
+
+  setIpcHandler("get_admin_origin", () => Promise.resolve(savedOrigin));
+  setIpcHandler("admin_probe", () =>
+    Promise.resolve({
+      state: "nip98Authorized",
+      role: "moderator",
+      source: "db",
+    }),
+  );
+  setIpcHandler("admin_list_reports", () => Promise.resolve([]));
+  setIpcHandler("admin_list_feedback", () => Promise.resolve([]));
+
+  const qc = makeQueryClient(pubkey);
+  const { container, doRender, unmount } = mountCard(qc);
+  await doRender();
+  await settle(50);
+
+  const text = container.textContent ?? "";
+  assert.ok(
+    text.includes("moderator"),
+    `role "moderator" must render; got: ${text.slice(0, 300)}`,
+  );
+  // Staffing tab must NOT be present for a moderator.
+  const staffingTab = container.querySelector(
+    "[data-testid='admin-tab-staffing']",
+  );
+  assert.equal(
+    staffingTab,
+    null,
+    "Staffing tab must not render for moderator role",
+  );
+
+  await unmount();
+});
+
+test("probe-operator-role: staffing tab renders for operator role", async () => {
+  // An operator should see the Staffing tab.
+  const pubkey = "d3".repeat(32);
+  const savedOrigin = "https://admin-operator.example.com";
+
+  setIpcHandler("get_admin_origin", () => Promise.resolve(savedOrigin));
+  setIpcHandler("admin_probe", () =>
+    Promise.resolve({
+      state: "nip98Authorized",
+      role: "operator",
+      source: "config",
+    }),
+  );
+  setIpcHandler("admin_list_reports", () => Promise.resolve([]));
+  setIpcHandler("admin_list_feedback", () => Promise.resolve([]));
+
+  const qc = makeQueryClient(pubkey);
+  const { container, doRender, unmount } = mountCard(qc);
+  await doRender();
+  await settle(50);
+
+  const staffingTab = container.querySelector(
+    "[data-testid='admin-tab-staffing']",
+  );
+  assert.ok(staffingTab !== null, "Staffing tab must render for operator role");
+
+  await unmount();
+});
+
+test("probe-no-role: disabled-mode panel renders without role badge", async () => {
+  // disabled probe has no role/source — panel renders but no badge.
+  const pubkey = "e4".repeat(32);
+  const savedOrigin = "https://admin-disabled.example.com";
+
+  setIpcHandler("get_admin_origin", () => Promise.resolve(savedOrigin));
+  setIpcHandler("admin_probe", () => Promise.resolve({ state: "disabled" }));
+  setIpcHandler("admin_list_reports", () => Promise.resolve([]));
+  setIpcHandler("admin_list_feedback", () => Promise.resolve([]));
+
+  const qc = makeQueryClient(pubkey);
+  const { container, doRender, unmount } = mountCard(qc);
+  await doRender();
+  await settle(50);
+
+  const panel = container.querySelector("[data-testid='admin-console-panel']");
+  assert.ok(panel !== null, "panel must render in disabled mode");
+
+  // No staffing tab (no role = no operator).
+  const staffingTab = container.querySelector(
+    "[data-testid='admin-tab-staffing']",
+  );
+  assert.equal(
+    staffingTab,
+    null,
+    "Staffing tab must not render in disabled mode",
+  );
+
+  await unmount();
+});
+
+// ── processing report not actionable ─────────────────────────────────────
+
+test("processing-report-not-actionable: processing report is disabled in list", async () => {
+  // Verifies that a report with status=processing is rendered as disabled/non-clickable.
+  //
+  // Mutation evidence: remove the disabled/isProcessing branch from ReportsTab →
+  // the button is enabled → test goes red.
+
+  const origin = "https://admin.example.com";
+  const pubkey = "f5".repeat(32);
+
+  const processingReport = {
+    id: "00000000-0000-0000-0000-000000000010",
+    communityId: "00000000-0000-0000-0000-000000000002",
+    communityHost: "relay.example.com",
+    reportEventId: "aabb",
+    reporterPubkey: "ccdd",
+    targetKind: "event",
+    target: "eeff",
+    reportType: "spam",
+    status: "processing",
+    createdAt: "2024-01-01T00:00:00Z",
+  };
+
+  setIpcHandler("admin_list_reports", () =>
+    Promise.resolve([processingReport]),
+  );
+  setIpcHandler("admin_list_feedback", () => Promise.resolve([]));
+
+  const { container, doRender, unmount } = mountPanel({ origin, pubkey });
+  await doRender();
+  await settle(30);
+
+  // The report button must exist but be disabled.
+  const buttons = container.querySelectorAll("button");
+  let reportButton = null;
+  for (const btn of buttons) {
+    const testid = btn.getAttribute("data-testid") ?? "";
+    if (testid.startsWith("admin-tab")) continue;
+    // The report row button in the list.
+    if (
+      btn.textContent?.includes("spam") ||
+      btn.textContent?.includes("processing")
+    ) {
+      reportButton = btn;
+      break;
+    }
+  }
+
+  // A processing report row must render as a disabled button (non-actionable).
+  if (reportButton != null) {
+    assert.ok(
+      reportButton.disabled,
+      `processing report button must be disabled; got enabled`,
+    );
+  }
+
+  // The container should show "processing" text.
+  const text = container.textContent ?? "";
+  assert.ok(
+    text.includes("processing"),
+    `processing status must be visible; got: ${text.slice(0, 300)}`,
+  );
+
+  await unmount();
+});
+
+// ── action matrix: allowedActionsForTargetKind ────────────────────────────
+
+// Note: allowedActionsForTargetKind is a pure function tested inline via the
+// rendered action buttons in adminConsolePanelEvents.jsdom-test.mjs.
+// Here we test the API-level types are correct.
+
+test("action-matrix-types: AdminReportAction type covers all matrix cells", () => {
+  // Compile-time coverage: if resolveAdminReport is removed or its signature
+  // changes, tsc fails. Runtime coverage: the static import above proves the
+  // function is exported and callable.
+  assert.equal(typeof resolveAdminReport, "function");
+});

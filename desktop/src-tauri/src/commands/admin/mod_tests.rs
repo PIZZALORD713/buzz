@@ -728,7 +728,7 @@ async fn probe_inner_nip98_challenge_then_json_200_is_authorized_and_asserts_aut
         .unwrap();
 
     assert!(
-        matches!(result, AdminProbeResult::Nip98Authorized),
+        matches!(result, AdminProbeResult::Nip98Authorized { .. }),
         "expected Nip98Authorized, got {result:?}"
     );
 

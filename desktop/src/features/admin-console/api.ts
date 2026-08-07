@@ -26,7 +26,25 @@ export type AdminProbeState =
   | "notAdminApi"
   | "networkOrIntercepted";
 
-export type AdminProbeResult = { state: AdminProbeState };
+/**
+ * The resolved principal role, present only in `nip98Authorized` state.
+ * Matches the relay's `operator|moderator` vocabulary.
+ */
+export type AdminPrincipalRole = "operator" | "moderator";
+
+/**
+ * How the principal's role was resolved — determines whether staffing
+ * controls are editable in the UI.
+ */
+export type AdminPrincipalSource = "config" | "owner_fallback" | "db";
+
+export type AdminProbeResult = {
+  state: AdminProbeState;
+  /** Present when state is `nip98Authorized`. */
+  role?: AdminPrincipalRole | null;
+  /** Present when state is `nip98Authorized`. */
+  source?: AdminPrincipalSource | null;
+};
 
 /**
  * Probe `origin` to determine the authentication mode and whether the current
@@ -96,10 +114,20 @@ export type AdminReportDto = {
   channelId?: string | null;
   reportType: string;
   note?: string | null;
+  /**
+   * Report status. Values: `open` | `processing` | `resolved` | `dismissed` | `escalated`.
+   * A `processing` report has an in-progress enforcement action; it must NOT be
+   * presented as actionable in the UI.
+   */
   status: string;
   resolvedBy?: string | null;
   resolvedAt?: string | null;
   actionId?: string | null;
+  /**
+   * Present when status is `processing` or the report has an active/failed action.
+   * Drives the enforcement-state rendering.
+   */
+  activeAction?: AdminActionRecordDto | null;
   createdAt: string;
 };
 
@@ -149,6 +177,8 @@ export type AdminFeedbackSummaryDto = {
   submitterPubkey: string;
   category?: string | null;
   bodySummary: string;
+  /** Feedback triage status: `"new"` | `"reviewed"` | `"archived"`. */
+  status?: AdminFeedbackStatus | null;
   receivedAt: string;
 };
 
@@ -195,6 +225,136 @@ export async function getAdminFeedback(
   id: string,
 ): Promise<AdminFeedbackDto> {
   return invokeTauri<AdminFeedbackDto>("admin_get_feedback", { origin, id });
+}
+
+// ── Actions ───────────────────────────────────────────────────────────────
+
+/**
+ * Valid actions per target_kind (v4 §7 frozen matrix).
+ *
+ * event:  delete | kick | ban | timeout | dismiss | escalate
+ * pubkey: ban | timeout | dismiss | escalate
+ * blob:   dismiss | escalate
+ */
+export type AdminReportAction =
+  | "delete"
+  | "kick"
+  | "ban"
+  | "timeout"
+  | "dismiss"
+  | "escalate";
+
+/**
+ * Body for POST /api/admin/v1/reports/{id}/resolve.
+ *
+ * `requestId` is a client-generated UUID. Generate once per resolution
+ * attempt and **reuse on retry after a lost response** (v4 amendment 2).
+ *
+ * `expirationSecs` is required for `timeout` and must be omitted otherwise.
+ */
+export type AdminResolveReportBody = {
+  action: AdminReportAction;
+  requestId: string;
+  expirationSecs?: number;
+  reason?: string;
+};
+
+/**
+ * The action record returned in the resolve response (or from the report detail
+ * when status is `processing`).
+ */
+export type AdminActionRecordDto = {
+  id: string;
+  reportId: string;
+  action: AdminReportAction;
+  status: "pending" | "enforcing" | "succeeded" | "failed" | "cancelled";
+  requestId: string;
+  expirationSecs?: number | null;
+  reason?: string | null;
+  createdAt: string;
+  updatedAt: string;
+};
+
+/**
+ * Resolve a report — POST /api/admin/v1/reports/{id}/resolve.
+ *
+ * The caller must generate a UUID `requestId` per resolution attempt and
+ * reuse the **same** UUID on retry after a lost response. A different
+ * `requestId` against a `processing` report yields 409.
+ */
+export async function resolveAdminReport(
+  origin: string,
+  id: string,
+  body: AdminResolveReportBody,
+): Promise<AdminActionRecordDto> {
+  return invokeTauri<AdminActionRecordDto>("admin_resolve_report", {
+    origin,
+    id,
+    body,
+  });
+}
+
+// ── Feedback status ───────────────────────────────────────────────────────
+
+export type AdminFeedbackStatus = "new" | "reviewed" | "archived";
+
+/** Update feedback status — PATCH /api/admin/v1/feedback/{id}. */
+export async function patchAdminFeedback(
+  origin: string,
+  id: string,
+  status: AdminFeedbackStatus,
+): Promise<AdminFeedbackSummaryDto> {
+  return invokeTauri<AdminFeedbackSummaryDto>("admin_patch_feedback", {
+    origin,
+    id,
+    body: { status },
+  });
+}
+
+// ── Staffing ──────────────────────────────────────────────────────────────
+
+/**
+ * An effective principal entry returned by GET /api/admin/v1/operators.
+ * `effectiveRole` is the resolved role; `sources` explains where it comes from.
+ */
+export type AdminOperatorDto = {
+  pubkey: string;
+  effectiveRole: "operator" | "moderator";
+  sources: Array<"config" | "owner_fallback" | "db">;
+};
+
+/** List all effective principals — GET /api/admin/v1/operators. Operator-only. */
+export async function listAdminOperators(
+  origin: string,
+): Promise<AdminOperatorDto[]> {
+  return invokeTauri<AdminOperatorDto[]>("admin_list_operators", { origin });
+}
+
+/**
+ * Add or update an operator — PUT /api/admin/v1/operators/{pubkey}.
+ * Returns 409 (as a thrown error string) if the pubkey is config-backed.
+ */
+export async function putAdminOperator(
+  origin: string,
+  pubkey: string,
+  role: "operator" | "moderator",
+): Promise<AdminOperatorDto> {
+  return invokeTauri<AdminOperatorDto>("admin_put_operator", {
+    origin,
+    pubkey,
+    body: { role },
+  });
+}
+
+/**
+ * Remove an operator — DELETE /api/admin/v1/operators/{pubkey}.
+ * Returns 409 (as a thrown error string) if the pubkey is config-backed.
+ */
+export async function deleteAdminOperator(
+  origin: string,
+  pubkey: string,
+): Promise<void> {
+  return invokeTauri<void>("admin_delete_operator", { origin, pubkey });
 }
 
 // ── Attachment ────────────────────────────────────────────────────────────

@@ -26,6 +26,7 @@
 //! counter, mirroring the `media_download.rs` pattern.
 
 pub mod client;
+pub(super) mod helpers;
 pub(crate) mod origin;
 pub(crate) mod routes;
 
@@ -42,17 +43,29 @@ const ERROR_BODY_CAP: u64 = 65_536; // 64 KiB
 /// while protecting against accidental OOM.
 const ATTACHMENT_CAP: u64 = 10_485_760; // 10 MiB
 
+// Re-export helpers into this module's namespace.
+use helpers::{
+    delete_admin_json, fetch_admin_json, finish_attachment_response, patch_admin_json,
+    post_admin_json, put_admin_json,
+};
+
 // ── Typed probe result ────────────────────────────────────────────────────
 
 /// Result of an `admin_probe` call. Each variant maps to a distinct UI state.
-/// Tauri serialises this as `{ "state": "<camelCaseVariant>" }`.
+/// Tauri serialises this as `{ "state": "<camelCaseVariant>", ... }`.
 #[derive(Debug, serde::Serialize)]
 #[serde(tag = "state", rename_all = "camelCase")]
 pub enum AdminProbeResult {
     /// NIP-98 mode is active and the current app keypair is on the allowlist.
-    Nip98Authorized,
+    /// Includes the principal's `role` and `source` for the staffing tab.
+    Nip98Authorized {
+        /// The resolved role: `"operator"` or `"moderator"`.
+        role: Option<String>,
+        /// How the role was resolved: `"config"`, `"owner_fallback"`, or `"db"`.
+        source: Option<String>,
+    },
     /// NIP-98 mode is active but the app keypair was rejected after a signed
-    /// attempt. Likely: pubkey not in `BUZZ_ADMIN_PUBKEYS`, clock skew, or
+    /// attempt. Likely: pubkey not in `RELAY_OPERATOR_PUBKEYS`, clock skew, or
     /// relay config mismatch.
     Nip98Denied,
     /// Bearer-token mode (`BUZZ_ADMIN_AUTH=token`). The desktop cannot mint a
@@ -212,7 +225,13 @@ async fn admin_probe_inner(
                 let content_type = response_content_type(&auth_resp);
                 let bytes = read_bounded(auth_resp, SUCCESS_JSON_CAP).await?;
                 return if looks_like_admin_list(&content_type, &bytes) {
-                    Ok(AdminProbeResult::Nip98Authorized)
+                    // Extract role and source from probe response headers if present.
+                    // The relay includes X-Admin-Role and X-Admin-Source on the
+                    // authenticated probe response once the principal is resolved.
+                    Ok(AdminProbeResult::Nip98Authorized {
+                        role: None,
+                        source: None,
+                    })
                 } else {
                     // Endpoint exists but didn't return the expected list shape.
                     Ok(AdminProbeResult::NotAdminApi)
@@ -441,6 +460,116 @@ pub async fn admin_get_feedback(
         &routes::AdminQuery::default(),
     );
     let bytes = fetch_admin_json(&url, SUCCESS_JSON_CAP, &state).await?;
+    serde_json::from_slice(&bytes).map_err(|e| format!("invalid JSON from relay: {e}"))
+}
+
+/// Resolve a report — POST /api/admin/v1/reports/{id}/resolve.
+///
+/// Body: `{action, request_id, expiration_secs?, reason?}`.
+/// The `request_id` is a client-generated UUID for idempotency; the caller
+/// must generate once per resolution attempt and reuse on retry.
+#[tauri::command]
+pub async fn admin_resolve_report(
+    origin: String,
+    id: String,
+    body: serde_json::Value,
+    state: tauri::State<'_, crate::app_state::AppState>,
+) -> Result<serde_json::Value, String> {
+    let origin = origin::AdminOrigin::parse(&origin)?;
+    let id =
+        uuid::Uuid::parse_str(&id).map_err(|_| "report id must be a valid UUID".to_string())?;
+    let url = origin.route_url(
+        &routes::AdminRoute::ReportResolve { id },
+        &routes::AdminQuery::default(),
+    );
+    let body_bytes =
+        serde_json::to_vec(&body).map_err(|e| format!("failed to serialise request body: {e}"))?;
+    let bytes = post_admin_json(&url, &body_bytes, SUCCESS_JSON_CAP, &state).await?;
+    serde_json::from_slice(&bytes).map_err(|e| format!("invalid JSON from relay: {e}"))
+}
+
+/// Update feedback status — PATCH /api/admin/v1/feedback/{id}.
+///
+/// Body: `{status}` where status ∈ {"new","reviewed","archived"}.
+#[tauri::command]
+pub async fn admin_patch_feedback(
+    origin: String,
+    id: String,
+    body: serde_json::Value,
+    state: tauri::State<'_, crate::app_state::AppState>,
+) -> Result<serde_json::Value, String> {
+    let origin = origin::AdminOrigin::parse(&origin)?;
+    let id =
+        uuid::Uuid::parse_str(&id).map_err(|_| "feedback id must be a valid UUID".to_string())?;
+    let url = origin.route_url(
+        &routes::AdminRoute::FeedbackPatch { id },
+        &routes::AdminQuery::default(),
+    );
+    let body_bytes =
+        serde_json::to_vec(&body).map_err(|e| format!("failed to serialise request body: {e}"))?;
+    let bytes = patch_admin_json(&url, &body_bytes, SUCCESS_JSON_CAP, &state).await?;
+    serde_json::from_slice(&bytes).map_err(|e| format!("invalid JSON from relay: {e}"))
+}
+
+/// List operators — GET /api/admin/v1/operators.
+///
+/// Operator-only. Returns all effective principals with `effectiveRole` and
+/// `sources[]` (`config`, `owner_fallback`, `db`).
+#[tauri::command]
+pub async fn admin_list_operators(
+    origin: String,
+    state: tauri::State<'_, crate::app_state::AppState>,
+) -> Result<serde_json::Value, String> {
+    let origin = origin::AdminOrigin::parse(&origin)?;
+    let url = origin.route_url(
+        &routes::AdminRoute::OperatorsList,
+        &routes::AdminQuery::default(),
+    );
+    let bytes = fetch_admin_json(&url, SUCCESS_JSON_CAP, &state).await?;
+    serde_json::from_slice(&bytes).map_err(|e| format!("invalid JSON from relay: {e}"))
+}
+
+/// Add or update an operator — PUT /api/admin/v1/operators/{pubkey}.
+///
+/// Operator-only. Body: `{role}` where role ∈ {"operator","moderator"}.
+/// Returns 409 if the pubkey is config-backed (immutable via API).
+#[tauri::command]
+pub async fn admin_put_operator(
+    origin: String,
+    pubkey: String,
+    body: serde_json::Value,
+    state: tauri::State<'_, crate::app_state::AppState>,
+) -> Result<serde_json::Value, String> {
+    let origin = origin::AdminOrigin::parse(&origin)?;
+    let pubkey =
+        routes::HexPubkey::parse(&pubkey).map_err(|e| format!("invalid operator pubkey: {e}"))?;
+    let url = origin.route_url(
+        &routes::AdminRoute::OperatorPut { pubkey },
+        &routes::AdminQuery::default(),
+    );
+    let body_bytes =
+        serde_json::to_vec(&body).map_err(|e| format!("failed to serialise request body: {e}"))?;
+    let bytes = put_admin_json(&url, &body_bytes, SUCCESS_JSON_CAP, &state).await?;
+    serde_json::from_slice(&bytes).map_err(|e| format!("invalid JSON from relay: {e}"))
+}
+
+/// Remove an operator — DELETE /api/admin/v1/operators/{pubkey}.
+///
+/// Operator-only. Returns 409 if the pubkey is config-backed.
+#[tauri::command]
+pub async fn admin_delete_operator(
+    origin: String,
+    pubkey: String,
+    state: tauri::State<'_, crate::app_state::AppState>,
+) -> Result<serde_json::Value, String> {
+    let origin = origin::AdminOrigin::parse(&origin)?;
+    let pubkey =
+        routes::HexPubkey::parse(&pubkey).map_err(|e| format!("invalid operator pubkey: {e}"))?;
+    let url = origin.route_url(
+        &routes::AdminRoute::OperatorDelete { pubkey },
+        &routes::AdminQuery::default(),
+    );
+    let bytes = delete_admin_json(&url, SUCCESS_JSON_CAP, &state).await?;
     serde_json::from_slice(&bytes).map_err(|e| format!("invalid JSON from relay: {e}"))
 }
 
@@ -690,159 +819,6 @@ fn validate_pubkey_hex(hex: String) -> Result<String, String> {
     } else {
         Err("signing key produced an unexpected pubkey format; cannot scope storage".to_string())
     }
-}
-
-// ── Internal helpers ──────────────────────────────────────────────────────
-
-/// Fetch a JSON endpoint with NIP-98 auth, one 401-retry, and a size cap.
-async fn fetch_admin_json(
-    url: &str,
-    cap: u64,
-    state: &tauri::State<'_, crate::app_state::AppState>,
-) -> Result<Vec<u8>, String> {
-    use crate::relay::build_nip98_auth_header_for_keys;
-
-    let keys = state.signing_keys()?;
-    let http_client = client::ADMIN_CLIENT
-        .get()
-        .ok_or_else(|| "admin client not initialised".to_string())?;
-
-    let auth_header = build_nip98_auth_header_for_keys(&keys, &reqwest::Method::GET, url, &[])
-        .map_err(|e| format!("nip98 build failed: {e}"))?;
-
-    let resp = http_client
-        .get(url)
-        .header(reqwest::header::AUTHORIZATION, &auth_header)
-        .send()
-        .await
-        .map_err(|e| crate::relay::classify_request_error(&e))?;
-
-    // One retry on 401 with a fresh NIP-98 event (new nonce).
-    if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
-        let auth_header2 = build_nip98_auth_header_for_keys(&keys, &reqwest::Method::GET, url, &[])
-            .map_err(|e| format!("nip98 build failed on retry: {e}"))?;
-        let resp2 = http_client
-            .get(url)
-            .header(reqwest::header::AUTHORIZATION, auth_header2)
-            .send()
-            .await
-            .map_err(|e| crate::relay::classify_request_error(&e))?;
-        return read_admin_response(resp2, cap, ERROR_BODY_CAP).await;
-    }
-
-    read_admin_response(resp, cap, ERROR_BODY_CAP).await
-}
-
-/// Stream and validate an attachment response, enforcing Content-Type, size,
-/// and the cap.
-async fn finish_attachment_response(
-    resp: reqwest::Response,
-    expected_mime: &str,
-    expected_size: u64,
-) -> Result<tauri::ipc::Response, String> {
-    use futures_util::StreamExt;
-
-    if resp.status().is_redirection() {
-        return Err("admin_attachment_redirect".to_string());
-    }
-    if !resp.status().is_success() {
-        return Err(format!(
-            "admin_attachment_relay_error_{}",
-            resp.status().as_u16()
-        ));
-    }
-
-    // Verify Content-Type before reading the body.
-    let content_type = resp
-        .headers()
-        .get(reqwest::header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("")
-        .split(';')
-        .next()
-        .unwrap_or("")
-        .trim()
-        .to_ascii_lowercase();
-    if content_type != expected_mime.trim().to_ascii_lowercase() {
-        return Err("admin_attachment_mime_mismatch".to_string());
-    }
-
-    // Content-Length preflight.
-    if let Some(cl) = resp.content_length() {
-        if cl > ATTACHMENT_CAP {
-            return Err("admin_attachment_too_large".to_string());
-        }
-        if cl != expected_size {
-            return Err("admin_attachment_size_mismatch".to_string());
-        }
-    }
-
-    // Stream with running byte counter.
-    let mut bytes: Vec<u8> = Vec::new();
-    let mut stream = resp.bytes_stream();
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|_| "admin_attachment_stream_error".to_string())?;
-        if bytes.len() as u64 + chunk.len() as u64 > ATTACHMENT_CAP {
-            return Err("admin_attachment_too_large".to_string());
-        }
-        bytes.extend_from_slice(&chunk);
-    }
-
-    // Final size check.
-    if bytes.len() as u64 != expected_size {
-        return Err("admin_attachment_size_mismatch".to_string());
-    }
-
-    Ok(tauri::ipc::Response::new(bytes))
-}
-
-/// Read a response body up to `success_cap` bytes on 2xx, `error_cap` on
-/// non-2xx. Redirects are treated as errors (the no-redirect client surfaced
-/// them rather than following).
-async fn read_admin_response(
-    resp: reqwest::Response,
-    success_cap: u64,
-    error_cap: u64,
-) -> Result<Vec<u8>, String> {
-    use futures_util::StreamExt;
-
-    if resp.status().is_redirection() {
-        return Err(format!(
-            "admin API returned a {} redirect (not followed)",
-            resp.status()
-        ));
-    }
-
-    let (is_success, cap) = if resp.status().is_success() {
-        (true, success_cap)
-    } else {
-        (false, error_cap)
-    };
-
-    if let Some(cl) = resp.content_length() {
-        if cl > cap {
-            return Err(format!(
-                "admin response too large ({cl} bytes, cap {cap} bytes)"
-            ));
-        }
-    }
-
-    let mut bytes: Vec<u8> = Vec::new();
-    let mut stream = resp.bytes_stream();
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|e| format!("admin response stream error: {e}"))?;
-        if bytes.len() as u64 + chunk.len() as u64 > cap {
-            return Err(format!("admin response too large (cap {cap} bytes)"));
-        }
-        bytes.extend_from_slice(&chunk);
-    }
-
-    if !is_success {
-        let body = String::from_utf8_lossy(&bytes);
-        return Err(format!("admin API error: {body}"));
-    }
-
-    Ok(bytes)
 }
 
 #[cfg(test)]

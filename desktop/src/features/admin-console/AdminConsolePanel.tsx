@@ -2,8 +2,9 @@
  * Main admin console panel — renders when probe state is `nip98Authorized` or
  * `disabled`.
  *
- * Shows two tabs: Reports (deployment-wide moderation reports) and Feedback
- * (product feedback with optional image attachments).
+ * Shows three tabs: Reports (deployment-wide moderation reports), Feedback
+ * (product feedback with optional image attachments), and Staffing (Operator-
+ * only operator management).
  *
  * All query/UI state is keyed by `(pubkey, origin)`. In-flight native requests
  * are fenced by an effect-local `active` flag that is set to `false` in the
@@ -12,196 +13,414 @@
  * Tauri invoke is not cancellable at the native layer, but the active-flag
  * pattern ensures stale results never update visible state or create
  * unreachable blob URLs.
+ *
+ * Sub-components live in adjacent files:
+ *   - AdminConsolePanelHelpers.tsx  — AsyncState, useAsyncLoad, formatTimestamp,
+ *                                     DetailRow, LoadingSpinner, ErrorMessage,
+ *                                     AttachmentMeta, parseImetaAttachments
+ *   - AdminConsoleFeedbackTab.tsx   — FeedbackTab, FeedbackDetail
+ *   - AdminConsoleStaffingTab.tsx   — StaffingTab
  */
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
-  AlertCircle,
   ChevronLeft,
-  Download,
   LoaderCircle,
   MessageSquare,
+  Shield,
   ShieldAlert,
+  Users,
 } from "lucide-react";
 import { Button } from "@/shared/ui/button";
 import { Badge } from "@/shared/ui/badge";
 import { cn } from "@/shared/lib/cn";
 import {
-  fetchAdminAttachmentBlobUrl,
-  getAdminFeedback,
   getAdminReport,
-  listAdminFeedback,
   listAdminReports,
-  type AdminAttachmentErrorCode,
-  type AdminFeedbackDto,
-  type AdminFeedbackSummaryDto,
+  resolveAdminReport,
+  type AdminPrincipalRole,
+  type AdminPrincipalSource,
+  type AdminReportAction,
   type AdminReportDetailDto,
   type AdminReportDto,
 } from "./api";
-import { formatRelativeTime } from "../forum/lib/time";
+import {
+  DetailRow,
+  ErrorMessage,
+  LoadingSpinner,
+  formatTimestamp,
+  useAsyncLoad,
+} from "./AdminConsolePanelHelpers";
+import { FeedbackTab } from "./AdminConsoleFeedbackTab";
+import { StaffingTab } from "./AdminConsoleStaffingTab";
 
-// ── Generic async state ───────────────────────────────────────────────────
+export {
+  parseImetaAttachments,
+  type AttachmentMeta,
+} from "./AdminConsolePanelHelpers";
 
-type AsyncState<T> =
-  | { status: "idle" }
-  | { status: "loading" }
-  | { status: "ok"; data: T }
-  | { status: "error"; message: string };
-
-/**
- * Async load hook with effect-local active-flag cancellation.
- *
- * Each effect invocation sets `active = true` and flips it to `false` in the
- * cleanup function. Completions check `active` before calling setState, so a
- * result that arrives after the deps changed (or the component unmounted) is
- * silently discarded.
- *
- * `load` is stored in a ref so it is not a dependency of the effect — callers
- * create it inline and `deps` + `generation` are the explicit trigger list.
- */
-function useAsyncLoad<T>(
-  load: () => Promise<T>,
-  deps: unknown[],
-  generation: number,
-): AsyncState<T> {
-  const [state, setState] = useState<AsyncState<T>>({ status: "idle" });
-  const loadRef = useRef(load);
-  loadRef.current = load;
-
-  // biome-ignore lint/correctness/useExhaustiveDependencies: loadRef is a stable ref; deps and generation are the intentional trigger set
-  useEffect(() => {
-    let active = true;
-    setState({ status: "loading" });
-    loadRef.current().then(
-      (data) => {
-        if (!active) return;
-        setState({ status: "ok", data });
-      },
-      (e: unknown) => {
-        if (!active) return;
-        setState({
-          status: "error",
-          message: e instanceof Error ? e.message : String(e),
-        });
-      },
-    );
-    return () => {
-      active = false;
-    };
-  }, [...deps, generation]);
-
-  return state;
-}
-
-// ── Structured detail helpers ────────────────────────────────────────────
-
-/** One label/value row in a detail view. Null/empty values render as "—". */
-function DetailRow({
-  label,
-  value,
-  mono = false,
-}: {
-  label: string;
-  value: string | null | undefined;
-  mono?: boolean;
-}) {
-  const display = value != null && value !== "" ? value : "—";
-  return (
-    <div className="grid grid-cols-[9rem_1fr] gap-x-3 gap-y-0.5 text-xs">
-      <span className="font-medium text-muted-foreground">{label}</span>
-      <span className={cn("break-all", mono && "font-mono")}>{display}</span>
-    </div>
-  );
-}
-
-function formatTimestamp(raw: string | null | undefined): string {
-  if (raw == null || raw === "") return "—";
-  // DTO timestamps are ISO-8601 strings (DateTime<Utc> via serde).
-  // Parse to a Date, convert to unix seconds, then format relatively.
-  const date = new Date(raw);
-  if (Number.isNaN(date.getTime())) return raw;
-  const absolute = date.toLocaleString(undefined, {
-    month: "short",
-    day: "numeric",
-    year: "numeric",
-    hour: "numeric",
-    minute: "2-digit",
-  });
-  const rel = formatRelativeTime(Math.floor(date.getTime() / 1000));
-  // Render relative label with the absolute value inline in parentheses.
-  return `${rel} (${absolute})`;
-}
+// ── Status variant helper ─────────────────────────────────────────────────
 
 function statusVariant(
   status: string,
-): "success" | "warning" | "secondary" | "outline" {
-  switch (status.toLowerCase()) {
+): "default" | "secondary" | "destructive" | "outline" {
+  switch (status) {
     case "open":
-      return "warning";
+      return "default";
     case "resolved":
+      return "secondary";
     case "dismissed":
-      return "success";
+      return "outline";
+    case "escalated":
+      return "secondary";
+    case "processing":
+      return "secondary";
+    case "pending":
+      return "secondary";
+    case "enforcing":
+      return "secondary";
+    case "succeeded":
+      return "secondary";
+    case "failed":
+      return "destructive";
+    case "cancelled":
+      return "outline";
+    default:
+      return "outline";
+  }
+}
+
+// ── Action matrix helpers ─────────────────────────────────────────────────
+
+/**
+ * Return the allowed actions for a given target kind per the v4 frozen matrix.
+ * event:  delete | kick | ban | timeout | dismiss | escalate
+ * pubkey: ban | timeout | dismiss | escalate
+ * blob:   dismiss | escalate
+ */
+function allowedActionsForTargetKind(targetKind: string): AdminReportAction[] {
+  switch (targetKind.toLowerCase()) {
+    case "event":
+      return ["delete", "kick", "ban", "timeout", "dismiss", "escalate"];
+    case "pubkey":
+      return ["ban", "timeout", "dismiss", "escalate"];
+    case "blob":
+      return ["dismiss", "escalate"];
+    default:
+      return ["dismiss", "escalate"];
+  }
+}
+
+/** Label for each action. */
+function actionLabel(action: AdminReportAction): string {
+  switch (action) {
+    case "delete":
+      return "Delete";
+    case "kick":
+      return "Kick";
+    case "ban":
+      return "Ban";
+    case "timeout":
+      return "Timeout";
+    case "dismiss":
+      return "Dismiss";
+    case "escalate":
+      return "Escalate";
+  }
+}
+
+/** Variant for each action button. */
+function actionVariant(
+  action: AdminReportAction,
+): "destructive" | "outline" | "secondary" {
+  switch (action) {
+    case "delete":
+    case "ban":
+      return "destructive";
+    case "kick":
+    case "timeout":
+      return "outline";
     default:
       return "secondary";
   }
 }
 
-// ── imeta attachment parsing ──────────────────────────────────────────────
+// ── Enforcement state block ───────────────────────────────────────────────
 
 /**
- * Validated attachment metadata parsed from a feedback detail's `tags` field.
- * The relay serialises `AdminFeedback` with `serde(rename_all = "camelCase")`,
- * so the wire shape is `{ ..., tags: string[][] }`.
+ * Inline enforcement-state block shown on `processing` reports and after a
+ * failed enforcement action. Shows the action record's state and offers
+ * retry/cancel where appropriate.
+ *
+ * Cancel is only offered when the server permits it (pre-mutation failures).
+ * A rejected cancel is treated as authoritative — the server knows whether
+ * the mutation has landed.
  */
-type AttachmentMeta = {
-  /** Lowercase 64-hex SHA-256 as stored/returned by the relay. */
-  sha256: string;
-  /** MIME type from the `m` imeta field. */
-  mime: string;
-  /** Byte size from the `size` imeta field. */
-  size: number;
-};
+function EnforcementStateBlock({
+  activeAction,
+  origin,
+  reportId,
+  onActionComplete,
+}: {
+  activeAction: NonNullable<AdminReportDto["activeAction"]>;
+  origin: string;
+  reportId: string;
+  onActionComplete: () => void;
+}) {
+  const [error, setError] = useState<string | null>(null);
+  const [isWorking, setIsWorking] = useState(false);
+
+  const actionStatus = activeAction.status;
+
+  // User-facing copy for each action state.
+  const stateLabel: Record<string, string> = {
+    pending: "Enforcement pending…",
+    enforcing: "Enforcing…",
+    succeeded: "Enforcement succeeded",
+    failed: "Enforcement failed",
+    cancelled: "Enforcement cancelled",
+  };
+
+  const handleRetry = async () => {
+    setError(null);
+    setIsWorking(true);
+    try {
+      // Retry reuses the same requestId so the server returns the existing
+      // action record rather than creating a new claim.
+      await resolveAdminReport(origin, reportId, {
+        action: activeAction.action,
+        requestId: activeAction.requestId,
+        expirationSecs: activeAction.expirationSecs ?? undefined,
+        reason: activeAction.reason ?? undefined,
+      });
+      onActionComplete();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setIsWorking(false);
+    }
+  };
+
+  const handleCancel = async () => {
+    setError(null);
+    setIsWorking(true);
+    try {
+      // Cancel via the same resolve endpoint with action="dismiss".
+      // The server rejects cancel if mutation has already landed.
+      await resolveAdminReport(origin, reportId, {
+        action: "dismiss",
+        requestId: crypto.randomUUID(),
+        reason: "cancelled",
+      });
+      onActionComplete();
+    } catch (e) {
+      // A rejected cancel is authoritative — the enforcement may have landed.
+      // Surface the error but do not retry.
+      setError(
+        `Cancel rejected: ${e instanceof Error ? e.message : String(e)}`,
+      );
+    } finally {
+      setIsWorking(false);
+    }
+  };
+
+  return (
+    <div
+      className="rounded-md border border-border/60 px-3 py-2.5 space-y-2"
+      data-testid="enforcement-state-block"
+    >
+      <div className="flex items-center gap-2 text-sm">
+        {(actionStatus === "pending" || actionStatus === "enforcing") && (
+          <LoaderCircle className="h-4 w-4 animate-spin text-muted-foreground" />
+        )}
+        <Badge variant={statusVariant(actionStatus)}>
+          {stateLabel[actionStatus] ?? actionStatus}
+        </Badge>
+        <span className="text-xs text-muted-foreground font-mono">
+          {activeAction.action}
+        </span>
+      </div>
+      {actionStatus === "failed" && (
+        <div className="flex gap-2">
+          <Button
+            data-testid="enforcement-retry-btn"
+            disabled={isWorking}
+            onClick={() => void handleRetry()}
+            size="sm"
+            type="button"
+            variant="outline"
+          >
+            {isWorking ? (
+              <LoaderCircle className="h-3.5 w-3.5 animate-spin" />
+            ) : (
+              "Retry"
+            )}
+          </Button>
+          <Button
+            data-testid="enforcement-cancel-btn"
+            disabled={isWorking}
+            onClick={() => void handleCancel()}
+            size="sm"
+            type="button"
+            variant="ghost"
+          >
+            Cancel
+          </Button>
+        </div>
+      )}
+      {error && <p className="text-xs text-destructive">{error}</p>}
+    </div>
+  );
+}
+
+// ── Resolve report form ───────────────────────────────────────────────────
 
 /**
- * Parse imeta attachment metadata from the relay's `tags: string[][]` wire
- * format. Matches the reference SPA implementation in `admin-web/src/App.tsx`.
+ * Resolution form — shown on open reports (not `processing`). Presents the
+ * action matrix for the report's target_kind, collects optional reason and
+ * (for timeout) expiration_secs, then calls the resolve endpoint.
  *
- * Each `imeta` tag looks like:
- *   `["imeta", "url https://...", "m image/png", "x <sha256>", "size 12345"]`
- * Each entry after `"imeta"` is a singleton `"key value"` string.
- *
- * Rejected: missing x/m/size, non-lowercase-hex x, non-positive size.
+ * The form generates a `requestId` per submission attempt. On retry after a
+ * lost response, the caller should reuse the same `requestId` — this is
+ * handled by the retry path in `EnforcementStateBlock`.
  */
-export function parseImetaAttachments(tags: unknown): AttachmentMeta[] {
-  if (!Array.isArray(tags)) return [];
-  const result: AttachmentMeta[] = [];
-  for (const tag of tags) {
-    if (!Array.isArray(tag) || tag[0] !== "imeta") continue;
-    const values = new Map<string, string>();
-    for (const entry of (tag as string[]).slice(1)) {
-      const sep = typeof entry === "string" ? entry.indexOf(" ") : -1;
-      if (sep > 0) {
-        values.set(entry.slice(0, sep), entry.slice(sep + 1));
+function ResolveReportForm({
+  report,
+  origin,
+  onResolved,
+}: {
+  report: AdminReportDto;
+  origin: string;
+  onResolved: () => void;
+}) {
+  const [selectedAction, setSelectedAction] =
+    useState<AdminReportAction | null>(null);
+  const [reason, setReason] = useState("");
+  const [expirationSecs, setExpirationSecs] = useState("");
+  const [isSubmitting, setIsSubmitting] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  // Stable requestId per submission; regenerated on each new submit attempt.
+  const requestIdRef = useRef<string | null>(null);
+
+  const allowedActions = allowedActionsForTargetKind(report.targetKind ?? "");
+
+  const handleSubmit = async () => {
+    if (!selectedAction) return;
+    setError(null);
+    setIsSubmitting(true);
+
+    // Generate a fresh requestId for this submission attempt (v4 amendment 2).
+    if (!requestIdRef.current) {
+      requestIdRef.current = crypto.randomUUID();
+    }
+
+    try {
+      await resolveAdminReport(origin, report.id, {
+        action: selectedAction,
+        requestId: requestIdRef.current,
+        expirationSecs:
+          selectedAction === "timeout" && expirationSecs
+            ? Number(expirationSecs)
+            : undefined,
+        reason: reason.trim() || undefined,
+      });
+      onResolved();
+    } catch (e) {
+      // On error, reset requestId so the next submit generates a new one.
+      // But: if the error suggests a 409 (report already processing), the
+      // server has a claim — don't reset, let the parent handle it.
+      const msg = e instanceof Error ? e.message : String(e);
+      if (!msg.includes("409") && !msg.includes("processing")) {
+        requestIdRef.current = null;
       }
+      setError(msg);
+    } finally {
+      setIsSubmitting(false);
     }
-    const sha256 = values.get("x") ?? "";
-    const mime = values.get("m") ?? "";
-    const rawSize = values.get("size") ?? "";
-    const size = Number(rawSize);
-    // Require exactly 64 lowercase hex chars for the hash (relay stores lowercase;
-    // uppercase returns 404). Require a non-empty MIME type and a positive size.
-    if (
-      sha256.length !== 64 ||
-      !/^[0-9a-f]{64}$/.test(sha256) ||
-      !mime ||
-      !Number.isFinite(size) ||
-      size <= 0
-    ) {
-      continue;
-    }
-    result.push({ sha256, mime, size });
-  }
-  return result;
+  };
+
+  return (
+    <div
+      className="rounded-md border border-border/60 px-3 py-2.5 space-y-3"
+      data-testid="resolve-report-form"
+    >
+      <p className="text-xs font-medium text-muted-foreground">
+        Resolve report
+      </p>
+      <div className="flex flex-wrap gap-1.5">
+        {allowedActions.map((action) => (
+          <Button
+            className={cn(
+              "text-xs",
+              selectedAction === action && "ring-2 ring-ring ring-offset-1",
+            )}
+            data-testid={`action-btn-${action}`}
+            key={action}
+            onClick={() =>
+              setSelectedAction(action === selectedAction ? null : action)
+            }
+            size="sm"
+            type="button"
+            variant={actionVariant(action)}
+          >
+            {actionLabel(action)}
+          </Button>
+        ))}
+      </div>
+
+      {selectedAction === "timeout" && (
+        <div className="flex items-center gap-2">
+          <label
+            className="text-xs text-muted-foreground shrink-0"
+            htmlFor="timeout-duration-input"
+          >
+            Duration (seconds)
+          </label>
+          <input
+            className="flex-1 rounded-md border border-border/60 bg-background px-2 py-1 text-xs font-mono"
+            data-testid="timeout-duration-input"
+            id="timeout-duration-input"
+            min="1"
+            onChange={(e) => setExpirationSecs(e.target.value)}
+            placeholder="e.g. 3600"
+            type="number"
+            value={expirationSecs}
+          />
+        </div>
+      )}
+
+      <div>
+        <input
+          className="w-full rounded-md border border-border/60 bg-background px-2 py-1 text-xs"
+          data-testid="resolve-reason-input"
+          onChange={(e) => setReason(e.target.value)}
+          placeholder="Reason (optional)"
+          type="text"
+          value={reason}
+        />
+      </div>
+
+      {selectedAction && (
+        <Button
+          data-testid="resolve-submit-btn"
+          disabled={
+            isSubmitting || (selectedAction === "timeout" && !expirationSecs)
+          }
+          onClick={() => void handleSubmit()}
+          size="sm"
+          type="button"
+        >
+          {isSubmitting ? (
+            <LoaderCircle className="h-3.5 w-3.5 animate-spin" />
+          ) : (
+            `Confirm: ${actionLabel(selectedAction)}`
+          )}
+        </Button>
+      )}
+
+      {error && <p className="text-xs text-destructive">{error}</p>}
+    </div>
+  );
 }
 
 // ── Reports tab ───────────────────────────────────────────────────────────
@@ -254,16 +473,28 @@ function ReportsTab({
         const id = report.id;
         const summary = report.reportType || "Report";
         const status = report.status;
+        const isProcessing = status === "processing";
         return (
           <li key={id}>
             <button
-              className="w-full rounded-md border border-border/60 px-3 py-2.5 text-left text-sm hover:bg-muted/40 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-              onClick={() => setSelectedId(id)}
+              className={cn(
+                "w-full rounded-md border border-border/60 px-3 py-2.5 text-left text-sm hover:bg-muted/40 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring",
+                isProcessing && "opacity-60 cursor-default",
+              )}
+              disabled={isProcessing}
+              onClick={() => {
+                if (!isProcessing) setSelectedId(id);
+              }}
               type="button"
             >
               <span className="block font-medium">{summary}</span>
               {status && (
-                <span className="text-xs text-muted-foreground">{status}</span>
+                <span className="flex items-center gap-1.5 text-xs text-muted-foreground">
+                  {status}
+                  {isProcessing && (
+                    <LoaderCircle className="h-3 w-3 animate-spin" />
+                  )}
+                </span>
               )}
             </button>
           </li>
@@ -330,14 +561,22 @@ function ReportDetail({
   reportId: string;
   onBack: () => void;
 }) {
+  // Resolution generation: bump to reload detail after an action completes.
+  const [resolveGen, setResolveGen] = useState(0);
+
   const detailState = useAsyncLoad(
     () => getAdminReport(origin, reportId),
     [origin, pubkey, reportId],
-    generation,
+    generation + resolveGen,
   );
 
+  const data = detailState.status === "ok" ? detailState.data : null;
+  const isProcessing = data?.status === "processing";
+  const isOpen = data?.status === "open";
+  const activeAction = data?.activeAction ?? null;
+
   return (
-    <div>
+    <div className="space-y-4">
       <button
         className="mb-3 flex items-center gap-1 text-xs text-muted-foreground hover:text-foreground"
         onClick={onBack}
@@ -350,330 +589,29 @@ function ReportDetail({
       {detailState.status === "error" && (
         <ErrorMessage message={detailState.message} />
       )}
-      {detailState.status === "ok" && <ReportFields data={detailState.data} />}
-    </div>
-  );
-}
-
-// ── Feedback tab ──────────────────────────────────────────────────────────
-
-function FeedbackTab({
-  origin,
-  pubkey,
-  generation,
-}: {
-  origin: string;
-  pubkey: string;
-  generation: number;
-}) {
-  const [selectedId, setSelectedId] = useState<string | null>(null);
-
-  const listState = useAsyncLoad(
-    () => listAdminFeedback(origin),
-    [origin, pubkey],
-    generation,
-  );
-
-  if (selectedId) {
-    return (
-      <FeedbackDetail
-        feedbackId={selectedId}
-        onBack={() => setSelectedId(null)}
-        origin={origin}
-        pubkey={pubkey}
-        generation={generation}
-      />
-    );
-  }
-
-  if (listState.status === "loading") return <LoadingSpinner />;
-  if (listState.status === "error") {
-    return <ErrorMessage message={listState.message} />;
-  }
-  if (listState.status !== "ok") return null;
-
-  const items = listState.data;
-  if (!Array.isArray(items) || items.length === 0) {
-    return <p className="text-sm text-muted-foreground">No feedback found.</p>;
-  }
-
-  return (
-    <ul className="space-y-1">
-      {items.map((item: AdminFeedbackSummaryDto) => {
-        const id = item.id;
-        const text = item.bodySummary.slice(0, 120);
-        const receivedAt = item.receivedAt;
-        return (
-          <li key={id}>
-            <button
-              className="w-full rounded-md border border-border/60 px-3 py-2.5 text-left text-sm hover:bg-muted/40 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-              onClick={() => setSelectedId(id)}
-              type="button"
-            >
-              <span className="block font-medium line-clamp-2">{text}</span>
-              {receivedAt && (
-                <span className="text-xs text-muted-foreground">
-                  {formatTimestamp(receivedAt)}
-                </span>
-              )}
-            </button>
-          </li>
-        );
-      })}
-    </ul>
-  );
-}
-
-// ── Attachment viewer ─────────────────────────────────────────────────────
-
-function AttachmentViewer({
-  origin,
-  pubkey,
-  feedbackId,
-  attachment,
-  panelGeneration,
-}: {
-  origin: string;
-  pubkey: string;
-  feedbackId: string;
-  attachment: AttachmentMeta;
-  /** Generation from the parent panel — when this changes the attachment
-   *  context has changed and any in-flight load result is stale. */
-  panelGeneration: number;
-}) {
-  const [blobUrl, setBlobUrl] = useState<string | null>(null);
-  const [error, setError] = useState<AdminAttachmentErrorCode | null>(null);
-  const [loading, setLoading] = useState(false);
-  const blobUrlRef = useRef<string | null>(null);
-  // Per-load generation: incremented when a new load starts AND in cleanup so
-  // that unmount or panelGeneration change invalidates any in-flight load.
-  const loadGenRef = useRef(0);
-  // Keep current origin/pubkey in refs so the callback can compare against
-  // the rendered-at-call-time values without capturing stale closure copies.
-  const originRef = useRef(origin);
-  const pubkeyRef = useRef(pubkey);
-  originRef.current = origin;
-  pubkeyRef.current = pubkey;
-
-  // On panelGeneration change (identity/origin switch) or unmount:
-  // invalidate any in-flight load and revoke the cached blob URL.
-  // biome-ignore lint/correctness/useExhaustiveDependencies: panelGeneration is a prop that drives cleanup re-registration; the cleanup body mutates refs, not reactive state
-  useEffect(() => {
-    return () => {
-      // Increment generation so any in-flight native callback sees a mismatch.
-      loadGenRef.current += 1;
-      if (blobUrlRef.current) {
-        URL.revokeObjectURL(blobUrlRef.current);
-        blobUrlRef.current = null;
-      }
-    };
-  }, [panelGeneration]);
-
-  const load = useCallback(async () => {
-    // Capture snapshot of context at the moment this load starts.
-    const thisGen = ++loadGenRef.current;
-    const thisOrigin = origin;
-    const thisPubkey = pubkey;
-
-    setLoading(true);
-    setError(null);
-    try {
-      const url = await fetchAdminAttachmentBlobUrl(
-        origin,
-        feedbackId,
-        attachment.sha256,
-        attachment.mime,
-        attachment.size,
-      );
-
-      // Discard if a newer load started, the component was unmounted/context
-      // changed (loadGenRef incremented in cleanup), or origin/pubkey differ.
-      if (
-        thisGen !== loadGenRef.current ||
-        thisOrigin !== originRef.current ||
-        thisPubkey !== pubkeyRef.current
-      ) {
-        URL.revokeObjectURL(url);
-        return;
-      }
-
-      // Revoke any previous blob before replacing.
-      if (blobUrlRef.current) URL.revokeObjectURL(blobUrlRef.current);
-      blobUrlRef.current = url;
-      setBlobUrl(url);
-    } catch (e) {
-      if (thisGen !== loadGenRef.current) return;
-      setError(
-        typeof e === "string" ? (e as AdminAttachmentErrorCode) : String(e),
-      );
-    } finally {
-      if (thisGen === loadGenRef.current) setLoading(false);
-    }
-  }, [
-    origin,
-    pubkey,
-    feedbackId,
-    attachment.sha256,
-    attachment.mime,
-    attachment.size,
-  ]);
-
-  // Auto-load image/* attachments immediately on mount — no button click needed.
-  // Routes through the same `load` callback (generation fence, SSRF guard,
-  // revoke-on-cleanup), so the existing blob-leak tests remain valid and cover
-  // the auto-load path.
-  // biome-ignore lint/correctness/useExhaustiveDependencies: load is a stable useCallback; attachment.mime is a mount-time constant — auto-load fires once per mount
-  useEffect(() => {
-    if (attachment.mime.startsWith("image/")) {
-      void load();
-    }
-  }, []); // Empty: fires once on mount; identity boundary and generation fence handle context changes.
-
-  if (error) {
-    const friendlyError: Record<string, string> = {
-      admin_attachment_too_large: "Attachment exceeds the 10 MiB desktop cap.",
-      admin_attachment_mime_mismatch:
-        "Attachment MIME type does not match the imeta record.",
-      admin_attachment_size_mismatch:
-        "Attachment byte count does not match the imeta record.",
-      admin_attachment_network_error: "Network error fetching attachment.",
-    };
-    return (
-      <div className="flex items-center gap-1.5 text-xs text-destructive">
-        <AlertCircle className="h-3.5 w-3.5" />
-        {friendlyError[error] ?? `Error: ${error}`}
-      </div>
-    );
-  }
-
-  if (!blobUrl) {
-    // For image/* types the load is triggered automatically on mount.
-    // Show only a spinner while in-flight; the "View attachment" button is
-    // for non-image MIME types where the user opts in to loading.
-    if (attachment.mime.startsWith("image/") || loading) {
-      return (
-        <div className="flex items-center gap-1.5 text-xs text-muted-foreground">
-          <LoaderCircle className="h-3.5 w-3.5 animate-spin" />
-          Loading…
-        </div>
-      );
-    }
-    return (
-      <Button
-        className="gap-1.5"
-        disabled={loading}
-        onClick={() => void load()}
-        size="sm"
-        type="button"
-        variant="outline"
-      >
-        <Download className="h-3.5 w-3.5" />
-        {`View attachment (${attachment.mime})`}
-      </Button>
-    );
-  }
-
-  if (attachment.mime.startsWith("image/")) {
-    return (
-      <img
-        alt="Feedback attachment"
-        className="max-h-96 max-w-full rounded-md border border-border/60 object-contain"
-        src={blobUrl}
-      />
-    );
-  }
-
-  return (
-    <a
-      className="flex items-center gap-1.5 text-xs text-primary underline"
-      download={`attachment-${attachment.sha256.slice(0, 8)}`}
-      href={blobUrl}
-    >
-      <Download className="h-3.5 w-3.5" />
-      Download attachment ({attachment.mime})
-    </a>
-  );
-}
-
-function FeedbackFields({ data }: { data: AdminFeedbackDto }) {
-  return (
-    <div
-      className="space-y-1.5 rounded-md border border-border/60 px-3 py-2.5"
-      data-testid="feedback-detail-fields"
-    >
-      <DetailRow label="ID" value={data.id} mono />
-      <DetailRow label="Body" value={data.body} />
-      <DetailRow label="Submitter" value={data.submitterPubkey} mono />
-      <DetailRow label="Category" value={data.category ?? null} />
-      <DetailRow label="Community" value={data.communityId} mono />
-      <DetailRow label="Host" value={data.communityHost} />
-      <DetailRow label="Event ID" value={data.eventId} mono />
-      <DetailRow
-        label="Event created"
-        value={formatTimestamp(data.eventCreatedAt)}
-      />
-      <DetailRow label="Received" value={formatTimestamp(data.receivedAt)} />
-    </div>
-  );
-}
-
-function FeedbackDetail({
-  origin,
-  pubkey,
-  generation,
-  feedbackId,
-  onBack,
-}: {
-  origin: string;
-  pubkey: string;
-  generation: number;
-  feedbackId: string;
-  onBack: () => void;
-}) {
-  const detailState = useAsyncLoad(
-    () => getAdminFeedback(origin, feedbackId),
-    [origin, pubkey, feedbackId],
-    generation,
-  );
-
-  // Parse imeta attachment metadata from the relay's wire `tags: string[][]`.
-  // AdminFeedback is serialised camelCase by the relay (serde rename_all).
-  const attachments: AttachmentMeta[] =
-    detailState.status === "ok"
-      ? parseImetaAttachments(detailState.data.tags)
-      : [];
-
-  return (
-    <div className="space-y-4">
-      <button
-        className="flex items-center gap-1 text-xs text-muted-foreground hover:text-foreground"
-        onClick={onBack}
-        type="button"
-      >
-        <ChevronLeft className="h-3.5 w-3.5" />
-        Back to feedback
-      </button>
-      {detailState.status === "loading" && <LoadingSpinner />}
-      {detailState.status === "error" && (
-        <ErrorMessage message={detailState.message} />
-      )}
       {detailState.status === "ok" && (
         <>
-          <FeedbackFields data={detailState.data} />
-          {attachments.length > 0 && (
-            <div className="space-y-3">
-              <h4 className="text-sm font-medium">Attachments</h4>
-              {attachments.map((a) => (
-                <AttachmentViewer
-                  attachment={a}
-                  feedbackId={feedbackId}
-                  key={a.sha256}
-                  origin={origin}
-                  pubkey={pubkey}
-                  panelGeneration={generation}
-                />
-              ))}
-            </div>
+          <ReportFields data={detailState.data} />
+          {/* Enforcement state: present on processing reports or failed actions */}
+          {activeAction &&
+            (isProcessing ||
+              activeAction.status === "failed" ||
+              activeAction.status === "pending" ||
+              activeAction.status === "enforcing") && (
+              <EnforcementStateBlock
+                activeAction={activeAction}
+                origin={origin}
+                reportId={reportId}
+                onActionComplete={() => setResolveGen((g) => g + 1)}
+              />
+            )}
+          {/* Resolve form: only for open (non-processing) reports */}
+          {isOpen && !activeAction && (
+            <ResolveReportForm
+              report={detailState.data}
+              origin={origin}
+              onResolved={() => setResolveGen((g) => g + 1)}
+            />
           )}
         </>
       )}
@@ -683,27 +621,31 @@ function FeedbackDetail({
 
 // ── Tab bar ───────────────────────────────────────────────────────────────
 
-type Tab = "reports" | "feedback";
+type Tab = "reports" | "feedback" | "staffing";
 
 function TabBar({
   activeTab,
   onSelect,
+  showStaffing,
 }: {
   activeTab: Tab;
   onSelect: (tab: Tab) => void;
+  showStaffing: boolean;
 }) {
+  const allTabs: Array<{
+    value: Tab;
+    label: string;
+    Icon: React.ComponentType<{ className?: string }>;
+  }> = [
+    { value: "reports", label: "Reports", Icon: ShieldAlert },
+    { value: "feedback", label: "Feedback", Icon: MessageSquare },
+    ...(showStaffing
+      ? [{ value: "staffing" as const, label: "Staffing", Icon: Users }]
+      : []),
+  ];
   return (
     <div className="mb-4 flex gap-1 border-b border-border/60">
-      {(
-        [
-          { value: "reports" as const, label: "Reports", Icon: ShieldAlert },
-          {
-            value: "feedback" as const,
-            label: "Feedback",
-            Icon: MessageSquare,
-          },
-        ] as const
-      ).map(({ value, label, Icon }) => (
+      {allTabs.map(({ value, label, Icon }) => (
         <button
           className={cn(
             "flex items-center gap-1.5 border-b-2 px-3 pb-2 pt-1 text-sm font-medium transition-colors",
@@ -724,36 +666,23 @@ function TabBar({
   );
 }
 
-// ── Shared helpers ────────────────────────────────────────────────────────
-
-function LoadingSpinner() {
-  return (
-    <div className="flex items-center gap-2 text-sm text-muted-foreground">
-      <LoaderCircle className="h-4 w-4 animate-spin" />
-      Loading…
-    </div>
-  );
-}
-
-function ErrorMessage({ message }: { message: string }) {
-  return (
-    <div className="flex items-center gap-1.5 text-sm text-destructive">
-      <AlertCircle className="h-4 w-4" />
-      {message}
-    </div>
-  );
-}
-
 // ── Panel root ────────────────────────────────────────────────────────────
 
 export function AdminConsolePanel({
   origin,
   pubkey,
+  role,
+  source,
 }: {
   origin: string;
   /** Active identity pubkey — all state is keyed on (pubkey, origin). */
   pubkey: string;
+  /** Principal role from probe — `"operator"` | `"moderator"` | undefined */
+  role?: AdminPrincipalRole | null;
+  /** Source from probe — `"config"` | `"owner_fallback"` | `"db"` | undefined */
+  source?: AdminPrincipalSource | null;
 }) {
+  const isOperator = role === "operator";
   const [activeTab, setActiveTab] = useState<Tab>("reports");
   // Increment whenever the (pubkey, origin) context changes to invalidate all
   // in-flight useAsyncLoad effects via their effect-local `active` flags.
@@ -771,12 +700,28 @@ export function AdminConsolePanel({
       className="flex min-h-0 flex-1 flex-col"
       data-testid="admin-console-panel"
     >
-      <TabBar activeTab={activeTab} onSelect={setActiveTab} />
+      {role && (
+        <div className="mb-3 flex items-center gap-2 text-xs">
+          <Shield className="h-3.5 w-3.5 text-muted-foreground" />
+          <Badge variant="secondary">{role}</Badge>
+          {source && (
+            <Badge variant="outline">{source.replace("_", " ")}</Badge>
+          )}
+        </div>
+      )}
+      <TabBar
+        activeTab={activeTab}
+        onSelect={setActiveTab}
+        showStaffing={isOperator}
+      />
       {activeTab === "reports" && (
         <ReportsTab origin={origin} pubkey={pubkey} generation={generation} />
       )}
       {activeTab === "feedback" && (
         <FeedbackTab origin={origin} pubkey={pubkey} generation={generation} />
+      )}
+      {activeTab === "staffing" && isOperator && (
+        <StaffingTab origin={origin} pubkey={pubkey} generation={generation} />
       )}
     </div>
   );

@@ -36,6 +36,8 @@ import {
   getAdminOrigin,
   probeAdminOrigin,
   setAdminOrigin,
+  type AdminPrincipalRole,
+  type AdminPrincipalSource,
   type AdminProbeState,
 } from "./api";
 import { AdminConsolePanel } from "./AdminConsolePanel";
@@ -58,8 +60,8 @@ function DeniedBadge({ pubkeyHex }: { pubkeyHex: string }) {
       </span>
       <span className="text-muted-foreground">
         Your pubkey is not in{" "}
-        <code className="font-mono">BUZZ_ADMIN_PUBKEYS</code>. Ask your relay
-        operator to add:
+        <code className="font-mono">RELAY_OPERATOR_PUBKEYS</code>. Ask your
+        relay operator to add:
       </span>
       <span className="flex min-w-0 items-center gap-1.5 rounded bg-muted px-1.5 py-0.5">
         <code
@@ -104,7 +106,12 @@ function DeniedBadge({ pubkeyHex }: { pubkeyHex: string }) {
 type ProbeUiState =
   | { kind: "idle" }
   | { kind: "probing" }
-  | { kind: "authorized"; origin: string }
+  | {
+      kind: "authorized";
+      origin: string;
+      role?: AdminPrincipalRole | null;
+      source?: AdminPrincipalSource | null;
+    }
   | { kind: "denied"; pubkeyHex: string }
   | { kind: "tokenMode" }
   | { kind: "disabled"; origin: string }
@@ -179,13 +186,22 @@ function ProbeStatusBadge({ uiState }: { uiState: ProbeUiState }) {
 }
 
 function probeStateToUiState(
-  state: AdminProbeState,
+  result: {
+    state: AdminProbeState;
+    role?: AdminPrincipalRole | null;
+    source?: AdminPrincipalSource | null;
+  },
   origin: string,
   pubkeyHex: string,
 ): ProbeUiState {
-  switch (state) {
+  switch (result.state) {
     case "nip98Authorized":
-      return { kind: "authorized", origin };
+      return {
+        kind: "authorized",
+        origin,
+        role: result.role,
+        source: result.source,
+      };
     case "nip98Denied":
       return { kind: "denied", pubkeyHex };
     case "tokenMode":
@@ -316,7 +332,7 @@ function AdminConsoleSettingsSession({ pubkeyHex }: { pubkeyHex: string }) {
       try {
         const result = await probeAdminOrigin(origin);
         if (controller.signal.aborted) return;
-        setProbeUiState(probeStateToUiState(result.state, origin, pubkeyHex));
+        setProbeUiState(probeStateToUiState(result, origin, pubkeyHex));
       } catch (e) {
         if (controller.signal.aborted) return;
         setProbeUiState({
@@ -431,7 +447,16 @@ function AdminConsoleSettingsSession({ pubkeyHex }: { pubkeyHex: string }) {
       </div>
 
       {isPanelVisible && savedOrigin && (
-        <AdminConsolePanel origin={savedOrigin} pubkey={pubkeyHex} />
+        <AdminConsolePanel
+          origin={savedOrigin}
+          pubkey={pubkeyHex}
+          role={
+            probeUiState.kind === "authorized" ? probeUiState.role : undefined
+          }
+          source={
+            probeUiState.kind === "authorized" ? probeUiState.source : undefined
+          }
+        />
       )}
     </>
   );

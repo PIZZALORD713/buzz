@@ -35,15 +35,19 @@ impl AttachmentHash {
     }
 }
 
-/// The five read routes exposed by `/api/admin/v1`.
+/// The routes exposed by `/api/admin/v1`.
 ///
 /// IDs are typed `Uuid` — path injection via slash, `..`, `?`, `#`, or
 /// percent-escapes is structurally impossible. The attachment hash is an
-/// `AttachmentHash`, enforcing exact lowercase-hex grammar.
+/// `AttachmentHash`, enforcing exact lowercase-hex grammar. Operator pubkeys
+/// are validated hex strings.
 #[derive(Debug)]
 pub enum AdminRoute {
     ReportsList,
     ReportDetail {
+        id: uuid::Uuid,
+    },
+    ReportResolve {
         id: uuid::Uuid,
     },
     FeedbackList,
@@ -54,6 +58,40 @@ pub enum AdminRoute {
         id: uuid::Uuid,
         sha256: AttachmentHash,
     },
+    FeedbackPatch {
+        id: uuid::Uuid,
+    },
+    OperatorsList,
+    OperatorPut {
+        pubkey: HexPubkey,
+    },
+    OperatorDelete {
+        pubkey: HexPubkey,
+    },
+}
+
+/// A validated 64 lowercase-hex character pubkey for use as a URL path segment.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HexPubkey(String);
+
+impl HexPubkey {
+    /// Parse `raw` as a 64-character lowercase hex pubkey.
+    pub fn parse(raw: &str) -> Result<Self, String> {
+        if raw.len() != 64 {
+            return Err(format!(
+                "pubkey must be exactly 64 hex characters; got {}",
+                raw.len()
+            ));
+        }
+        if !raw.chars().all(|c| matches!(c, '0'..='9' | 'a'..='f')) {
+            return Err("pubkey must be lowercase hex only (0-9, a-f)".to_string());
+        }
+        Ok(HexPubkey(raw.to_string()))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
 }
 
 impl AdminRoute {
@@ -62,11 +100,16 @@ impl AdminRoute {
         match self {
             AdminRoute::ReportsList => "/reports".to_string(),
             AdminRoute::ReportDetail { id } => format!("/reports/{id}"),
+            AdminRoute::ReportResolve { id } => format!("/reports/{id}/resolve"),
             AdminRoute::FeedbackList => "/feedback".to_string(),
             AdminRoute::FeedbackDetail { id } => format!("/feedback/{id}"),
             AdminRoute::FeedbackAttachment { id, sha256 } => {
                 format!("/feedback/{id}/attachments/{}", sha256.as_str())
             }
+            AdminRoute::FeedbackPatch { id } => format!("/feedback/{id}"),
+            AdminRoute::OperatorsList => "/operators".to_string(),
+            AdminRoute::OperatorPut { pubkey } => format!("/operators/{}", pubkey.as_str()),
+            AdminRoute::OperatorDelete { pubkey } => format!("/operators/{}", pubkey.as_str()),
         }
     }
 }
