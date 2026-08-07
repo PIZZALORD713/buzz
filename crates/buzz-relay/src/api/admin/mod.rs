@@ -2559,7 +2559,12 @@ mod tests {
                 "#,
             )
             .bind(community_id)
-            .bind(uuid::Uuid::new_v4().as_bytes().as_slice())
+            .bind({
+                // report_event_id requires 32 bytes (Nostr event ID length).
+                // Duplicate the UUID bytes to fill the 32-byte requirement.
+                let uid = uuid::Uuid::new_v4();
+                uid.as_bytes().iter().chain(uid.as_bytes().iter()).copied().collect::<Vec<u8>>()
+            })
             .bind(vec![0u8; 32])
             .bind(vec![1u8; 32])
             .fetch_one(&pool)
@@ -2589,7 +2594,7 @@ mod tests {
                 None,
                 None,
                 "resolve:ban",
-                "config",
+                "relay_operator",
                 Some(&target),
                 None,
                 None,
@@ -2656,7 +2661,12 @@ mod tests {
                 "#,
             )
             .bind(community_id)
-            .bind(uuid::Uuid::new_v4().as_bytes().as_slice())
+            .bind({
+                // report_event_id requires 32 bytes (Nostr event ID length).
+                // Duplicate the UUID bytes to fill the 32-byte requirement.
+                let uid = uuid::Uuid::new_v4();
+                uid.as_bytes().iter().chain(uid.as_bytes().iter()).copied().collect::<Vec<u8>>()
+            })
             .bind(vec![0u8; 32])
             .bind(vec![1u8; 32])
             .fetch_one(&pool)
@@ -2681,7 +2691,7 @@ mod tests {
             None,
             None,
             "resolve:ban",
-            "config",
+            "relay_operator",
             Some(&target),
             None,
             None,
@@ -2704,7 +2714,7 @@ mod tests {
             None,
             None,
             "resolve:ban",
-            "config",
+            "relay_operator",
             Some(&target),
             None,
             None,
@@ -2757,7 +2767,12 @@ mod tests {
                 "#,
             )
             .bind(community_id)
-            .bind(uuid::Uuid::new_v4().as_bytes().as_slice())
+            .bind({
+                // report_event_id requires 32 bytes (Nostr event ID length).
+                // Duplicate the UUID bytes to fill the 32-byte requirement.
+                let uid = uuid::Uuid::new_v4();
+                uid.as_bytes().iter().chain(uid.as_bytes().iter()).copied().collect::<Vec<u8>>()
+            })
             .bind(vec![0u8; 32])
             .bind(vec![1u8; 32])
             .fetch_one(&pool)
@@ -2782,7 +2797,7 @@ mod tests {
             None,
             None,
             "resolve:ban",
-            "config",
+            "relay_operator",
             Some(&target),
             None,
             None,
@@ -2852,7 +2867,12 @@ mod tests {
                 "#,
             )
             .bind(community_id)
-            .bind(uuid::Uuid::new_v4().as_bytes().as_slice())
+            .bind({
+                // report_event_id requires 32 bytes (Nostr event ID length).
+                // Duplicate the UUID bytes to fill the 32-byte requirement.
+                let uid = uuid::Uuid::new_v4();
+                uid.as_bytes().iter().chain(uid.as_bytes().iter()).copied().collect::<Vec<u8>>()
+            })
             .bind(vec![0u8; 32])
             .bind(vec![1u8; 32])
             .fetch_one(&pool)
@@ -2876,7 +2896,7 @@ mod tests {
             None,
             None,
             "resolve:ban",
-            "config",
+            "relay_operator",
             Some(&target),
             None,
             None,
@@ -2938,7 +2958,12 @@ mod tests {
                 "#,
             )
             .bind(community_id)
-            .bind(uuid::Uuid::new_v4().as_bytes().as_slice())
+            .bind({
+                // report_event_id requires 32 bytes (Nostr event ID length).
+                // Duplicate the UUID bytes to fill the 32-byte requirement.
+                let uid = uuid::Uuid::new_v4();
+                uid.as_bytes().iter().chain(uid.as_bytes().iter()).copied().collect::<Vec<u8>>()
+            })
             .bind(vec![0u8; 32])
             .bind(vec![1u8; 32])
             .fetch_one(&pool)
@@ -2962,7 +2987,7 @@ mod tests {
             None,
             None,
             "resolve:ban",
-            "config",
+            "relay_operator",
             Some(&target),
             None,
             None,

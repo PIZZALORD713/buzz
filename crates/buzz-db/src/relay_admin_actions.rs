@@ -811,6 +811,15 @@ mod tests {
     async fn make_report(pool: &PgPool, community_id: Uuid) -> Uuid {
         let reporter = vec![0u8; 32];
         let target = vec![1u8; 32];
+        // report_event_id requires exactly 32 bytes (Nostr event ID).
+        // Use the two UUID halves concatenated to produce a unique 32-byte value.
+        let uid = Uuid::new_v4();
+        let event_id: Vec<u8> = uid
+            .as_bytes()
+            .iter()
+            .chain(uid.as_bytes().iter())
+            .copied()
+            .collect();
         let row = sqlx::query(
             r#"
             INSERT INTO moderation_reports (
@@ -821,7 +830,7 @@ mod tests {
             "#,
         )
         .bind(community_id)
-        .bind(Uuid::new_v4().as_bytes().as_slice())
+        .bind(event_id)
         .bind(&reporter)
         .bind(&target)
         .fetch_one(pool)
@@ -854,7 +863,7 @@ mod tests {
             Some("test reason"),
             None,
             "resolve:ban",
-            "config",
+            "relay_operator",
             Some(&target),
             None,
             None,
@@ -1078,7 +1087,7 @@ mod tests {
             "dismissed",
             "dismiss_report",
             &actor,
-            "config",
+            "relay_operator",
             Some(&target),
             None,
             None,
@@ -1096,7 +1105,7 @@ mod tests {
             "dismissed",
             "dismiss_report",
             &actor,
-            "config",
+            "relay_operator",
             Some(&target),
             None,
             None,
@@ -1197,7 +1206,7 @@ mod tests {
         sqlx::query(
             r#"
             INSERT INTO channels (id, community_id, name, channel_type, visibility, created_by)
-            VALUES ($1, $2, 'test', 'public_group', 'public', $3)
+            VALUES ($1, $2, 'test', 'stream', 'open', $3)
             "#,
         )
         .bind(channel_id)
