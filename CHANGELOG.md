@@ -50,7 +50,7 @@
 - fix(mobile): recover stale relay sessions ([#4372](https://github.com/block/buzz/pull/4372)) ([`ce56e34411d2940e70a6c0de653ffae36d334701`](https://github.com/block/buzz/commit/ce56e34411d2940e70a6c0de653ffae36d334701))
 
 [Compare desktop-v0.5.4...desktop-v0.5.5](https://github.com/block/buzz/compare/desktop-v0.5.4...desktop-v0.5.5)
->>>>>>> 9570237a1 (feat(desktop): add in-app admin console for relay operators)
+
 ## v0.5.4
 
 ### Desktop and shared changes
