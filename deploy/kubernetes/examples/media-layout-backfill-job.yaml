@@ -1,4 +1,5 @@
-# Copy this example, pin the same image tag as the relay, and supply its S3
+# Run this while relays are in dual-read-and-write, before switching them to
+# sharded-only. Pin the same image tag as the relay and supply its S3
 # environment/IRSA. Re-running is safe: existing sharded objects are skipped.
 apiVersion: batch/v1
 kind: Job

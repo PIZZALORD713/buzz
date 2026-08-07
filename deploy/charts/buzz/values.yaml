@@ -123,9 +123,9 @@ relay:
   # local development or fully public communities — desktop, mobile, and CLI
   # clients all attach read auth.
   requireMediaGetAuth: true
-  # Behavior-preserving upgrade default: legacy-only reads and writes. Existing deployments migrate through
-  # legacy-only -> dual-read-legacy-write -> dual-read-dual-write -> sharded-only. New deployments should override
-  # this to sharded-only before accepting their first upload so they never need a backfill.
+  # Behavior-preserving upgrade default: legacy-only reads and writes. Existing deployments use
+  # legacy-only -> dual-read-and-write -> backfill -> sharded-only. New deployments should override this to
+  # sharded-only before accepting their first upload so they never need a backfill.
   mediaMigrationPhase: legacy-only
   allowNipOaAuth: true
   pubkeyAllowlist: false

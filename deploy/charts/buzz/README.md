@@ -107,8 +107,7 @@ The supported modes are:
 | Mode | Reads | Writes | Use |
 |---|---|---|---|
 | `legacy-only` (default) | Legacy only | Legacy only | Behavior-preserving upgrades and deployments that are not migrating yet |
-| `dual-read-legacy-write` | Sharded first, legacy fallback | Legacy only | Deploy compatibility readers before changing the write layout |
-| `dual-read-dual-write` | Sharded first, legacy fallback | Sharded and legacy | Migration and rollback window |
+| `dual-read-and-write` | Sharded first, legacy fallback | Sharded and legacy | Migration, backfill, and rollback window |
 | `sharded-only` | Sharded only | Sharded only | New deployments and completed migrations |
 
 **New deployments should start with `sharded-only` before accepting the first
@@ -118,7 +117,7 @@ eliminates the later backfill and cleanup migration.
 Existing deployments should keep the `legacy-only` default until an operator
 intentionally starts the staged migration. Do not roll `sharded-only` writers
 back to a Buzz version that predates sharded reads. Returning from
-`sharded-only` to `dual-read-dual-write` does not retroactively recreate legacy
+`sharded-only` to `dual-read-and-write` does not retroactively recreate legacy
 copies; run and verify the backfill before relying on old-version rollback.
 
 ## Relay Pod extensions
@@ -307,16 +306,15 @@ For an **existing deployment**:
 
 1. Upgrade with the default `legacy-only`. This is behavior-preserving: the
    relay continues reading and writing only flat legacy keys.
-2. Select `dual-read-legacy-write`; confirm every relay can read both layouts.
-   Writes remain legacy-only, so this step creates no duplicate objects.
-3. Select `dual-read-dual-write` and observe successful writes and storage
-   telemetry through a rollback window.
-4. Run the backfill Job. Re-run from any logged checkpoint as needed, then run
+2. Select `dual-read-and-write`; confirm every relay can read both layouts, and
+   observe successful dual writes and storage telemetry through a rollback
+   window.
+3. Run the backfill Job. Re-run from any logged checkpoint as needed, then run
    it again to a clean `copied=0` result. Reconcile storage sweep unknown keys,
    duplicate gauges, migration failures, and legacy fallback traffic.
-5. Select `sharded-only` only after every supported rollback version understands
+4. Select `sharded-only` only after every supported rollback version understands
    sharded keys and reconciliation finds no missing sharded destination.
-6. Run the deletion Job with its default `dry-run=true`, review the output, and
+5. Run the deletion Job with its default `dry-run=true`, review the output, and
    retain a recovery window/S3 versions. Only then set `dry-run=false` and
    `BUZZ_MEDIA_DELETE_CONFIRM=delete-verified-legacy-media`. The tool checks the
    corresponding sharded object immediately before every deletion.

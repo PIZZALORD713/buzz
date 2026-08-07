@@ -1135,17 +1135,17 @@ mod tests {
     }
 
     #[test]
-    fn media_migration_phase_env_accepts_sharded_only_and_rejects_invalid_values() {
+    fn media_migration_phase_env_accepts_dual_read_and_write_and_rejects_removed_phase() {
         let _guard = ENV_MUTEX.lock().unwrap();
         let previous = std::env::var_os("BUZZ_MEDIA_MIGRATION_PHASE");
 
-        std::env::set_var("BUZZ_MEDIA_MIGRATION_PHASE", "sharded-only");
+        std::env::set_var("BUZZ_MEDIA_MIGRATION_PHASE", "dual-read-and-write");
         let configured = Config::from_env()
-            .expect("sharded-only media config")
+            .expect("dual-read-and-write media config")
             .media
             .migration_phase;
 
-        std::env::set_var("BUZZ_MEDIA_MIGRATION_PHASE", "auto");
+        std::env::set_var("BUZZ_MEDIA_MIGRATION_PHASE", "dual-read-legacy-write");
         let invalid = Config::from_env();
 
         if let Some(value) = previous {
@@ -1154,7 +1154,10 @@ mod tests {
             std::env::remove_var("BUZZ_MEDIA_MIGRATION_PHASE");
         }
 
-        assert_eq!(configured, buzz_media::MediaMigrationPhase::ShardedOnly);
+        assert_eq!(
+            configured,
+            buzz_media::MediaMigrationPhase::DualReadAndWrite
+        );
         assert!(matches!(
             invalid,
             Err(ConfigError::InvalidValue(ref message))

@@ -293,9 +293,10 @@ impl MediaStorage {
 
     /// Resolve a media payload according to the configured read layout.
     ///
-    /// Dual-read phases prefer the sharded key and fall back to legacy only on
-    /// an actual not-found result. Authorization, transport, throttling, and
-    /// service errors are returned so fallback cannot mask an unhealthy store.
+    /// The dual-read-and-write phase prefers the sharded key and falls back to
+    /// legacy only on an actual not-found result. Authorization, transport,
+    /// throttling, and service errors are returned so fallback cannot mask an
+    /// unhealthy store.
     pub async fn resolve_read_key(
         &self,
         ctx: &TenantContext,

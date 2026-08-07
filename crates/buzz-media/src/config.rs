@@ -40,14 +40,10 @@ pub enum MediaMigrationPhase {
     #[default]
     #[serde(rename = "legacy-only")]
     LegacyOnly,
-    /// Compatibility phase: prefer sharded reads with legacy fallback, but
-    /// write only legacy keys.
-    #[serde(rename = "dual-read-legacy-write")]
-    DualReadLegacyWrite,
     /// Migration phase: prefer sharded reads with legacy fallback and write
     /// both layouts (sharded first, then legacy).
-    #[serde(rename = "dual-read-dual-write")]
-    DualReadDualWrite,
+    #[serde(rename = "dual-read-and-write")]
+    DualReadAndWrite,
     /// Final phase: read and write only hash-sharded keys.
     #[serde(rename = "sharded-only")]
     ShardedOnly,
@@ -66,7 +62,7 @@ impl MediaMigrationPhase {
 
     /// Whether writes include the sharded key.
     pub const fn writes_sharded(self) -> bool {
-        matches!(self, Self::DualReadDualWrite | Self::ShardedOnly)
+        matches!(self, Self::DualReadAndWrite | Self::ShardedOnly)
     }
 
     /// Whether writes include the legacy key.
@@ -81,13 +77,11 @@ impl FromStr for MediaMigrationPhase {
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         match value {
             "legacy-only" => Ok(Self::LegacyOnly),
-            "dual-read-legacy-write" => Ok(Self::DualReadLegacyWrite),
-            "dual-read-dual-write" => Ok(Self::DualReadDualWrite),
+            "dual-read-and-write" => Ok(Self::DualReadAndWrite),
             "sharded-only" => Ok(Self::ShardedOnly),
             _ => Err(format!(
                 "BUZZ_MEDIA_MIGRATION_PHASE must be 'legacy-only', \
-                 'dual-read-legacy-write', 'dual-read-dual-write', or 'sharded-only', \
-                 got {value:?}"
+                 'dual-read-and-write', or 'sharded-only', got {value:?}"
             )),
         }
     }
@@ -283,15 +277,18 @@ mod tests {
         );
         assert_eq!("legacy-only".parse(), Ok(MediaMigrationPhase::LegacyOnly));
         assert_eq!(
-            "dual-read-legacy-write".parse(),
-            Ok(MediaMigrationPhase::DualReadLegacyWrite)
-        );
-        assert_eq!(
-            "dual-read-dual-write".parse(),
-            Ok(MediaMigrationPhase::DualReadDualWrite)
+            "dual-read-and-write".parse(),
+            Ok(MediaMigrationPhase::DualReadAndWrite)
         );
         assert_eq!("sharded-only".parse(), Ok(MediaMigrationPhase::ShardedOnly));
-        for invalid in ["legacy", "dual", "sharded", "new"] {
+        for invalid in [
+            "legacy",
+            "dual",
+            "dual-read-legacy-write",
+            "dual-read-dual-write",
+            "sharded",
+            "new",
+        ] {
             assert!(invalid.parse::<MediaMigrationPhase>().is_err());
         }
     }
@@ -301,14 +298,7 @@ mod tests {
         let layouts = [
             (MediaMigrationPhase::LegacyOnly, false, true, false, true),
             (
-                MediaMigrationPhase::DualReadLegacyWrite,
-                true,
-                true,
-                false,
-                true,
-            ),
-            (
-                MediaMigrationPhase::DualReadDualWrite,
+                MediaMigrationPhase::DualReadAndWrite,
                 true,
                 true,
                 true,
