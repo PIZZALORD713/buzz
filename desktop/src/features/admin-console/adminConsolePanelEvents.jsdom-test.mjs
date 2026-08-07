@@ -379,7 +379,7 @@ test("detail-navigation: stale detail result is discarded after navigating away"
       communityHost: "relay.example.com",
       reportEventId: "aa",
       reporterPubkey: "bb",
-      targetKind: "message",
+      targetKind: "event",
       target: "cc",
       reportType: "spam",
       status: "open",
@@ -488,14 +488,24 @@ test("attachment-unmount: late blob URL is revoked and not committed after panel
   const pubkey = "a".repeat(64);
   const sha256 = "a".repeat(64);
 
-  const feedbackItem = {
+  const feedbackSummary = {
+    id: "00000000-0000-0000-0000-000000000011",
+    communityId: "00000000-0000-0000-0000-000000000022",
+    communityHost: "relay.example.com",
+    submitterPubkey: "submitterattach001",
+    category: null,
+    bodySummary: "Test feedback summary",
+    receivedAt: "2024-01-01T00:00:01Z",
+  };
+
+  const feedbackDetail = {
     id: "00000000-0000-0000-0000-000000000011",
     communityId: "00000000-0000-0000-0000-000000000022",
     communityHost: "relay.example.com",
     eventId: "attachtest001",
     submitterPubkey: "submitterattach001",
     category: null,
-    body: "Test feedback",
+    body: "Test feedback full body",
     tags: [
       [
         "imeta",
@@ -510,8 +520,10 @@ test("attachment-unmount: late blob URL is revoked and not committed after panel
   };
 
   setIpcHandler("admin_list_reports", () => Promise.resolve([]));
-  setIpcHandler("admin_list_feedback", () => Promise.resolve([feedbackItem]));
-  setIpcHandler("admin_get_feedback", () => Promise.resolve(feedbackItem));
+  setIpcHandler("admin_list_feedback", () =>
+    Promise.resolve([feedbackSummary]),
+  );
+  setIpcHandler("admin_get_feedback", () => Promise.resolve(feedbackDetail));
 
   const attachDeferred = deferred();
   const revokedUrls = [];
@@ -641,14 +653,24 @@ test("blob-leak-on-back-navigation: loadGenRef cleanup prevents orphaned blob UR
   const pubkey = "a".repeat(64);
   const sha256 = "a".repeat(64);
 
-  const feedbackItem = {
+  const feedbackSummary = {
+    id: "00000000-0000-0000-0000-000000000011",
+    communityId: "00000000-0000-0000-0000-000000000022",
+    communityHost: "relay.example.com",
+    submitterPubkey: "submitterblobtest001",
+    category: null,
+    bodySummary: "Test feedback summary",
+    receivedAt: "2024-01-01T00:00:01Z",
+  };
+
+  const feedbackDetail = {
     id: "00000000-0000-0000-0000-000000000011",
     communityId: "00000000-0000-0000-0000-000000000022",
     communityHost: "relay.example.com",
     eventId: "blobtest001",
     submitterPubkey: "submitterblobtest001",
     category: null,
-    body: "Test feedback",
+    body: "Test feedback full body",
     tags: [
       [
         "imeta",
@@ -663,8 +685,10 @@ test("blob-leak-on-back-navigation: loadGenRef cleanup prevents orphaned blob UR
   };
 
   setIpcHandler("admin_list_reports", () => Promise.resolve([]));
-  setIpcHandler("admin_list_feedback", () => Promise.resolve([feedbackItem]));
-  setIpcHandler("admin_get_feedback", () => Promise.resolve(feedbackItem));
+  setIpcHandler("admin_list_feedback", () =>
+    Promise.resolve([feedbackSummary]),
+  );
+  setIpcHandler("admin_get_feedback", () => Promise.resolve(feedbackDetail));
 
   const attachDeferred = deferred();
   const revokedUrls = [];
@@ -1014,7 +1038,7 @@ test("report-detail-renders-structured-fields: ReportDetail shows field layout, 
     communityHost: "relay.example.com",
     reportEventId: "aabb",
     reporterPubkey: "ccdd",
-    targetKind: "message",
+    targetKind: "event",
     target: "eeff",
     reportType: "spam",
     status: "open",
@@ -1116,23 +1140,36 @@ test("feedback-detail-renders-structured-fields: FeedbackDetail shows field layo
   const origin = "https://admin.example.com";
   const pubkey = "6".repeat(64);
 
-  // Full AdminFeedbackDto shape — contract-accurate field names.
-  const feedbackItem = {
+  // Summary shape returned by GET /admin/feedback (FeedbackSummary wire type).
+  const feedbackSummary = {
+    id: "00000000-0000-0000-0000-000000000011",
+    communityId: "00000000-0000-0000-0000-000000000022",
+    communityHost: "relay.example.com",
+    submitterPubkey: "submitter001pubkey",
+    category: "bug",
+    bodySummary: "App crashes on startup",
+    receivedAt: "2024-05-01T09:00:05Z",
+  };
+
+  // Full AdminFeedbackDto shape returned by GET /admin/feedback/:id.
+  const feedbackDetail = {
     id: "00000000-0000-0000-0000-000000000011",
     communityId: "00000000-0000-0000-0000-000000000022",
     communityHost: "relay.example.com",
     eventId: "feedevent001",
     submitterPubkey: "submitter001pubkey",
     category: "bug",
-    body: "App crashes on startup",
+    body: "App crashes on startup — full detail body text",
     tags: [],
     eventCreatedAt: "2024-05-01T09:00:00Z",
     receivedAt: "2024-05-01T09:00:05Z",
   };
 
   setIpcHandler("admin_list_reports", () => Promise.resolve([]));
-  setIpcHandler("admin_list_feedback", () => Promise.resolve([feedbackItem]));
-  setIpcHandler("admin_get_feedback", () => Promise.resolve(feedbackItem));
+  setIpcHandler("admin_list_feedback", () =>
+    Promise.resolve([feedbackSummary]),
+  );
+  setIpcHandler("admin_get_feedback", () => Promise.resolve(feedbackDetail));
 
   const { container, doRender, unmount } = mountPanel({ origin, pubkey });
   await doRender();
@@ -1149,6 +1186,15 @@ test("feedback-detail-renders-structured-fields: FeedbackDetail shows field layo
   });
 
   await settle(30);
+
+  // Pre-navigation: list row shows the summary body text (bodySummary rendered).
+  // Mutation seam: render `body` instead of `bodySummary` → red because summary
+  // fixture has no `body` field → row title is blank.
+  const listText = container.textContent ?? "";
+  assert.ok(
+    listText.includes("App crashes on startup"),
+    `list row must show bodySummary before navigation; got: ${listText.slice(0, 400)}`,
+  );
 
   // Navigate into the feedback detail — click the first non-tab button.
   const allButtons = container.querySelectorAll("button");
@@ -1200,6 +1246,13 @@ test("feedback-detail-renders-structured-fields: FeedbackDetail shows field layo
   assert.ok(
     !text.includes("authorPubkey"),
     `invented 'authorPubkey' field must not render; got: ${text.slice(0, 400)}`,
+  );
+
+  // Relative timestamp: formatTimestamp output must match "Xm/h/d ago (...)" shape.
+  // The fixture receivedAt is far in the past, so it will be "Nd ago (...)".
+  assert.ok(
+    /\d+[mhd] ago \(/.test(text) || text.includes("just now ("),
+    `relative timestamp must render in "Nm/h/d ago (...)" format; got: ${text.slice(0, 600)}`,
   );
 
   await unmount();
@@ -1301,7 +1354,7 @@ test("contract-dto-mutation-evidence-resolvedBy: wrong key lookup makes resolved
     communityHost: "relay.example.com",
     reportEventId: "rr01",
     reporterPubkey: "pp01",
-    targetKind: "message",
+    targetKind: "event",
     target: "tt01",
     reportType: "harassment",
     status: "resolved",
@@ -1361,7 +1414,8 @@ test("contract-dto-mutation-evidence-nested-message: removing message block hide
   // Mutation evidence (b): removing the nested message block from ReportFields
   // makes the reported message content invisible.
   //
-  // This test asserts the CORRECT behaviour: the nested message IS rendered.
+  // This test asserts the CORRECT behaviour: the nested message IS rendered,
+  // and the (deleted) indicator appears when deletedAt is non-null.
   // To produce the red output, remove the `{data.message != null && ...}` block.
 
   const origin = "https://admin.example.com";
@@ -1373,7 +1427,7 @@ test("contract-dto-mutation-evidence-nested-message: removing message block hide
     communityHost: "relay.example.com",
     reportEventId: "rr02",
     reporterPubkey: "pp02",
-    targetKind: "message",
+    targetKind: "event",
     target: "tt02",
     reportType: "spam",
     status: "open",
@@ -1391,7 +1445,8 @@ test("contract-dto-mutation-evidence-nested-message: removing message block hide
       authorPubkey: "msg_author_pubkey",
       content: "buy cheap meds at spamsite.example",
       createdAt: "2024-06-01T11:55:00Z",
-      deletedAt: null,
+      // Non-null deletedAt — exercises the deleted indicator branch.
+      deletedAt: "2024-06-01T12:10:00Z",
     },
   };
 
@@ -1430,6 +1485,12 @@ test("contract-dto-mutation-evidence-nested-message: removing message block hide
   assert.ok(
     text.includes("Reported message"),
     `"Reported message" heading must render; got: ${text.slice(0, 600)}`,
+  );
+  // Seam: asserting the deleted indicator renders when deletedAt is non-null.
+  // Mutation: remove the `{data.message.deletedAt != null && ...}` span → "(deleted)" absent → red.
+  assert.ok(
+    text.includes("(deleted)"),
+    `deleted indicator must render when deletedAt is non-null; got: ${text.slice(0, 600)}`,
   );
 
   await unmount();

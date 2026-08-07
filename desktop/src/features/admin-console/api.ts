@@ -134,6 +134,24 @@ export type AdminFeedbackDto = {
   receivedAt: string;
 };
 
+/**
+ * Feedback list row returned by the relay's `GET /admin/feedback` handler.
+ * Authoritative source: `buzz-relay/src/api/admin/mod.rs` `FeedbackSummary`.
+ *
+ * This is a separate, leaner shape from `AdminFeedbackDto` — the list
+ * endpoint summarises the body and omits event/tag detail fields that are
+ * only needed when viewing a single entry.
+ */
+export type AdminFeedbackSummaryDto = {
+  id: string;
+  communityId: string;
+  communityHost: string;
+  submitterPubkey: string;
+  category?: string | null;
+  bodySummary: string;
+  receivedAt: string;
+};
+
 // ── Data commands ─────────────────────────────────────────────────────────
 
 export type AdminReportsQuery = {
@@ -165,8 +183,10 @@ export async function getAdminReport(
 /** Fetch the deployment-wide product feedback list. */
 export async function listAdminFeedback(
   origin: string,
-): Promise<AdminFeedbackDto[]> {
-  return invokeTauri<AdminFeedbackDto[]>("admin_list_feedback", { origin });
+): Promise<AdminFeedbackSummaryDto[]> {
+  return invokeTauri<AdminFeedbackSummaryDto[]>("admin_list_feedback", {
+    origin,
+  });
 }
 
 /** Fetch a single feedback entry's detail (includes imeta attachment metadata). */

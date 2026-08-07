@@ -34,6 +34,7 @@ import {
   listAdminReports,
   type AdminAttachmentErrorCode,
   type AdminFeedbackDto,
+  type AdminFeedbackSummaryDto,
   type AdminReportDetailDto,
   type AdminReportDto,
 } from "./api";
@@ -127,7 +128,7 @@ function formatTimestamp(raw: string | null | undefined): string {
     minute: "2-digit",
   });
   const rel = formatRelativeTime(Math.floor(date.getTime() / 1000));
-  // Render relative label with the absolute value as a tooltip.
+  // Render relative label with the absolute value inline in parentheses.
   return `${rel} (${absolute})`;
 }
 
@@ -398,9 +399,9 @@ function FeedbackTab({
 
   return (
     <ul className="space-y-1">
-      {items.map((item: AdminFeedbackDto) => {
+      {items.map((item: AdminFeedbackSummaryDto) => {
         const id = item.id;
-        const text = String(item.body ?? "").slice(0, 120);
+        const text = item.bodySummary.slice(0, 120);
         const receivedAt = item.receivedAt;
         return (
           <li key={id}>
