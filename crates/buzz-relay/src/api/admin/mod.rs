@@ -3711,6 +3711,17 @@ mod tests {
             rec2.step_marker
         );
 
+        // Expire action2's lease so the production driver can re-acquire it.
+        // (In production this happens when the original worker's lease times out.)
+        sqlx::query(
+            "UPDATE relay_admin_actions SET action_lease_expires_at = $2, action_lease_token = NULL WHERE id = $1",
+        )
+        .bind(action_id2)
+        .bind(chrono::Utc::now() - chrono::Duration::seconds(300))
+        .execute(&pool)
+        .await
+        .expect("expire action2 lease");
+
         // Drive enforcement via production driver: AlreadyGone → enforcement failure.
         let result2 = crate::handlers::report_resolution::drive_enforcement_pub(
             &state,
