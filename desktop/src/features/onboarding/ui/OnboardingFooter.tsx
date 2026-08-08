@@ -2,6 +2,7 @@ import * as React from "react";
 import { createPortal } from "react-dom";
 
 import { cn } from "@/shared/lib/cn";
+import { Button } from "@/shared/ui/button";
 
 const OnboardingFooterTargetContext = React.createContext<HTMLElement | null>(
   null,
@@ -20,9 +21,18 @@ const OnboardingFooterTargetContext = React.createContext<HTMLElement | null>(
  * `--buzz-welcome-chartreuse` and the theme color tokens still resolve for the
  * docked buttons.
  */
+export type OnboardingBackAction = {
+  disabled?: boolean;
+  label?: string;
+  onClick: () => void;
+  testId?: string;
+};
+
 export function OnboardingFooterProvider({
+  backAction,
   children,
 }: {
+  backAction?: OnboardingBackAction;
   children: React.ReactNode;
 }) {
   const [target, setTarget] = React.useState<HTMLElement | null>(null);
@@ -38,6 +48,20 @@ export function OnboardingFooterProvider({
         aria-hidden
         className="pointer-events-none fixed inset-x-0 bottom-0 z-10 h-36 bg-[linear-gradient(to_top,var(--buzz-onboarding-shell-bottom)_35%,transparent)]"
       />
+      {backAction ? (
+        <div className="fixed bottom-5 left-6 z-20">
+          <Button
+            className="h-9 rounded-full bg-foreground/10 px-6 text-sm text-foreground hover:bg-foreground/15 hover:text-foreground"
+            data-testid={backAction.testId ?? "onboarding-back"}
+            disabled={backAction.disabled}
+            onClick={backAction.onClick}
+            type="button"
+            variant="ghost"
+          >
+            {backAction.label ?? "Back"}
+          </Button>
+        </div>
+      ) : null}
       <div
         className="pointer-events-none fixed inset-x-0 bottom-5 z-20 flex justify-center px-4"
         data-testid="onboarding-footer-slot"
