@@ -984,6 +984,21 @@ impl OperationRestoreRuntime {
         }))
     }
 
+    /// Replace the in-memory test fence with the scratch database's real
+    /// detached-session fence. This is reserved for integration tests that
+    /// must exercise operation-specific writers requiring a live fence
+    /// capability while retaining the deterministic in-memory restore store.
+    #[cfg(any(test, feature = "test-utils"))]
+    #[doc(hidden)]
+    pub fn with_database_fences_for_test(mut self, fence_pool: PgPool) -> Self {
+        let inner = Arc::get_mut(&mut self.0)
+            .expect("test restore runtime must not be cloned before fence configuration");
+        inner.fence_pool = fence_pool;
+        inner.fence_slots = Arc::new(Semaphore::new(1));
+        inner.test_fences = None;
+        self
+    }
+
     #[cfg(any(test, feature = "test-utils"))]
     #[doc(hidden)]
     pub fn force_unhealthy_for_test(&self) {
