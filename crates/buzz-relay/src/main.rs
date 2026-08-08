@@ -675,6 +675,7 @@ async fn main() -> anyhow::Result<()> {
                         &reaper_state,
                         channel_id,
                         serde_json::json!({ "type": "channel_auto_archived" }),
+                        chrono::Utc::now(),
                     )
                     .await
                     {

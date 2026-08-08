@@ -4300,10 +4300,11 @@ impl Db {
     }
 
     /// Atomically execute a ban mutation and commit the step marker.
-    /// Returns `true` if this driver committed the marker, `false` if already marked.
+    /// Returns `true` if this driver committed the marker, `false` if already marked or lease lost.
     pub async fn execute_ban_with_marker(
         &self,
         action_id: uuid::Uuid,
+        lease_token: uuid::Uuid,
         community_id: CommunityId,
         target_pubkey: &[u8],
         actor_pubkey: &[u8],
@@ -4312,6 +4313,7 @@ impl Db {
         relay_admin_actions::execute_ban_with_marker(
             &self.pool,
             action_id,
+            lease_token,
             community_id,
             target_pubkey,
             actor_pubkey,
@@ -4321,11 +4323,12 @@ impl Db {
     }
 
     /// Atomically execute a timeout mutation and commit the step marker.
-    /// Returns `true` if this driver committed the marker, `false` if already marked.
+    /// Returns `true` if this driver committed the marker, `false` if already marked or lease lost.
     #[allow(clippy::too_many_arguments)]
     pub async fn execute_timeout_with_marker(
         &self,
         action_id: uuid::Uuid,
+        lease_token: uuid::Uuid,
         community_id: CommunityId,
         target_pubkey: &[u8],
         actor_pubkey: &[u8],
@@ -4335,6 +4338,7 @@ impl Db {
         relay_admin_actions::execute_timeout_with_marker(
             &self.pool,
             action_id,
+            lease_token,
             community_id,
             target_pubkey,
             actor_pubkey,
@@ -4346,10 +4350,11 @@ impl Db {
 
     /// Atomically execute a kick mutation and commit the step marker.
     /// Returns `Removed` (member was present), `AlreadyGone` (absent before this action),
-    /// or `AlreadyMarked` (marker already committed by another driver).
+    /// or `AlreadyMarked` (marker already committed by another driver or lease lost).
     pub async fn execute_kick_with_marker(
         &self,
         action_id: uuid::Uuid,
+        lease_token: uuid::Uuid,
         community_id: CommunityId,
         channel_id: uuid::Uuid,
         target_pubkey: &[u8],
@@ -4358,6 +4363,7 @@ impl Db {
         relay_admin_actions::execute_kick_with_marker(
             &self.pool,
             action_id,
+            lease_token,
             community_id,
             channel_id,
             target_pubkey,
@@ -4367,10 +4373,11 @@ impl Db {
     }
 
     /// Atomically execute a soft-delete mutation and commit the step marker.
-    /// Returns `true` if this driver committed the marker, `false` if already marked.
+    /// Returns `true` if this driver committed the marker, `false` if already marked or lease lost.
     pub async fn execute_delete_with_marker(
         &self,
         action_id: uuid::Uuid,
+        lease_token: uuid::Uuid,
         community_id: CommunityId,
         target_event_id: &[u8],
         parent_event_id: Option<&[u8]>,
@@ -4379,6 +4386,7 @@ impl Db {
         relay_admin_actions::execute_delete_with_marker(
             &self.pool,
             action_id,
+            lease_token,
             community_id,
             target_event_id,
             parent_event_id,
@@ -4456,14 +4464,25 @@ impl Db {
             .await
     }
 
-    /// Mark an outbox record as delivered.
-    pub async fn mark_admin_outbox_delivered(&self, outbox_id: uuid::Uuid) -> Result<()> {
-        relay_admin_actions::mark_outbox_delivered(&self.pool, outbox_id).await
+    /// Mark an outbox record as delivered, fenced by the claim token.
+    /// Returns `true` if updated, `false` if ownership was already lost.
+    pub async fn mark_admin_outbox_delivered(
+        &self,
+        outbox_id: uuid::Uuid,
+        claim_token: uuid::Uuid,
+    ) -> Result<bool> {
+        relay_admin_actions::mark_outbox_delivered(&self.pool, outbox_id, claim_token).await
     }
 
-    /// Mark an outbox record as failed.
-    pub async fn fail_admin_outbox_row(&self, outbox_id: uuid::Uuid, error: &str) -> Result<()> {
-        relay_admin_actions::fail_outbox_row(&self.pool, outbox_id, error).await
+    /// Mark an outbox record as failed, fenced by the claim token.
+    /// Returns `true` if updated, `false` if ownership was already lost.
+    pub async fn fail_admin_outbox_row(
+        &self,
+        outbox_id: uuid::Uuid,
+        claim_token: uuid::Uuid,
+        error: &str,
+    ) -> Result<bool> {
+        relay_admin_actions::fail_outbox_row(&self.pool, outbox_id, claim_token, error).await
     }
 
     /// Claim a batch of pending outbox rows for the given worker pod.

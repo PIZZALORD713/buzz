@@ -355,6 +355,11 @@ async fn drive_enforcement(
     // Work on an owned copy so we can replace it when reloading.
     let mut rec = initial_record.clone();
     let action_id = rec.id;
+    // Maximum iterations while waiting for lease contention to resolve (HTTP path only).
+    // 30 × 100 ms = 3 s. Once exceeded, return a retryable error and let the recovery
+    // worker converge the action asynchronously.
+    let mut contention_attempts: u32 = 0;
+    const MAX_CONTENTION_ATTEMPTS: u32 = 30;
 
     loop {
         // Already finalized — idempotent success.
@@ -423,6 +428,16 @@ async fn drive_enforcement(
                     buzz_db::relay_admin_actions::LeaseResult::Acquired(token) => token,
                     buzz_db::relay_admin_actions::LeaseResult::Contended => {
                         // Another driver holds the lease. Wait briefly, reload, and loop.
+                        // Bounded: after MAX_CONTENTION_ATTEMPTS (≈3 s), return a retryable
+                        // error so the HTTP request is not held indefinitely. The recovery
+                        // worker will converge the action once the lease expires.
+                        contention_attempts += 1;
+                        if contention_attempts >= MAX_CONTENTION_ATTEMPTS {
+                            return Err(ResolutionError::Internal(format!(
+                                "action {action_id} lease contention unresolved after {contention_attempts} attempts; \
+                                 recovery worker will complete"
+                            )));
+                        }
                         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                         rec = state
                             .db
@@ -464,7 +479,7 @@ async fn drive_enforcement(
                 target_event_id,
                 channel_id,
             };
-            let mutation_result = run_atomic_mutation(state, action_id, &ctx).await;
+            let mutation_result = run_atomic_mutation(state, action_id, lease_token, &ctx).await;
 
             // Release lease regardless of outcome so the action worker
             // can pick up a failed action. Skip if we were given the lease
@@ -550,14 +565,15 @@ async fn drive_enforcement(
 }
 
 /// Execute the enforcement mutation AND commit `step_marker = 'mutation_committed'`
-/// in a single DB transaction, fenced by `action_id`.
+/// in a single DB transaction, fenced by `action_id` AND `lease_token`.
 ///
 /// Returns `Ok(true)` if this driver committed the marker (successful mutation),
-/// `Ok(false)` if the marker was already committed (another driver raced us),
-/// `Err` if the mutation itself failed.
+/// `Ok(false)` if the marker was already committed or the lease was lost (another
+/// driver raced us), `Err` if the mutation itself failed.
 async fn run_atomic_mutation(
     state: &Arc<AppState>,
     action_id: Uuid,
+    lease_token: Uuid,
     ctx: &EnforcementCtx<'_>,
 ) -> anyhow::Result<bool> {
     match ctx.action {
@@ -569,6 +585,7 @@ async fn run_atomic_mutation(
                 .db
                 .execute_ban_with_marker(
                     action_id,
+                    lease_token,
                     ctx.community_id,
                     target,
                     ctx.actor_pubkey,
@@ -588,6 +605,7 @@ async fn run_atomic_mutation(
                 .db
                 .execute_timeout_with_marker(
                     action_id,
+                    lease_token,
                     ctx.community_id,
                     target,
                     ctx.actor_pubkey,
@@ -606,7 +624,14 @@ async fn run_atomic_mutation(
                 .ok_or_else(|| anyhow::anyhow!("kick requires channel_id"))?;
             match state
                 .db
-                .execute_kick_with_marker(action_id, ctx.community_id, ch, target, ctx.actor_pubkey)
+                .execute_kick_with_marker(
+                    action_id,
+                    lease_token,
+                    ctx.community_id,
+                    ch,
+                    target,
+                    ctx.actor_pubkey,
+                )
                 .await
                 .map_err(|e| anyhow::anyhow!("kick failed: {e}"))?
             {
@@ -632,6 +657,7 @@ async fn run_atomic_mutation(
                 .db
                 .execute_delete_with_marker(
                     action_id,
+                    lease_token,
                     ctx.community_id,
                     target,
                     parent_id.as_deref(),

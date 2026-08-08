@@ -69,6 +69,12 @@ pub struct OutboxRecord {
     pub error_message: Option<String>,
     /// Number of delivery attempts made so far.
     pub attempt_count: i32,
+    /// Opaque claim token written at claim time. Required by `mark_outbox_delivered`
+    /// and `fail_outbox_row` to fence against stale workers.
+    pub claim_token: Uuid,
+    /// Row creation time. Used as `idempotency_ts` for system-message signing so
+    /// that retries produce the same Nostr event ID.
+    pub created_at: DateTime<Utc>,
 }
 
 /// Result of attempting to claim a report for HTTP enforcement.
@@ -410,25 +416,56 @@ pub async fn begin_enforcing(pool: &PgPool, action_id: Uuid) -> Result<bool> {
 }
 
 /// Atomically execute a ban mutation and commit the step marker in one
-/// transaction, fenced by `action_id`.
+/// transaction, fenced by `action_id` AND the caller's `lease_token`.
 ///
 /// Performs:
 /// 1. `UPSERT` into `community_bans` for the target pubkey.
 /// 2. `UPDATE relay_admin_actions SET step_marker = 'mutation_committed'` where
-///    `id = action_id AND state = 'enforcing' AND step_marker IS NULL`.
+///    `id = action_id AND action_lease_token = lease_token AND state = 'enforcing'
+///    AND step_marker IS NULL`.
+///
+/// The lease token is a real DB fence: if the caller's token no longer matches
+/// the row (because the lease expired and another pod reclaimed the action), the
+/// marker UPDATE affects zero rows and the transaction rolls back — the domain
+/// mutation never commits.
 ///
 /// Returns `true` if the step marker was successfully committed (i.e. this
 /// driver owns the action and the mutation landed). Returns `false` if the
-/// action was already marked (idempotent re-drive: caller skips to finalize).
+/// action was already marked or the lease was lost (idempotent re-drive or
+/// stale worker: caller must stop or reload).
 pub async fn execute_ban_with_marker(
     pool: &PgPool,
     action_id: Uuid,
+    lease_token: Uuid,
     community_id: CommunityId,
     target_pubkey: &[u8],
     actor_pubkey: &[u8],
     reason: Option<&str>,
 ) -> Result<bool> {
     let mut tx = pool.begin().await?;
+
+    // Verify lease ownership first — abort without touching domain rows if the
+    // lease is already gone. This prevents the commit entirely on a stale worker.
+    let owned: bool = sqlx::query_scalar(
+        r#"
+        SELECT EXISTS (
+            SELECT 1 FROM relay_admin_actions
+            WHERE id = $1
+              AND action_lease_token = $2
+              AND action_lease_expires_at > now()
+              AND state = 'enforcing'
+        )
+        "#,
+    )
+    .bind(action_id)
+    .bind(lease_token)
+    .fetch_one(&mut *tx)
+    .await?;
+
+    if !owned {
+        tx.rollback().await?;
+        return Ok(false);
+    }
 
     sqlx::query(
         r#"
@@ -450,22 +487,36 @@ pub async fn execute_ban_with_marker(
         r#"
         UPDATE relay_admin_actions
         SET step_marker = 'mutation_committed', updated_at = now()
-        WHERE id = $1 AND state = 'enforcing' AND step_marker IS NULL
+        WHERE id = $1
+          AND action_lease_token = $2
+          AND action_lease_expires_at > now()
+          AND state = 'enforcing'
+          AND step_marker IS NULL
         "#,
     )
     .bind(action_id)
+    .bind(lease_token)
     .execute(&mut *tx)
     .await?;
 
+    if marker.rows_affected() == 0 {
+        // Lease was lost between the ownership check and the UPDATE (race), or
+        // step_marker was already set by another driver. Roll back domain change.
+        tx.rollback().await?;
+        return Ok(false);
+    }
+
     tx.commit().await?;
-    Ok(marker.rows_affected() > 0)
+    Ok(true)
 }
 
 /// Atomically execute a timeout mutation and commit the step marker in one
-/// transaction, fenced by `action_id`.
+/// transaction, fenced by `action_id` AND the caller's `lease_token`.
+#[allow(clippy::too_many_arguments)]
 pub async fn execute_timeout_with_marker(
     pool: &PgPool,
     action_id: Uuid,
+    lease_token: Uuid,
     community_id: CommunityId,
     target_pubkey: &[u8],
     actor_pubkey: &[u8],
@@ -473,6 +524,27 @@ pub async fn execute_timeout_with_marker(
     reason: Option<&str>,
 ) -> Result<bool> {
     let mut tx = pool.begin().await?;
+
+    let owned: bool = sqlx::query_scalar(
+        r#"
+        SELECT EXISTS (
+            SELECT 1 FROM relay_admin_actions
+            WHERE id = $1
+              AND action_lease_token = $2
+              AND action_lease_expires_at > now()
+              AND state = 'enforcing'
+        )
+        "#,
+    )
+    .bind(action_id)
+    .bind(lease_token)
+    .fetch_one(&mut *tx)
+    .await?;
+
+    if !owned {
+        tx.rollback().await?;
+        return Ok(false);
+    }
 
     sqlx::query(
         r#"
@@ -497,15 +569,25 @@ pub async fn execute_timeout_with_marker(
         r#"
         UPDATE relay_admin_actions
         SET step_marker = 'mutation_committed', updated_at = now()
-        WHERE id = $1 AND state = 'enforcing' AND step_marker IS NULL
+        WHERE id = $1
+          AND action_lease_token = $2
+          AND action_lease_expires_at > now()
+          AND state = 'enforcing'
+          AND step_marker IS NULL
         "#,
     )
     .bind(action_id)
+    .bind(lease_token)
     .execute(&mut *tx)
     .await?;
 
+    if marker.rows_affected() == 0 {
+        tx.rollback().await?;
+        return Ok(false);
+    }
+
     tx.commit().await?;
-    Ok(marker.rows_affected() > 0)
+    Ok(true)
 }
 
 /// Result of the kick-with-marker atomic operation.
@@ -520,7 +602,7 @@ pub enum KickWithMarkerResult {
 }
 
 /// Atomically execute a kick mutation and commit the step marker in one
-/// transaction, fenced by `action_id`.
+/// transaction, fenced by `action_id` AND the caller's `lease_token`.
 ///
 /// The kick step marker is committed only if the member was present. If the
 /// member was already gone (`UPDATE … rows_affected = 0`), the step marker is
@@ -529,12 +611,36 @@ pub enum KickWithMarkerResult {
 pub async fn execute_kick_with_marker(
     pool: &PgPool,
     action_id: Uuid,
+    lease_token: Uuid,
     community_id: CommunityId,
     channel_id: Uuid,
     target_pubkey: &[u8],
     actor_pubkey: &[u8],
 ) -> Result<KickWithMarkerResult> {
     let mut tx = pool.begin().await?;
+
+    let owned: bool = sqlx::query_scalar(
+        r#"
+        SELECT EXISTS (
+            SELECT 1 FROM relay_admin_actions
+            WHERE id = $1
+              AND action_lease_token = $2
+              AND action_lease_expires_at > now()
+              AND state = 'enforcing'
+        )
+        "#,
+    )
+    .bind(action_id)
+    .bind(lease_token)
+    .fetch_one(&mut *tx)
+    .await?;
+
+    if !owned {
+        tx.rollback().await?;
+        // Return AlreadyMarked so callers follow the same "skip mutation, go to finalize"
+        // path as when another driver already committed the marker.
+        return Ok(KickWithMarkerResult::AlreadyMarked);
+    }
 
     let kick = sqlx::query(
         r#"
@@ -559,35 +665,64 @@ pub async fn execute_kick_with_marker(
         r#"
         UPDATE relay_admin_actions
         SET step_marker = 'mutation_committed', updated_at = now()
-        WHERE id = $1 AND state = 'enforcing' AND step_marker IS NULL
+        WHERE id = $1
+          AND action_lease_token = $2
+          AND action_lease_expires_at > now()
+          AND state = 'enforcing'
+          AND step_marker IS NULL
         "#,
     )
     .bind(action_id)
+    .bind(lease_token)
     .execute(&mut *tx)
     .await?;
 
-    tx.commit().await?;
-    if marker.rows_affected() > 0 {
-        Ok(KickWithMarkerResult::Removed)
-    } else {
-        Ok(KickWithMarkerResult::AlreadyMarked)
+    if marker.rows_affected() == 0 {
+        // Lease lost after kick but before marker commit — roll back the kick too.
+        tx.rollback().await?;
+        return Ok(KickWithMarkerResult::AlreadyMarked);
     }
+
+    tx.commit().await?;
+    Ok(KickWithMarkerResult::Removed)
 }
 
 /// Atomically execute a soft-delete mutation and commit the step marker in one
-/// transaction, fenced by `action_id`.
+/// transaction, fenced by `action_id` AND the caller's `lease_token`.
 ///
 /// The delete is idempotent: if the event is already deleted the marker is still
 /// committed (soft-delete is already-done = success).
 pub async fn execute_delete_with_marker(
     pool: &PgPool,
     action_id: Uuid,
+    lease_token: Uuid,
     community_id: CommunityId,
     target_event_id: &[u8],
     parent_event_id: Option<&[u8]>,
     _root_event_id: Option<&[u8]>,
 ) -> Result<bool> {
     let mut tx = pool.begin().await?;
+
+    let owned: bool = sqlx::query_scalar(
+        r#"
+        SELECT EXISTS (
+            SELECT 1 FROM relay_admin_actions
+            WHERE id = $1
+              AND action_lease_token = $2
+              AND action_lease_expires_at > now()
+              AND state = 'enforcing'
+        )
+        "#,
+    )
+    .bind(action_id)
+    .bind(lease_token)
+    .fetch_one(&mut *tx)
+    .await?;
+
+    if !owned {
+        tx.rollback().await?;
+        return Ok(false);
+    }
 
     // Soft-delete the event and update thread metadata (idempotent: already-deleted is a no-op).
     sqlx::query(
@@ -621,15 +756,25 @@ pub async fn execute_delete_with_marker(
         r#"
         UPDATE relay_admin_actions
         SET step_marker = 'mutation_committed', updated_at = now()
-        WHERE id = $1 AND state = 'enforcing' AND step_marker IS NULL
+        WHERE id = $1
+          AND action_lease_token = $2
+          AND action_lease_expires_at > now()
+          AND state = 'enforcing'
+          AND step_marker IS NULL
         "#,
     )
     .bind(action_id)
+    .bind(lease_token)
     .execute(&mut *tx)
     .await?;
 
+    if marker.rows_affected() == 0 {
+        tx.rollback().await?;
+        return Ok(false);
+    }
+
     tx.commit().await?;
-    Ok(marker.rows_affected() > 0)
+    Ok(true)
 }
 
 /// Commit the core mutation step and advance the step_marker to
@@ -930,123 +1075,154 @@ pub async fn enqueue_outbox(
     Ok(())
 }
 
-/// Mark an outbox record as delivered.
-pub async fn mark_outbox_delivered(pool: &PgPool, outbox_id: Uuid) -> Result<()> {
-    sqlx::query(
-        "UPDATE relay_admin_outbox SET state = 'delivered', updated_at = now() WHERE id = $1",
+/// Mark an outbox record as delivered, fenced by the claim token.
+///
+/// The update only succeeds if the caller still holds the claim token written
+/// at claim time. Returns `true` if the row was updated, `false` if ownership
+/// was already lost (lease expired and another worker reclaimed it).
+pub async fn mark_outbox_delivered(
+    pool: &PgPool,
+    outbox_id: Uuid,
+    claim_token: Uuid,
+) -> Result<bool> {
+    let result = sqlx::query(
+        r#"
+        UPDATE relay_admin_outbox
+        SET state = 'delivered', updated_at = now()
+        WHERE id = $1
+          AND outbox_claim_token = $2
+          AND state = 'pending'
+        "#,
     )
     .bind(outbox_id)
+    .bind(claim_token)
     .execute(pool)
     .await?;
-    Ok(())
+    Ok(result.rows_affected() > 0)
 }
 
 /// Maximum number of delivery attempts before an outbox row is permanently failed.
 pub const OUTBOX_MAX_ATTEMPTS: i32 = 5;
 
-/// Record a delivery failure for an outbox row.
+/// Record a delivery failure for an outbox row, fenced by the claim token.
 ///
-/// If `attempt_count < OUTBOX_MAX_ATTEMPTS`, the row remains `pending` with
-/// `retry_after` set to an exponential backoff. If the attempt limit is reached,
-/// the row is transitioned to terminal `failed` — retries are exhausted.
-pub async fn fail_outbox_row(pool: &PgPool, outbox_id: Uuid, error: &str) -> Result<()> {
-    // Fetch current attempt_count to decide retry vs. terminal.
-    let row = sqlx::query("SELECT attempt_count FROM relay_admin_outbox WHERE id = $1")
-        .bind(outbox_id)
-        .fetch_optional(pool)
-        .await?;
-
-    let attempt_count: i32 = row
-        .map(|r| r.try_get::<i32, _>("attempt_count").unwrap_or(0))
-        .unwrap_or(0);
-
-    let new_count = attempt_count + 1;
-
-    if new_count >= OUTBOX_MAX_ATTEMPTS {
-        // Terminal failure: retries exhausted.
-        sqlx::query(
-            r#"
-            UPDATE relay_admin_outbox
-            SET state = 'failed', attempt_count = $2, error_message = $3,
-                held_by = NULL, lease_expires_at = NULL, retry_after = NULL,
-                updated_at = now()
-            WHERE id = $1
-            "#,
-        )
-        .bind(outbox_id)
-        .bind(new_count)
-        .bind(error)
-        .execute(pool)
-        .await?;
-    } else {
-        // Retryable: exponential backoff (2^attempt_count seconds, max 300s).
-        let backoff_secs = (1i64 << attempt_count).min(300);
-        let retry_after = Utc::now() + chrono::Duration::seconds(backoff_secs);
-        sqlx::query(
-            r#"
-            UPDATE relay_admin_outbox
-            SET state = 'pending', attempt_count = $2, error_message = $3,
-                held_by = NULL, lease_expires_at = NULL, retry_after = $4,
-                updated_at = now()
-            WHERE id = $1
-            "#,
-        )
-        .bind(outbox_id)
-        .bind(new_count)
-        .bind(error)
-        .bind(retry_after)
-        .execute(pool)
-        .await?;
-    }
-    Ok(())
+/// Uses a single atomic `UPDATE … SET attempt_count = attempt_count + 1` — no
+/// read-then-write, so concurrent updates cannot lose an increment. If the
+/// incremented count reaches `OUTBOX_MAX_ATTEMPTS`, the row transitions to
+/// terminal `failed`; otherwise it stays `pending` with exponential backoff.
+///
+/// Returns `true` if the row was updated (ownership still held), `false` if
+/// the claim token no longer matches (ownership lost — stale worker must stop).
+pub async fn fail_outbox_row(
+    pool: &PgPool,
+    outbox_id: Uuid,
+    claim_token: Uuid,
+    error: &str,
+) -> Result<bool> {
+    // One statement: increment attempt_count and derive backoff/terminal state.
+    // The CASE expression mirrors the Rust logic that was previously read-then-write.
+    let result = sqlx::query(
+        r#"
+        UPDATE relay_admin_outbox
+        SET
+            attempt_count  = attempt_count + 1,
+            error_message  = $3,
+            state          = CASE WHEN attempt_count + 1 >= $4 THEN 'failed' ELSE 'pending' END,
+            retry_after    = CASE WHEN attempt_count + 1 >= $4 THEN NULL
+                                  ELSE now() + (LEAST(POWER(2, attempt_count), 300) * INTERVAL '1 second')
+                             END,
+            held_by        = NULL,
+            lease_expires_at = NULL,
+            outbox_claim_token = NULL,
+            updated_at     = now()
+        WHERE id = $1
+          AND outbox_claim_token = $2
+          AND state = 'pending'
+        "#,
+    )
+    .bind(outbox_id)
+    .bind(claim_token)
+    .bind(error)
+    .bind(OUTBOX_MAX_ATTEMPTS)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected() > 0)
 }
 
 /// Claim a batch of pending outbox rows using DB-level leases.
 ///
-/// Atomically sets `held_by` and `lease_expires_at` on up to `batch_size`
-/// rows whose lease is expired or unset AND whose `retry_after` is past (or null),
-/// returning them for processing.
+/// Atomically sets `held_by`, `lease_expires_at`, and a fresh `outbox_claim_token`
+/// on up to `batch_size` rows whose lease is expired or unset AND whose
+/// `retry_after` is past (or null), returning them for processing. The claim token
+/// is the fencing token required by `mark_outbox_delivered` and `fail_outbox_row`.
 pub async fn claim_pending_outbox_batch(
     pool: &PgPool,
     worker_id: &str,
     lease_until: DateTime<Utc>,
     batch_size: i64,
 ) -> Result<Vec<OutboxRecord>> {
-    // SELECT FOR UPDATE SKIP LOCKED gives each worker pod an exclusive
-    // row-level lock on exactly the rows it claims; rows held by another
-    // pod are skipped rather than waited on.
-    let rows = sqlx::query(
+    // Generate one fresh claim token per row via a VALUES list, same approach as
+    // claim_stranded_action_batch.  Step 1: find candidates (SKIP LOCKED).
+    let candidate_ids: Vec<Uuid> = sqlx::query_scalar(
         r#"
-        WITH candidates AS (
-            SELECT id FROM relay_admin_outbox
-            WHERE state = 'pending'
-              AND (lease_expires_at IS NULL OR lease_expires_at < now())
-              AND (retry_after IS NULL OR retry_after <= now())
-            ORDER BY retry_after NULLS FIRST, created_at ASC
-            LIMIT $3
-            FOR UPDATE SKIP LOCKED
-        )
-        UPDATE relay_admin_outbox o
-        SET held_by = $1, lease_expires_at = $2, updated_at = now()
-        FROM candidates
-        WHERE o.id = candidates.id
-        RETURNING o.id, o.action_id, o.task_type, o.payload, o.state,
-                  o.dedup_key, o.error_message, o.attempt_count
+        SELECT id FROM relay_admin_outbox
+        WHERE state = 'pending'
+          AND (lease_expires_at IS NULL OR lease_expires_at < now())
+          AND (retry_after IS NULL OR retry_after <= now())
+        ORDER BY retry_after NULLS FIRST, created_at ASC
+        LIMIT $1
+        FOR UPDATE SKIP LOCKED
         "#,
     )
-    .bind(worker_id)
-    .bind(lease_until)
     .bind(batch_size)
     .fetch_all(pool)
     .await?;
-    rows.into_iter().map(row_to_outbox).collect()
+
+    if candidate_ids.is_empty() {
+        return Ok(vec![]);
+    }
+
+    // Step 2: assign a unique token to each row via individual UPDATE statements.
+    // Dynamic SQL (format!-built VALUES list) is rejected by the SqlSafeStr trait,
+    // so we iterate. Each row is already SELECT-FOR-UPDATE locked from step 1;
+    // the per-row UPDATE WHERE clause re-verifies state to handle races.
+    let mut records = Vec::with_capacity(candidate_ids.len());
+    for id in candidate_ids {
+        let token = Uuid::new_v4();
+        let row = sqlx::query(
+            r#"
+            UPDATE relay_admin_outbox
+            SET held_by = $2, lease_expires_at = $3,
+                outbox_claim_token = $4, updated_at = now()
+            WHERE id = $1
+              AND state = 'pending'
+              AND (lease_expires_at IS NULL OR lease_expires_at < now())
+            RETURNING id, action_id, task_type, payload, state,
+                      dedup_key, error_message, attempt_count, created_at,
+                      outbox_claim_token
+            "#,
+        )
+        .bind(id)
+        .bind(worker_id)
+        .bind(lease_until)
+        .bind(token)
+        .fetch_optional(pool)
+        .await?;
+
+        if let Some(row) = row {
+            records.push(row_to_outbox_claimed(row)?);
+        }
+        // If the row was not found (race: another pod reclaimed between step 1 and 2),
+        // skip it — no claim issued for that row.
+    }
+    Ok(records)
 }
 
 /// Fetch pending outbox records for a given action.
 pub async fn list_pending_outbox(pool: &PgPool, action_id: Uuid) -> Result<Vec<OutboxRecord>> {
     let rows = sqlx::query(
         r#"
-        SELECT id, action_id, task_type, payload, state, dedup_key, error_message, attempt_count
+        SELECT id, action_id, task_type, payload, state, dedup_key, error_message, attempt_count, created_at
         FROM relay_admin_outbox
         WHERE action_id = $1 AND state = 'pending'
         ORDER BY created_at ASC
@@ -1061,50 +1237,72 @@ pub async fn list_pending_outbox(pool: &PgPool, action_id: Uuid) -> Result<Vec<O
 /// Claim a batch of stranded `relay_admin_actions` for the action recovery worker.
 ///
 /// Claims `state IN ('pending', 'enforcing')` rows whose action lease has expired
-/// or was never set. Returns records with the new lease token so the worker can
-/// verify ownership before mutating.
+/// or was never set. Each claimed row receives its own unique lease token so that
+/// per-row lease fencing in `execute_*_with_marker` works correctly: all batch
+/// items share the same expiry window, but each gets an independent token that
+/// cannot be reused across rows.
 pub async fn claim_stranded_action_batch(
     pool: &PgPool,
-    worker_id: &str,
+    _worker_id: &str,
     lease_until: DateTime<Utc>,
     batch_size: i64,
 ) -> Result<Vec<StrandedActionClaim>> {
-    let token = Uuid::new_v4();
-    let rows = sqlx::query(
+    // Step 1: find candidate IDs (SKIP LOCKED prevents double-claim across pods).
+    let candidate_ids: Vec<Uuid> = sqlx::query_scalar(
         r#"
-        WITH candidates AS (
-            SELECT id FROM relay_admin_actions
-            WHERE state IN ('pending', 'enforcing')
-              AND (action_lease_expires_at IS NULL OR action_lease_expires_at < now())
-            ORDER BY created_at ASC
-            LIMIT $4
-            FOR UPDATE SKIP LOCKED
-        )
-        UPDATE relay_admin_actions a
-        SET action_lease_token = $2, action_lease_expires_at = $3, updated_at = now()
-        FROM candidates
-        WHERE a.id = candidates.id
-        RETURNING a.id, a.report_id, a.report_community_id, a.request_id, a.actor_pubkey,
-                  a.actor_role, a.action, a.reason, a.timeout_until, a.state, a.step_marker,
-                  a.error_message, a.created_at, a.updated_at
+        SELECT id FROM relay_admin_actions
+        WHERE state IN ('pending', 'enforcing')
+          AND (action_lease_expires_at IS NULL OR action_lease_expires_at < now())
+        ORDER BY created_at ASC
+        LIMIT $1
+        FOR UPDATE SKIP LOCKED
         "#,
     )
-    .bind(worker_id)
-    .bind(token)
-    .bind(lease_until)
     .bind(batch_size)
     .fetch_all(pool)
     .await?;
 
-    rows.into_iter()
-        .map(|row| {
+    if candidate_ids.is_empty() {
+        return Ok(vec![]);
+    }
+
+    // Step 2: assign a unique token to each row via individual UPDATE statements.
+    // We cannot use a shared VALUES-list without dynamic SQL, so we iterate.
+    // Each row is already SELECT-FOR-UPDATE locked from step 1 (same connection
+    // is implicit in the pool transaction context — or we re-lock with FOR UPDATE
+    // in the UPDATE WHERE clause, which is safe).
+    let mut claims = Vec::with_capacity(candidate_ids.len());
+    for id in candidate_ids {
+        let token = Uuid::new_v4();
+        let row = sqlx::query(
+            r#"
+            UPDATE relay_admin_actions
+            SET action_lease_token = $2, action_lease_expires_at = $3, updated_at = now()
+            WHERE id = $1
+              AND state IN ('pending', 'enforcing')
+              AND (action_lease_expires_at IS NULL OR action_lease_expires_at < now())
+            RETURNING id, report_id, report_community_id, request_id, actor_pubkey,
+                      actor_role, action, reason, timeout_until, state, step_marker,
+                      error_message, created_at, updated_at
+            "#,
+        )
+        .bind(id)
+        .bind(token)
+        .bind(lease_until)
+        .fetch_optional(pool)
+        .await?;
+
+        if let Some(row) = row {
             let record = row_to_action(row)?;
-            Ok(StrandedActionClaim {
+            claims.push(StrandedActionClaim {
                 record,
                 lease_token: token,
-            })
-        })
-        .collect()
+            });
+        }
+        // If the row was not found (race: another pod reclaimed between step 1 and 2),
+        // skip it — no claim issued for that row.
+    }
+    Ok(claims)
 }
 
 /// New deployment-authority kick primitive: removes a member from a channel
@@ -1197,6 +1395,25 @@ fn row_to_outbox(row: sqlx::postgres::PgRow) -> Result<OutboxRecord> {
         dedup_key: row.try_get("dedup_key")?,
         error_message: row.try_get("error_message")?,
         attempt_count: row.try_get("attempt_count").unwrap_or(0),
+        // For non-claim queries (e.g. list_pending_outbox), there is no claim token.
+        claim_token: Uuid::nil(),
+        created_at: row.try_get("created_at").unwrap_or_else(|_| Utc::now()),
+    })
+}
+
+/// Decode a row returned by `claim_pending_outbox_batch` — includes the claim token.
+fn row_to_outbox_claimed(row: sqlx::postgres::PgRow) -> Result<OutboxRecord> {
+    Ok(OutboxRecord {
+        id: row.try_get("id")?,
+        action_id: row.try_get("action_id")?,
+        task_type: row.try_get("task_type")?,
+        payload: row.try_get("payload")?,
+        state: row.try_get("state")?,
+        dedup_key: row.try_get("dedup_key")?,
+        error_message: row.try_get("error_message")?,
+        attempt_count: row.try_get("attempt_count").unwrap_or(0),
+        claim_token: row.try_get("outbox_claim_token")?,
+        created_at: row.try_get("created_at").unwrap_or_else(|_| Utc::now()),
     })
 }
 
@@ -1719,10 +1936,21 @@ mod tests {
         let actork = actor();
         let cid = CommunityId::from_uuid(community_id);
 
-        // Execute ban + step_marker in one transaction.
-        let committed = execute_ban_with_marker(&pool, action_id, cid, &target, &actork, None)
+        // Acquire action lease (required by execute_ban_with_marker).
+        let lease_until = chrono::Utc::now() + chrono::Duration::seconds(60);
+        let lease_token = match acquire_action_lease(&pool, action_id, lease_until)
             .await
-            .expect("execute_ban_with_marker");
+            .expect("acquire_action_lease")
+        {
+            LeaseResult::Acquired(t) => t,
+            other => panic!("expected Acquired, got {other:?}"),
+        };
+
+        // Execute ban + step_marker in one transaction.
+        let committed =
+            execute_ban_with_marker(&pool, action_id, lease_token, cid, &target, &actork, None)
+                .await
+                .expect("execute_ban_with_marker");
         assert!(committed, "execute_ban_with_marker must return true");
 
         // step_marker must now be 'mutation_committed'.
@@ -1732,10 +1960,11 @@ mod tests {
             .expect("action exists");
         assert_eq!(rec.step_marker.as_deref(), Some("mutation_committed"));
 
-        // Re-execution must return false (idempotent: step_marker already set).
-        let second = execute_ban_with_marker(&pool, action_id, cid, &target, &actork, None)
-            .await
-            .expect("second execute_ban_with_marker");
+        // Re-execution with same token: step_marker already set → returns false (idempotent).
+        let second =
+            execute_ban_with_marker(&pool, action_id, lease_token, cid, &target, &actork, None)
+                .await
+                .expect("second execute_ban_with_marker");
         assert!(
             !second,
             "second execute_ban_with_marker must return false (already marked)"
@@ -1832,10 +2061,28 @@ mod tests {
             .await
             .expect("begin_enforcing");
 
-        // First kick: member is present → Removed + step_marker committed.
-        let r1 = execute_kick_with_marker(&pool, action_id, cid, channel_id, &target, &actork)
+        // Acquire action lease for action_id (required by execute_kick_with_marker).
+        let lease_until = chrono::Utc::now() + chrono::Duration::seconds(60);
+        let lease_token1 = match acquire_action_lease(&pool, action_id, lease_until)
             .await
-            .expect("first kick");
+            .expect("acquire lease1")
+        {
+            LeaseResult::Acquired(t) => t,
+            other => panic!("expected Acquired for action1, got {other:?}"),
+        };
+
+        // First kick: member is present → Removed + step_marker committed.
+        let r1 = execute_kick_with_marker(
+            &pool,
+            action_id,
+            lease_token1,
+            cid,
+            channel_id,
+            &target,
+            &actork,
+        )
+        .await
+        .expect("first kick");
         assert!(
             matches!(r1, KickWithMarkerResult::Removed),
             "first kick must be Removed"
@@ -1902,10 +2149,27 @@ mod tests {
             .await
             .expect("begin_enforcing2");
 
-        // Target already gone (removed by action 1) → AlreadyGone, step marker NOT committed.
-        let r2 = execute_kick_with_marker(&pool, action_id2, cid, channel_id, &target, &actork)
+        // Acquire action lease for action_id2.
+        let lease_token2 = match acquire_action_lease(&pool, action_id2, lease_until)
             .await
-            .expect("second kick");
+            .expect("acquire lease2")
+        {
+            LeaseResult::Acquired(t) => t,
+            other => panic!("expected Acquired for action2, got {other:?}"),
+        };
+
+        // Target already gone (removed by action 1) → AlreadyGone, step marker NOT committed.
+        let r2 = execute_kick_with_marker(
+            &pool,
+            action_id2,
+            lease_token2,
+            cid,
+            channel_id,
+            &target,
+            &actork,
+        )
+        .await
+        .expect("second kick");
         assert!(
             matches!(r2, KickWithMarkerResult::AlreadyGone),
             "kick of absent target must return AlreadyGone"

@@ -66,7 +66,10 @@ pub async fn run(state: Arc<AppState>) {
     }
 }
 
-async fn recover_one(state: &Arc<AppState>, claim: StrandedActionClaim) {
+/// Recover one stranded action from the batch claim.
+/// Made pub(crate) for integration tests — allows tests to call through
+/// the real production recovery path without the infinite worker loop.
+pub(crate) async fn recover_one(state: &Arc<AppState>, claim: StrandedActionClaim) {
     let rec = &claim.record;
     let action_id = rec.id;
 

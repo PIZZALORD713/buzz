@@ -364,7 +364,11 @@ async fn handle_untimeout(
 
 // ── 9044: resolve report ─────────────────────────────────────────────────────
 
-async fn handle_resolve(
+/// Re-drive a 9044 resolve command through the atomic decision helper.
+/// Made `pub(crate)` for integration tests — allows tests to call through the
+/// real `handle_resolve → resolve_report_decision_only` path without all the
+/// NIP-42/freshness boilerplate that `handle_moderation_command` adds.
+pub(crate) async fn handle_resolve(
     tenant: &TenantContext,
     state: &Arc<AppState>,
     event: &Event,

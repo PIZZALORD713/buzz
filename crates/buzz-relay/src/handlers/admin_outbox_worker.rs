@@ -65,7 +65,9 @@ pub async fn run(state: Arc<AppState>) {
     }
 }
 
-async fn deliver_one(state: &Arc<AppState>, row: &OutboxRecord) {
+/// Attempt to deliver one outbox row and update its state.
+/// Made pub(crate) for integration tests.
+pub(crate) async fn deliver_one(state: &Arc<AppState>, row: &OutboxRecord) {
     let result = match row.task_type.as_str() {
         "tombstone" => deliver_tombstone(state, row).await,
         "system_message" => deliver_system_message(state, row).await,
@@ -75,15 +77,31 @@ async fn deliver_one(state: &Arc<AppState>, row: &OutboxRecord) {
 
     match result {
         Ok(()) => {
-            if let Err(e) = state.db.mark_admin_outbox_delivered(row.id).await {
-                warn!(outbox_id = %row.id, "mark_delivered failed: {e}");
-            } else {
-                info!(
-                    outbox_id = %row.id,
-                    action_id = %row.action_id,
-                    task_type = %row.task_type,
-                    "Outbox row delivered"
-                );
+            match state
+                .db
+                .mark_admin_outbox_delivered(row.id, row.claim_token)
+                .await
+            {
+                Ok(true) => {
+                    info!(
+                        outbox_id = %row.id,
+                        action_id = %row.action_id,
+                        task_type = %row.task_type,
+                        "Outbox row delivered"
+                    );
+                }
+                Ok(false) => {
+                    // Ownership was lost before we could mark delivered (lease expired,
+                    // another worker reclaimed and may have already completed this row).
+                    // Stop processing — the row is in safe hands.
+                    warn!(
+                        outbox_id = %row.id,
+                        "Outbox mark_delivered: ownership lost (stale worker), stopping"
+                    );
+                }
+                Err(e) => {
+                    warn!(outbox_id = %row.id, "mark_delivered failed: {e}");
+                }
             }
         }
         Err(e) => {
@@ -94,8 +112,20 @@ async fn deliver_one(state: &Arc<AppState>, row: &OutboxRecord) {
                 error = %e,
                 "Outbox delivery failed"
             );
-            if let Err(db_err) = state.db.fail_admin_outbox_row(row.id, &e).await {
-                error!(outbox_id = %row.id, "fail_outbox_row DB call failed: {db_err}");
+            match state
+                .db
+                .fail_admin_outbox_row(row.id, row.claim_token, &e)
+                .await
+            {
+                Ok(true) => {}
+                Ok(false) => {
+                    // Ownership lost — another worker holds this row now. Don't
+                    // double-record the failure.
+                    warn!(outbox_id = %row.id, "fail_outbox_row: ownership lost (stale worker)");
+                }
+                Err(db_err) => {
+                    error!(outbox_id = %row.id, "fail_outbox_row DB call failed: {db_err}");
+                }
             }
         }
     }
@@ -144,6 +174,7 @@ async fn deliver_tombstone(state: &Arc<AppState>, row: &OutboxRecord) -> Result<
             "type": "admin_delete",
             "action_id": row.action_id.to_string(),
         }),
+        row.created_at,
     )
     .await
     .map_err(|e| format!("tombstone: system message failed: {e}"))
@@ -178,6 +209,7 @@ async fn deliver_system_message(state: &Arc<AppState>, row: &OutboxRecord) -> Re
             "target": target_hex,
             "action_id": row.action_id.to_string(),
         }),
+        row.created_at,
     )
     .await
     .map_err(|e| format!("system_message: failed: {e}"))
