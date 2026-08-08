@@ -3,6 +3,7 @@
 use std::net::SocketAddr;
 use std::time::Duration;
 
+use buzz_auth::AuthorizationEventCapacityPolicy;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tracing::warn;
@@ -101,6 +102,8 @@ pub struct CorporateIdentityConfig {
     pub public_display_claim: Option<String>,
     /// Optional claim name carrying a hex pubkey or `npub1...`.
     pub npub_claim: Option<String>,
+    /// Explicit immutable authorization-event capacity for enabled identity.
+    pub event_capacity: Option<AuthorizationEventCapacityPolicy>,
 }
 
 impl Default for CorporateIdentityConfig {
@@ -117,6 +120,7 @@ impl Default for CorporateIdentityConfig {
             display_claim: DEFAULT_CORPORATE_IDENTITY_DISPLAY_CLAIM.to_string(),
             public_display_claim: None,
             npub_claim: None,
+            event_capacity: None,
         }
     }
 }
@@ -540,6 +544,28 @@ fn parse_corporate_bool(name: &str, default: bool) -> Result<bool, ConfigError> 
     }
 }
 
+fn parse_positive_decimal_u64(name: &str, value: &str) -> Result<u64, ConfigError> {
+    if !value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(ConfigError::InvalidValue(format!(
+            "{name} must be a positive base-10 integer"
+        )));
+    }
+    value
+        .parse::<u64>()
+        .ok()
+        .filter(|value| *value > 0)
+        .ok_or_else(|| {
+            ConfigError::InvalidValue(format!("{name} must be a positive base-10 integer"))
+        })
+}
+
+fn parse_positive_decimal_u32(name: &str, value: &str) -> Result<u32, ConfigError> {
+    let value = parse_positive_decimal_u64(name, value)?;
+    u32::try_from(value).map_err(|_| {
+        ConfigError::InvalidValue(format!("{name} exceeds the supported integer range"))
+    })
+}
+
 fn load_corporate_identity_config() -> Result<CorporateIdentityConfig, ConfigError> {
     let mut config = CorporateIdentityConfig::default();
     config.require = parse_corporate_bool("BUZZ_REQUIRE_CORPORATE_IDENTITY", config.require)?;
@@ -573,6 +599,70 @@ fn load_corporate_identity_config() -> Result<CorporateIdentityConfig, ConfigErr
     config.public_display_claim =
         corporate_env_trimmed("BUZZ_CORPORATE_IDENTITY_PUBLIC_DISPLAY_CLAIM")?;
     config.npub_claim = corporate_env_trimmed("BUZZ_CORPORATE_IDENTITY_NPUB_CLAIM")?;
+    let capacity_values = [
+        (
+            "BUZZ_AUTHORIZATION_EVENT_MAX_EVENTS_PER_DOMAIN",
+            corporate_env_trimmed("BUZZ_AUTHORIZATION_EVENT_MAX_EVENTS_PER_DOMAIN")?,
+        ),
+        (
+            "BUZZ_AUTHORIZATION_EVENT_MAX_BYTES_PER_DOMAIN",
+            corporate_env_trimmed("BUZZ_AUTHORIZATION_EVENT_MAX_BYTES_PER_DOMAIN")?,
+        ),
+        (
+            "BUZZ_AUTHORIZATION_EVENT_MAX_ENVELOPE_BYTES",
+            corporate_env_trimmed("BUZZ_AUTHORIZATION_EVENT_MAX_ENVELOPE_BYTES")?,
+        ),
+    ];
+
+    if !config.require {
+        if capacity_values.iter().any(|(_, value)| value.is_some()) {
+            return Err(ConfigError::InvalidValue(
+                "authorization event capacity must be absent when corporate identity is disabled"
+                    .to_owned(),
+            ));
+        }
+    } else {
+        let missing_capacity: Vec<&str> = capacity_values
+            .iter()
+            .filter_map(|(name, value)| value.is_none().then_some(*name))
+            .collect();
+        if !missing_capacity.is_empty() {
+            return Err(ConfigError::InvalidValue(format!(
+                "BUZZ_REQUIRE_CORPORATE_IDENTITY=true but required authorization event capacity is missing: {}",
+                missing_capacity.join(", ")
+            )));
+        }
+        let max_events = parse_positive_decimal_u64(
+            capacity_values[0].0,
+            capacity_values[0]
+                .1
+                .as_deref()
+                .expect("capacity presence checked"),
+        )?;
+        let max_bytes = parse_positive_decimal_u64(
+            capacity_values[1].0,
+            capacity_values[1]
+                .1
+                .as_deref()
+                .expect("capacity presence checked"),
+        )?;
+        let max_envelope = parse_positive_decimal_u32(
+            capacity_values[2].0,
+            capacity_values[2]
+                .1
+                .as_deref()
+                .expect("capacity presence checked"),
+        )?;
+        config.event_capacity = Some(
+            AuthorizationEventCapacityPolicy::new(max_events, max_bytes, max_envelope).map_err(
+                |error| {
+                    ConfigError::InvalidValue(format!(
+                        "invalid corporate identity authorization event capacity: {error}"
+                    ))
+                },
+            )?,
+        );
+    }
 
     if config.require {
         let mut missing = Vec::new();
@@ -1260,9 +1350,34 @@ mod tests {
             "BUZZ_CORPORATE_IDENTITY_DISPLAY_CLAIM",
             "BUZZ_CORPORATE_IDENTITY_PUBLIC_DISPLAY_CLAIM",
             "BUZZ_CORPORATE_IDENTITY_NPUB_CLAIM",
+            "BUZZ_AUTHORIZATION_EVENT_MAX_EVENTS_PER_DOMAIN",
+            "BUZZ_AUTHORIZATION_EVENT_MAX_BYTES_PER_DOMAIN",
+            "BUZZ_AUTHORIZATION_EVENT_MAX_ENVELOPE_BYTES",
         ] {
             std::env::remove_var(name);
         }
+    }
+
+    fn set_required_corporate_identity_env() {
+        std::env::set_var("BUZZ_REQUIRE_CORPORATE_IDENTITY", "true");
+        std::env::set_var(
+            "BUZZ_CORPORATE_IDENTITY_JWKS_URI",
+            "https://idp.example/.well-known/jwks.json",
+        );
+        std::env::set_var("BUZZ_CORPORATE_IDENTITY_ISSUER", "https://idp.example");
+        std::env::set_var("BUZZ_CORPORATE_IDENTITY_AUDIENCE", "buzz-relay");
+    }
+
+    fn set_valid_corporate_identity_capacity_env() {
+        std::env::set_var("BUZZ_AUTHORIZATION_EVENT_MAX_EVENTS_PER_DOMAIN", "10000");
+        std::env::set_var(
+            "BUZZ_AUTHORIZATION_EVENT_MAX_BYTES_PER_DOMAIN",
+            (16 * 1024 * 1024).to_string(),
+        );
+        std::env::set_var(
+            "BUZZ_AUTHORIZATION_EVENT_MAX_ENVELOPE_BYTES",
+            (16 * 1024).to_string(),
+        );
     }
 
     /// Look up against a fixed set, standing in for process env.
@@ -1390,6 +1505,10 @@ mod tests {
             config.corporate_identity.public_display_claim.is_none(),
             "public corporate identity projection must be opt-in"
         );
+        assert!(
+            config.corporate_identity.event_capacity.is_none(),
+            "disabled identity must not invent authorization event capacity"
+        );
     }
 
     #[test]
@@ -1397,27 +1516,21 @@ mod tests {
         let _guard = ENV_MUTEX.lock().unwrap();
         clear_corporate_identity_env();
         std::env::set_var("BUZZ_REQUIRE_CORPORATE_IDENTITY", "true");
+        set_valid_corporate_identity_capacity_env();
 
         let err = Config::from_env().expect_err("incomplete corporate identity config");
         let msg = err.to_string();
         clear_corporate_identity_env();
 
         assert!(msg.contains("BUZZ_CORPORATE_IDENTITY_JWKS_URI"));
-        assert!(msg.contains("BUZZ_CORPORATE_IDENTITY_ISSUER"));
-        assert!(msg.contains("BUZZ_CORPORATE_IDENTITY_AUDIENCE"));
     }
 
     #[test]
     fn corporate_identity_config_can_be_enabled() {
         let _guard = ENV_MUTEX.lock().unwrap();
         clear_corporate_identity_env();
-        std::env::set_var("BUZZ_REQUIRE_CORPORATE_IDENTITY", "true");
-        std::env::set_var(
-            "BUZZ_CORPORATE_IDENTITY_JWKS_URI",
-            "https://idp.example/.well-known/jwks.json",
-        );
-        std::env::set_var("BUZZ_CORPORATE_IDENTITY_ISSUER", "https://idp.example");
-        std::env::set_var("BUZZ_CORPORATE_IDENTITY_AUDIENCE", "buzz-relay");
+        set_required_corporate_identity_env();
+        set_valid_corporate_identity_capacity_env();
         std::env::set_var("BUZZ_CORPORATE_IDENTITY_UID_CLAIM", "employee_id");
         std::env::set_var("BUZZ_CORPORATE_IDENTITY_DISPLAY_CLAIM", "email");
         std::env::set_var("BUZZ_CORPORATE_IDENTITY_NPUB_CLAIM", "buzz_npub");
@@ -1436,6 +1549,129 @@ mod tests {
             config.corporate_identity.auth_precedence,
             CorporateIdentityAuthPrecedence::Delegated
         );
+        assert_eq!(
+            config.corporate_identity.event_capacity,
+            Some(
+                AuthorizationEventCapacityPolicy::new(10_000, 16 * 1024 * 1024, 16 * 1024)
+                    .expect("fixture capacity")
+            )
+        );
+    }
+
+    #[test]
+    fn corporate_identity_rejects_capacity_when_disabled_or_partial() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        for name in [
+            "BUZZ_AUTHORIZATION_EVENT_MAX_EVENTS_PER_DOMAIN",
+            "BUZZ_AUTHORIZATION_EVENT_MAX_BYTES_PER_DOMAIN",
+            "BUZZ_AUTHORIZATION_EVENT_MAX_ENVELOPE_BYTES",
+        ] {
+            clear_corporate_identity_env();
+            std::env::set_var(name, "1");
+            let error = Config::from_env().expect_err("disabled capacity must be absent");
+            assert!(error.to_string().contains("must be absent"));
+        }
+
+        clear_corporate_identity_env();
+        set_required_corporate_identity_env();
+        std::env::set_var("BUZZ_AUTHORIZATION_EVENT_MAX_EVENTS_PER_DOMAIN", "10000");
+        let error = Config::from_env().expect_err("enabled capacity triple must be complete");
+        assert!(error
+            .to_string()
+            .contains("BUZZ_AUTHORIZATION_EVENT_MAX_BYTES_PER_DOMAIN"));
+        assert!(error
+            .to_string()
+            .contains("BUZZ_AUTHORIZATION_EVENT_MAX_ENVELOPE_BYTES"));
+        clear_corporate_identity_env();
+    }
+
+    #[test]
+    fn corporate_identity_capacity_requires_strict_positive_decimals() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        let fields = [
+            (
+                "BUZZ_AUTHORIZATION_EVENT_MAX_EVENTS_PER_DOMAIN",
+                "18446744073709551616",
+            ),
+            (
+                "BUZZ_AUTHORIZATION_EVENT_MAX_BYTES_PER_DOMAIN",
+                "18446744073709551616",
+            ),
+            ("BUZZ_AUTHORIZATION_EVENT_MAX_ENVELOPE_BYTES", "4294967296"),
+        ];
+        for (name, overflow) in fields {
+            for value in ["0", "+1", "abc", "1.5", "-1", overflow] {
+                clear_corporate_identity_env();
+                set_required_corporate_identity_env();
+                set_valid_corporate_identity_capacity_env();
+                std::env::set_var(name, value);
+                let error = Config::from_env().expect_err("invalid capacity must fail closed");
+                assert!(error.to_string().contains(name), "{name}: {error}");
+            }
+        }
+        clear_corporate_identity_env();
+    }
+
+    #[test]
+    fn corporate_identity_capacity_accepts_explicit_ceiling_and_rejects_plus_one() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        clear_corporate_identity_env();
+        set_required_corporate_identity_env();
+        std::env::set_var(
+            "BUZZ_AUTHORIZATION_EVENT_MAX_EVENTS_PER_DOMAIN",
+            buzz_auth::HARD_MAX_AUTHORIZATION_EVENTS_PER_DOMAIN.to_string(),
+        );
+        std::env::set_var(
+            "BUZZ_AUTHORIZATION_EVENT_MAX_BYTES_PER_DOMAIN",
+            buzz_auth::HARD_MAX_AUTHORIZATION_EVENT_BYTES_PER_DOMAIN.to_string(),
+        );
+        std::env::set_var(
+            "BUZZ_AUTHORIZATION_EVENT_MAX_ENVELOPE_BYTES",
+            buzz_auth::HARD_MAX_AUTHORIZATION_EVENT_ENVELOPE_BYTES.to_string(),
+        );
+        let exact = Config::from_env().expect("explicit hard ceilings are accepted");
+        assert_eq!(
+            exact.corporate_identity.event_capacity,
+            Some(
+                AuthorizationEventCapacityPolicy::new(
+                    buzz_auth::HARD_MAX_AUTHORIZATION_EVENTS_PER_DOMAIN,
+                    buzz_auth::HARD_MAX_AUTHORIZATION_EVENT_BYTES_PER_DOMAIN,
+                    buzz_auth::HARD_MAX_AUTHORIZATION_EVENT_ENVELOPE_BYTES,
+                )
+                .expect("hard ceilings")
+            )
+        );
+
+        for (name, value) in [
+            (
+                "BUZZ_AUTHORIZATION_EVENT_MAX_EVENTS_PER_DOMAIN",
+                (buzz_auth::HARD_MAX_AUTHORIZATION_EVENTS_PER_DOMAIN + 1).to_string(),
+            ),
+            (
+                "BUZZ_AUTHORIZATION_EVENT_MAX_BYTES_PER_DOMAIN",
+                (buzz_auth::HARD_MAX_AUTHORIZATION_EVENT_BYTES_PER_DOMAIN + 1).to_string(),
+            ),
+            (
+                "BUZZ_AUTHORIZATION_EVENT_MAX_ENVELOPE_BYTES",
+                (buzz_auth::HARD_MAX_AUTHORIZATION_EVENT_ENVELOPE_BYTES + 1).to_string(),
+            ),
+        ] {
+            clear_corporate_identity_env();
+            set_required_corporate_identity_env();
+            set_valid_corporate_identity_capacity_env();
+            std::env::set_var(name, value);
+            let error = Config::from_env().expect_err("capacity above ceiling must fail");
+            assert!(error.to_string().contains("authorization event capacity"));
+        }
+
+        clear_corporate_identity_env();
+        set_required_corporate_identity_env();
+        std::env::set_var("BUZZ_AUTHORIZATION_EVENT_MAX_EVENTS_PER_DOMAIN", "100");
+        std::env::set_var("BUZZ_AUTHORIZATION_EVENT_MAX_BYTES_PER_DOMAIN", "100");
+        std::env::set_var("BUZZ_AUTHORIZATION_EVENT_MAX_ENVELOPE_BYTES", "101");
+        let error = Config::from_env().expect_err("envelope cannot exceed domain bytes");
+        assert!(error.to_string().contains("authorization event capacity"));
+        clear_corporate_identity_env();
     }
 
     #[test]
@@ -1548,13 +1784,12 @@ mod tests {
     fn corporate_identity_requires_https_jwks_uri() {
         let _guard = ENV_MUTEX.lock().unwrap();
         clear_corporate_identity_env();
-        std::env::set_var("BUZZ_REQUIRE_CORPORATE_IDENTITY", "true");
+        set_required_corporate_identity_env();
+        set_valid_corporate_identity_capacity_env();
         std::env::set_var(
             "BUZZ_CORPORATE_IDENTITY_JWKS_URI",
             "http://idp.example/.well-known/jwks.json",
         );
-        std::env::set_var("BUZZ_CORPORATE_IDENTITY_ISSUER", "https://idp.example");
-        std::env::set_var("BUZZ_CORPORATE_IDENTITY_AUDIENCE", "buzz-relay");
 
         let error = Config::from_env().expect_err("insecure JWKS URL must fail");
         clear_corporate_identity_env();

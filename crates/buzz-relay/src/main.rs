@@ -197,6 +197,24 @@ async fn main() -> anyhow::Result<()> {
         info!("Skipping database migrations because BUZZ_AUTO_MIGRATE is not enabled");
     }
 
+    let prepared_corporate_identity =
+        buzz_relay::corporate_identity::prepare_service_from_config(&config.corporate_identity)
+            .await
+            .map_err(|error| anyhow::anyhow!("Corporate identity preparation failed: {error}"))?;
+    let identity_configuration = prepared_corporate_identity
+        .as_ref()
+        .map(|prepared| prepared.identity_configuration());
+    if let Some(configuration) = identity_configuration {
+        db.preflight_attested_identity_configuration(
+            configuration.policy_digest(),
+            configuration.event_capacity(),
+        )
+        .await
+        .map_err(|error| {
+            anyhow::anyhow!("Corporate identity database preflight failed: {error}")
+        })?;
+    }
+
     if let Err(e) = db.ensure_future_partitions(3).await {
         error!("Failed to ensure partitions: {e}");
     }
@@ -271,7 +289,14 @@ async fn main() -> anyhow::Result<()> {
             );
             None
         } else {
-            match db.ensure_configured_community(&host).await {
+            match db
+                .ensure_configured_community_with_attested_identity(
+                    &host,
+                    config.relay_owner_pubkey.as_deref(),
+                    identity_configuration,
+                )
+                .await
+            {
                 Ok(record) => {
                     info!(host = %record.host, community = %record.id, "Deployment community ensured");
                     Some(record.id)
@@ -447,13 +472,14 @@ async fn main() -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("failed to initialize media storage: {e}"))?;
     info!("Media storage connected");
 
-    let (app_state, audit_shutdown) = AppState::new(
+    let (app_state, audit_shutdown) = AppState::new_with_corporate_identity(
         config.clone(),
         db,
         redis_health_pool,
         audit,
         pubsub,
         auth,
+        prepared_corporate_identity.map(|prepared| prepared.into_service()),
         search,
         Arc::clone(&workflow_engine),
         relay_keypair,

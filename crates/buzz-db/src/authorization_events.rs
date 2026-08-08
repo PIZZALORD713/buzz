@@ -141,7 +141,7 @@ pub(crate) async fn event_capacity_is_configured_tx(
 ) -> Result<bool> {
     let configured: Option<bool> = sqlx::query_scalar(
         "SELECT TRUE FROM authorization_event_capacity \
-         WHERE community_id=$1 AND configuration_state=2 AND health_state=1 FOR SHARE",
+         WHERE community_id=$1 AND configuration_state=2 AND health_state=1",
     )
     .bind(community_id.as_uuid())
     .fetch_optional(&mut **transaction)

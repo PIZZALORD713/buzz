@@ -723,11 +723,8 @@ pub struct AppState {
 }
 
 impl AppState {
-    /// Constructs `AppState` from its component services.
-    ///
-    /// Returns `(state, audit_shutdown)`. The caller should call
-    /// `audit_shutdown.drain().await` during graceful shutdown so queued
-    /// audit entries are flushed before the process exits.
+    /// Construct test state with corporate identity deliberately uninstalled.
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         config: Config,
@@ -741,11 +738,43 @@ impl AppState {
         relay_keypair: nostr::Keys,
         media_storage: MediaStorage,
     ) -> (Self, AuditShutdownHandle) {
+        Self::new_with_corporate_identity(
+            config,
+            db,
+            redis_pool,
+            audit,
+            pubsub,
+            auth,
+            None,
+            search,
+            workflow_engine,
+            relay_keypair,
+            media_storage,
+        )
+    }
+
+    /// Constructs `AppState` from its component services.
+    ///
+    /// Returns `(state, audit_shutdown)`. The caller should call
+    /// `audit_shutdown.drain().await` during graceful shutdown so queued
+    /// audit entries are flushed before the process exits.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_corporate_identity(
+        config: Config,
+        db: Db,
+        redis_pool: deadpool_redis::Pool,
+        audit: impl Into<Option<AuditService>>,
+        pubsub: Arc<PubSubManager>,
+        auth: AuthService,
+        corporate_identity: Option<Arc<CorporateIdentityService>>,
+        search: SearchService,
+        workflow_engine: Arc<WorkflowEngine>,
+        relay_keypair: nostr::Keys,
+        media_storage: MediaStorage,
+    ) -> (Self, AuditShutdownHandle) {
         let max_connections = config.max_connections;
         let max_concurrent_handlers = config.max_concurrent_handlers;
         let search_arc = Arc::new(search);
-        let corporate_identity =
-            crate::corporate_identity::service_from_config(&config.corporate_identity);
 
         let audit_arc = audit.into().map(Arc::new);
         let (audit_tx, mut audit_rx) = mpsc::channel::<buzz_audit::NewAuditEntry>(1000);

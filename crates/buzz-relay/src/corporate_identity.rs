@@ -32,6 +32,7 @@ use buzz_db::event::EventQuery;
 use buzz_db::identity_lifecycle::{
     VerifiedIdentityBindingDenial, VerifiedIdentityBindingHandle, VerifiedIdentityBindingOutcome,
 };
+use buzz_db::AttestedIdentityConfiguration;
 
 use crate::config::{CorporateIdentityAuthPrecedence, CorporateIdentityConfig};
 use crate::state::AppState;
@@ -87,11 +88,11 @@ pub struct CorporateIdentityService {
     http: Result<reqwest::Client, String>,
     jwks: RwLock<Option<CachedJwks>>,
     refresh: Mutex<()>,
+    identity_configuration: Option<AttestedIdentityConfiguration>,
 }
 
 impl CorporateIdentityService {
-    /// Build a corporate identity verifier from relay config.
-    pub fn new(config: CorporateIdentityConfig) -> Self {
+    fn new(config: CorporateIdentityConfig) -> Self {
         let http = reqwest::Client::builder()
             .connect_timeout(JWKS_CONNECT_TIMEOUT)
             .timeout(JWKS_REQUEST_TIMEOUT)
@@ -103,7 +104,35 @@ impl CorporateIdentityService {
             http,
             jwks: RwLock::new(None),
             refresh: Mutex::new(()),
+            identity_configuration: None,
         }
+    }
+
+    fn assertion_verification_policy(
+        &self,
+    ) -> Result<AssertionVerificationPolicy, CorporateIdentityError> {
+        let mut policy = AssertionVerificationPolicy::new(
+            self.config.issuer.clone(),
+            self.config.audience.clone(),
+            self.config.uid_claim.clone(),
+            Duration::from_secs(86_400),
+            Duration::from_secs(JWT_CLOCK_SKEW_LEEWAY_SECS),
+        )
+        .map_err(|error| CorporateIdentityError::Configuration(error.to_string()))?;
+        if let Some(claim) = self.config.npub_claim.as_ref() {
+            policy = policy
+                .with_nostr_key_claim(
+                    NostrKeyClaimPolicy::canonical_public_key(claim.clone()).map_err(|error| {
+                        CorporateIdentityError::Configuration(error.to_string())
+                    })?,
+                )
+                .map_err(|error| CorporateIdentityError::Configuration(error.to_string()))?;
+        }
+        Ok(policy)
+    }
+
+    pub(crate) fn identity_configuration(&self) -> Option<AttestedIdentityConfiguration> {
+        self.identity_configuration
     }
 
     /// Validate a JWT and extract the configured corporate identity claims.
@@ -164,25 +193,11 @@ impl CorporateIdentityService {
         signer: PublicKey,
         transport: ProofTransport,
     ) -> Result<VerifiedIdentityBindingEvidence, CorporateIdentityError> {
-        let mut policy = AssertionVerificationPolicy::new(
-            self.config.issuer.clone(),
-            self.config.audience.clone(),
-            self.config.uid_claim.clone(),
-            Duration::from_secs(86_400),
-            Duration::from_secs(JWT_CLOCK_SKEW_LEEWAY_SECS),
+        let verifier = StaticJwksAssertionVerifier::new(
+            self.assertion_verification_policy()?,
+            self.jwks_snapshot().await?,
         )
         .map_err(|error| CorporateIdentityError::InvalidJwt(error.to_string()))?;
-        if let Some(claim) = self.config.npub_claim.as_ref() {
-            policy = policy
-                .with_nostr_key_claim(
-                    NostrKeyClaimPolicy::canonical_public_key(claim.clone())
-                        .map_err(|error| CorporateIdentityError::InvalidJwt(error.to_string()))?,
-                )
-                .map_err(|error| CorporateIdentityError::InvalidJwt(error.to_string()))?;
-        }
-
-        let verifier = StaticJwksAssertionVerifier::new(policy, self.jwks_snapshot().await?)
-            .map_err(|error| CorporateIdentityError::InvalidJwt(error.to_string()))?;
         let header_name = HeaderName::from_static("x-buzz-sealed-identity-assertion");
         let header_value = HeaderValue::from_str(token)
             .map_err(|_| CorporateIdentityError::InvalidJwt("ambiguous assertion".to_string()))?;
@@ -483,6 +498,9 @@ pub fn spawn_session_revalidation(
 /// Errors produced by corporate identity verification.
 #[derive(Debug, Error)]
 pub enum CorporateIdentityError {
+    /// Enabled verifier configuration is incomplete or invalid.
+    #[error("corporate identity configuration invalid: {0}")]
+    Configuration(String),
     /// No JWT was available and delegation did not apply.
     #[error("corporate identity JWT missing")]
     MissingJwt,
@@ -533,6 +551,7 @@ impl CorporateIdentityError {
             Self::MissingJwt | Self::MissingKid | Self::InvalidJwt(_) | Self::Jwks(_) => {
                 StatusCode::UNAUTHORIZED
             }
+            Self::Configuration(_) => StatusCode::SERVICE_UNAVAILABLE,
             Self::InvalidClaim { .. }
             | Self::BindingConflict
             | Self::BindingRequired
@@ -551,6 +570,7 @@ impl CorporateIdentityError {
             Self::MissingKid | Self::InvalidJwt(_) | Self::Jwks(_) => {
                 "relay identity verification failed"
             }
+            Self::Configuration(_) => "relay identity unavailable",
             Self::InvalidClaim { .. } => "relay identity claim invalid",
             Self::BindingConflict => "relay identity binding conflict",
             Self::BindingRequired => "relay identity binding required",
@@ -629,17 +649,6 @@ fn sealed_identity_expiry(
         .map_err(|_| CorporateIdentityError::InvalidJwt("invalid assertion expiry".to_string()))
 }
 
-async fn adopt_verified_identity_policy(
-    state: &AppState,
-    evidence: &VerifiedIdentityBindingEvidence,
-) -> Result<(), CorporateIdentityError> {
-    state
-        .db
-        .adopt_verified_identity_enrollment_policy(evidence)
-        .await?;
-    Ok(())
-}
-
 /// Extract a corporate identity JWT from the configured request header.
 pub fn identity_jwt_from_headers(
     headers: &HeaderMap,
@@ -713,7 +722,6 @@ async fn verify_corporate_identity_inner(
         let evidence = service
             .verify_binding_evidence(token, community_id, signer, transport)
             .await?;
-        adopt_verified_identity_policy(state, &evidence).await?;
         let expires_at = sealed_identity_expiry(&evidence)?;
         let claims = service.validate_jwt(token).await?;
         return Ok(CorporateIdentityProof(
@@ -1167,18 +1175,64 @@ fn parse_pubkey_claim(claim: &str, value: &str) -> Result<PublicKey, CorporateId
     }
 }
 
-/// Create an optional service from config.
-pub fn service_from_config(
+/// Exact startup-prepared corporate identity service.
+pub struct PreparedCorporateIdentityService {
+    service: Arc<CorporateIdentityService>,
+    configuration: AttestedIdentityConfiguration,
+}
+
+impl fmt::Debug for PreparedCorporateIdentityService {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("PreparedCorporateIdentityService([REDACTED])")
+    }
+}
+
+impl PreparedCorporateIdentityService {
+    /// Exact digest and explicit capacity installed before activation.
+    pub const fn identity_configuration(&self) -> AttestedIdentityConfiguration {
+        self.configuration
+    }
+
+    /// Consume the preparation token and activate the same seeded service.
+    pub fn into_service(self) -> Arc<CorporateIdentityService> {
+        self.service
+    }
+}
+
+/// Prepare the exact verifier snapshot installed before service activation.
+pub async fn prepare_service_from_config(
     config: &CorporateIdentityConfig,
-) -> Option<Arc<CorporateIdentityService>> {
-    config
-        .require
-        .then(|| Arc::new(CorporateIdentityService::new(config.clone())))
+) -> Result<Option<PreparedCorporateIdentityService>, CorporateIdentityError> {
+    if !config.require {
+        return Ok(None);
+    }
+    let event_capacity = config.event_capacity.ok_or_else(|| {
+        CorporateIdentityError::Configuration(
+            "enabled corporate identity requires explicit event capacity".to_owned(),
+        )
+    })?;
+    let mut service = CorporateIdentityService::new(config.clone());
+    let jwks = service.fetch_jwks().await?;
+    let verifier =
+        StaticJwksAssertionVerifier::new(service.assertion_verification_policy()?, jwks.clone())
+            .map_err(|error| CorporateIdentityError::Configuration(error.to_string()))?;
+    let policy_digest = verifier.enrollment_policy_digest();
+    let configuration = AttestedIdentityConfiguration::new(policy_digest, event_capacity)?;
+    *service.jwks.get_mut() = Some(CachedJwks {
+        set: jwks,
+        expires_at: Instant::now() + JWKS_CACHE_TTL,
+    });
+    service.identity_configuration = Some(configuration);
+    Ok(Some(PreparedCorporateIdentityService {
+        service: Arc::new(service),
+        configuration,
+    }))
 }
 
 fn record_corporate_identity_denial(error: &CorporateIdentityError) {
     let reason = match error {
         CorporateIdentityError::MissingJwt => "missing_jwt",
+        CorporateIdentityError::Configuration(_) => "configuration",
         CorporateIdentityError::MissingKid => "missing_kid",
         CorporateIdentityError::InvalidJwt(_) => "invalid_jwt",
         CorporateIdentityError::Jwks(_) => "jwks",
@@ -1230,13 +1284,30 @@ mod tests {
             display_claim: "email".to_string(),
             public_display_claim: None,
             npub_claim: Some("buzz_npub".to_string()),
+            event_capacity: Some(
+                buzz_auth::AuthorizationEventCapacityPolicy::new(
+                    10_000,
+                    16 * 1024 * 1024,
+                    16 * 1024,
+                )
+                .expect("bounded corporate identity test capacity"),
+            ),
         }
     }
 
-    #[test]
-    fn stock_default_keeps_corporate_identity_uninstalled() {
-        assert!(service_from_config(&CorporateIdentityConfig::default()).is_none());
-        assert!(service_from_config(&test_config()).is_some());
+    #[tokio::test]
+    async fn stock_default_keeps_corporate_identity_uninstalled_without_io() {
+        assert!(
+            prepare_service_from_config(&CorporateIdentityConfig::default())
+                .await
+                .expect("disabled preparation")
+                .is_none()
+        );
+
+        let error = prepare_service_from_config(&test_config())
+            .await
+            .expect_err("enabled preparation must fetch its configured JWKS");
+        assert!(matches!(error, CorporateIdentityError::Jwks(_)));
     }
 
     #[test]
@@ -1981,11 +2052,13 @@ mod tests {
     async fn canonical_test_state(
         database_url: &str,
         host: &str,
+        corporate_identity: CorporateIdentityConfig,
+        projected_migration_actor: Option<PublicKey>,
     ) -> (Arc<AppState>, PgPool, CommunityId) {
         let mut config = crate::config::Config::from_env().expect("load test configuration");
         config.database_url = database_url.to_owned();
         config.redis_url = "redis://127.0.0.1:1".to_owned();
-        config.corporate_identity = test_config();
+        config.corporate_identity = corporate_identity;
         let pool = PgPool::connect(database_url)
             .await
             .expect("connect test database");
@@ -1997,6 +2070,20 @@ mod tests {
             .execute(&pool)
             .await
             .expect("insert corporate identity test community");
+        if let Some(actor) = projected_migration_actor {
+            seed_projected_migration_binding(&pool, community_id, actor).await;
+        }
+        let prepared = prepare_service_from_config(&config.corporate_identity)
+            .await
+            .expect("prepare exact corporate identity service")
+            .expect("required corporate identity service");
+        let identity_configuration = prepared.identity_configuration();
+        db.preflight_attested_identity_configuration(
+            identity_configuration.policy_digest(),
+            identity_configuration.event_capacity(),
+        )
+        .await
+        .expect("preflight explicit corporate identity configuration");
         let redis_pool = deadpool_redis::Config::from_url(&config.redis_url)
             .create_pool(Some(deadpool_redis::Runtime::Tokio1))
             .expect("construct redis pool");
@@ -2014,19 +2101,47 @@ mod tests {
         ));
         let media_storage =
             buzz_media::MediaStorage::new(&config.media).expect("construct media storage");
-        let (state, _audit_shutdown) = AppState::new(
+        let (state, _audit_shutdown) = AppState::new_with_corporate_identity(
             config,
             db,
             redis_pool,
             audit,
             pubsub,
             auth,
+            Some(prepared.into_service()),
             search,
             workflow_engine,
             Keys::generate(),
             media_storage,
         );
         (Arc::new(state), pool, community_id)
+    }
+
+    async fn isolated_corporate_database(prefix: &str) -> String {
+        let admin_url = std::env::var("BUZZ_TEST_DATABASE_URL")
+            .or_else(|_| std::env::var("TEST_DATABASE_URL"))
+            .or_else(|_| std::env::var("DATABASE_URL"))
+            .unwrap_or_else(|_| TEST_DB_URL.to_owned());
+        let admin = PgPool::connect(&admin_url)
+            .await
+            .expect("connect database server");
+        let database_name = format!("{}_{}", prefix, Uuid::new_v4().simple());
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "CREATE DATABASE {database_name}"
+        )))
+        .execute(&admin)
+        .await
+        .expect("create isolated corporate identity database");
+        let separator = admin_url.rfind('/').expect("database URL path");
+        let database_url = format!("{}/{database_name}", &admin_url[..separator]);
+        let pool = PgPool::connect(&database_url)
+            .await
+            .expect("connect isolated corporate identity database");
+        buzz_db::migration::run_migrations(&pool)
+            .await
+            .expect("migrate isolated corporate identity database");
+        pool.close().await;
+        database_url
     }
 
     fn fixture_framed_digest(domain: &[u8], fields: &[&[u8]]) -> [u8; 32] {
@@ -2178,14 +2293,20 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires Postgres migrated through 0031"]
     async fn required_direct_identity_finalizes_and_rechecks_only_canonical_state() {
-        let database_url = std::env::var("BUZZ_TEST_DATABASE_URL")
-            .or_else(|_| std::env::var("DATABASE_URL"))
-            .unwrap_or_else(|_| TEST_DB_URL.to_owned());
+        let database_url = isolated_corporate_database("corporate_identity_fresh").await;
         let host = format!("corporate-prefix-{}.example", Uuid::new_v4().simple());
-        let (state, pool, community_id) = canonical_test_state(&database_url, &host).await;
         let actor = Keys::generate();
         let private_key = rsa_private_key(include_str!("testdata/rsa_private_key_1.der.b64"));
         let jwk = rsa_test_jwk(&private_key, "canonical-prefix-key");
+        let jwks_body =
+            serde_json::to_string(&JwkSet { keys: vec![jwk] }).expect("serialize startup JWKS");
+        let response = http_response("200 OK", &["Content-Type: application/json"], &jwks_body);
+        let (jwks_uri, jwks_requests, jwks_server) = spawn_http_server(response).await;
+        let mut corporate_config = test_config();
+        corporate_config.jwks_uri = jwks_uri;
+        let (state, pool, community_id) =
+            canonical_test_state(&database_url, &host, corporate_config, None).await;
+        assert_eq!(jwks_requests.load(Ordering::SeqCst), 1);
         let now = Timestamp::now().as_secs();
         let mut claims = valid_test_claims(now)
             .as_object()
@@ -2203,24 +2324,63 @@ mod tests {
             &EncodingKey::from_rsa_der(&private_key),
         )
         .expect("sign canonical prefix JWT");
-        let service = state
-            .corporate_identity
-            .as_ref()
-            .expect("required corporate identity service");
-        *service.jwks.write().await = Some(CachedJwks {
-            set: JwkSet { keys: vec![jwk] },
-            expires_at: Instant::now() + Duration::from_secs(60),
-        });
-        let first_proof = verify_corporate_identity(
-            &state,
-            community_id,
-            actor.public_key(),
-            ProofTransport::Nip42,
-            Some(&token),
-            None,
+        let before_verification: (i64, i64, i64) = sqlx::query_as(
+            "SELECT (SELECT count(*) FROM identity_enrollment_policies WHERE community_id=$1),\
+                    retained_event_count,retained_envelope_bytes \
+             FROM authorization_event_capacity WHERE community_id=$1",
         )
+        .bind(community_id.as_uuid())
+        .fetch_one(&pool)
         .await
-        .expect("verify required direct identity");
+        .expect("read startup-installed identity configuration");
+        let (first_proof, second_proof, third_proof, fourth_proof) = tokio::join!(
+            verify_corporate_identity(
+                &state,
+                community_id,
+                actor.public_key(),
+                ProofTransport::Nip42,
+                Some(&token),
+                None,
+            ),
+            verify_corporate_identity(
+                &state,
+                community_id,
+                actor.public_key(),
+                ProofTransport::Nip42,
+                Some(&token),
+                None,
+            ),
+            verify_corporate_identity(
+                &state,
+                community_id,
+                actor.public_key(),
+                ProofTransport::Nip42,
+                Some(&token),
+                None,
+            ),
+            verify_corporate_identity(
+                &state,
+                community_id,
+                actor.public_key(),
+                ProofTransport::Nip42,
+                Some(&token),
+                None,
+            ),
+        );
+        let first_proof = first_proof.expect("verify required direct identity");
+        for proof in [second_proof, third_proof, fourth_proof] {
+            proof.expect("parallel verification is read-only");
+        }
+        let after_verification: (i64, i64, i64) = sqlx::query_as(
+            "SELECT (SELECT count(*) FROM identity_enrollment_policies WHERE community_id=$1),\
+                    retained_event_count,retained_envelope_bytes \
+             FROM authorization_event_capacity WHERE community_id=$1",
+        )
+        .bind(community_id.as_uuid())
+        .fetch_one(&pool)
+        .await
+        .expect("read configuration after parallel verification");
+        assert_eq!(after_verification, before_verification);
         let first =
             finalize_corporate_identity(&state, community_id, actor.public_key(), first_proof)
                 .await
@@ -2292,31 +2452,16 @@ mod tests {
         .fetch_one(&pool)
         .await
         .expect("read production-adopted capacity");
-        assert_eq!(
-            capacity,
-            (
-                2,
-                i64::try_from(buzz_auth::HARD_MAX_AUTHORIZATION_EVENTS_PER_DOMAIN)
-                    .expect("event hard ceiling"),
-                i64::try_from(buzz_auth::HARD_MAX_AUTHORIZATION_EVENT_BYTES_PER_DOMAIN)
-                    .expect("byte hard ceiling"),
-                i32::try_from(buzz_auth::HARD_MAX_AUTHORIZATION_EVENT_ENVELOPE_BYTES)
-                    .expect("envelope hard ceiling"),
-            )
-        );
+        assert_eq!(capacity, (2, 10_000, 16 * 1024 * 1024, 16 * 1024,));
+        jwks_server.abort();
     }
 
     #[tokio::test]
     #[ignore = "requires Postgres migrated through 0031"]
-    async fn migrated_identity_reauth_adopts_bootstrap_and_rolls_policy_exactly() {
-        let database_url = std::env::var("BUZZ_TEST_DATABASE_URL")
-            .or_else(|_| std::env::var("DATABASE_URL"))
-            .unwrap_or_else(|_| TEST_DB_URL.to_owned());
+    async fn migrated_identity_reauth_uses_startup_adoption_and_exact_rollover() {
+        let database_url = isolated_corporate_database("corporate_identity_migrated").await;
         let host = format!("corporate-migrated-{}.example", Uuid::new_v4().simple());
-        let (state, pool, community_id) = canonical_test_state(&database_url, &host).await;
         let actor = Keys::generate();
-        seed_projected_migration_binding(&pool, community_id, actor.public_key()).await;
-
         let binding_token = |private_key: &[u8], kid: &str| {
             let now = Timestamp::now().as_secs();
             let mut claims = valid_test_claims(now)
@@ -2339,16 +2484,23 @@ mod tests {
         let first_key = rsa_private_key(include_str!("testdata/rsa_private_key_1.der.b64"));
         let first_jwk = rsa_test_jwk(&first_key, "migrated-current-key");
         let first_token = binding_token(&first_key, "migrated-current-key");
-        let service = state
-            .corporate_identity
-            .as_ref()
-            .expect("required corporate identity service");
-        *service.jwks.write().await = Some(CachedJwks {
-            set: JwkSet {
-                keys: vec![first_jwk],
-            },
-            expires_at: Instant::now() + Duration::from_secs(60),
-        });
+        let first_jwks_body = serde_json::to_string(&JwkSet {
+            keys: vec![first_jwk],
+        })
+        .expect("serialize first startup JWKS");
+        let first_response = http_response(
+            "200 OK",
+            &["Content-Type: application/json"],
+            &first_jwks_body,
+        );
+        let (first_jwks_uri, first_requests, first_server) =
+            spawn_http_server(first_response).await;
+        let mut first_config = test_config();
+        first_config.jwks_uri = first_jwks_uri;
+        let (mut state, pool, community_id) =
+            canonical_test_state(&database_url, &host, first_config, Some(actor.public_key()))
+                .await;
+        assert_eq!(first_requests.load(Ordering::SeqCst), 1);
 
         let first_proof = verify_corporate_identity(
             &state,
@@ -2359,7 +2511,7 @@ mod tests {
             None,
         )
         .await
-        .expect("production path adopts migration bootstrap");
+        .expect("startup-installed verifier authenticates migrated binding");
         let first =
             finalize_corporate_identity(&state, community_id, actor.public_key(), first_proof)
                 .await
@@ -2379,12 +2531,82 @@ mod tests {
         let second_key = rsa_private_key(include_str!("testdata/rsa_private_key_2.der.b64"));
         let second_jwk = rsa_test_jwk(&second_key, "migrated-rollover-key");
         let second_token = binding_token(&second_key, "migrated-rollover-key");
+        let service = state
+            .corporate_identity
+            .as_ref()
+            .expect("required corporate identity service");
         *service.jwks.write().await = Some(CachedJwks {
             set: JwkSet {
-                keys: vec![second_jwk],
+                keys: vec![second_jwk.clone()],
             },
             expires_at: Instant::now() + Duration::from_secs(60),
         });
+        let uninstalled = verify_corporate_identity(
+            &state,
+            community_id,
+            actor.public_key(),
+            ProofTransport::Nip42,
+            Some(&second_token),
+            None,
+        )
+        .await
+        .expect("refreshed verifier can seal proof");
+        let uninstalled_error =
+            finalize_corporate_identity(&state, community_id, actor.public_key(), uninstalled)
+                .await
+                .expect_err("uninstalled refreshed digest must fail closed");
+        assert!(matches!(
+            uninstalled_error,
+            CorporateIdentityError::PolicyUnavailable
+        ));
+        let revisions_before_rollover: Vec<i64> = sqlx::query_scalar(
+            "SELECT policy_revision FROM identity_enrollment_policies \
+             WHERE community_id=$1 ORDER BY policy_revision",
+        )
+        .bind(community_id.as_uuid())
+        .fetch_all(&pool)
+        .await
+        .expect("read revisions after uninstalled refresh");
+        assert_eq!(revisions_before_rollover, vec![1, 2]);
+
+        let second_jwks_body = serde_json::to_string(&JwkSet {
+            keys: vec![second_jwk],
+        })
+        .expect("serialize rollover JWKS");
+        let second_response = http_response(
+            "200 OK",
+            &["Content-Type: application/json"],
+            &second_jwks_body,
+        );
+        let (second_jwks_uri, second_requests, second_server) =
+            spawn_http_server(second_response).await;
+        let mut second_config = test_config();
+        second_config.jwks_uri = second_jwks_uri;
+        let prepared_rollover = prepare_service_from_config(&second_config)
+            .await
+            .expect("prepare exact rollover")
+            .expect("enabled rollover service");
+        let rollover_configuration = prepared_rollover.identity_configuration();
+        state
+            .db
+            .preflight_attested_identity_configuration(
+                rollover_configuration.policy_digest(),
+                rollover_configuration.event_capacity(),
+            )
+            .await
+            .expect("install rollover before activation");
+        state
+            .db
+            .preflight_attested_identity_configuration(
+                rollover_configuration.policy_digest(),
+                rollover_configuration.event_capacity(),
+            )
+            .await
+            .expect("exact rollover startup replay");
+        Arc::get_mut(&mut state)
+            .expect("test state is not shared")
+            .corporate_identity = Some(prepared_rollover.into_service());
+        assert_eq!(second_requests.load(Ordering::SeqCst), 1);
         for _ in 0..2 {
             let proof = verify_corporate_identity(
                 &state,
@@ -2395,7 +2617,7 @@ mod tests {
                 None,
             )
             .await
-            .expect("trusted verifier rollover is adopted");
+            .expect("explicitly activated verifier rollover is accepted");
             finalize_corporate_identity(&state, community_id, actor.public_key(), proof)
                 .await
                 .expect("rollover reauthentication matches migrated binding");
@@ -2410,26 +2632,29 @@ mod tests {
         .await
         .expect("read exact policy rollover");
         assert_eq!(revisions, vec![1, 2, 3]);
-        let capacity: (i16, i64, i64, i32, i64) = sqlx::query_as(
+        let capacity: (i16, i64, i64, i32, i64, i64, i32) = sqlx::query_as(
             "SELECT configuration_state,max_events_per_domain,max_bytes_per_domain,\
-                    max_envelope_bytes,retained_event_count \
+                    max_envelope_bytes,retained_event_count,retained_envelope_bytes,\
+                    retained_largest_envelope_bytes \
              FROM authorization_event_capacity WHERE community_id=$1",
         )
         .bind(community_id.as_uuid())
         .fetch_one(&pool)
         .await
         .expect("read adopted migration capacity");
+        let migration_envelope_bytes =
+            i64::try_from(br#"{"schema_version":1,"source":"migration-0031"}"#.len())
+                .expect("fixture envelope length");
         assert_eq!(
             capacity,
             (
                 2,
-                i64::try_from(buzz_auth::HARD_MAX_AUTHORIZATION_EVENTS_PER_DOMAIN)
-                    .expect("event hard ceiling"),
-                i64::try_from(buzz_auth::HARD_MAX_AUTHORIZATION_EVENT_BYTES_PER_DOMAIN)
-                    .expect("byte hard ceiling"),
-                i32::try_from(buzz_auth::HARD_MAX_AUTHORIZATION_EVENT_ENVELOPE_BYTES)
-                    .expect("envelope hard ceiling"),
+                10_000,
+                16 * 1024 * 1024,
+                16 * 1024,
                 1,
+                migration_envelope_bytes,
+                i32::try_from(migration_envelope_bytes).expect("fixture envelope PostgreSQL size"),
             )
         );
         for table in [
@@ -2447,6 +2672,8 @@ mod tests {
             .expect("count migrated exact-once state");
             assert_eq!(count, 1, "{table} must remain migration exact-once");
         }
+        first_server.abort();
+        second_server.abort();
     }
 
     async fn validate_rsa_jwt(

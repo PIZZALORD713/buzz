@@ -1301,6 +1301,88 @@ mod tests {
             )
         );
         assert_eq!(canonical_counts(&db, claimless_domain).await, [0, 0, 0, 0]);
+
+        let missing_domain = fresh_community(&db).await;
+        let (_, missing_evidence) = verified_evidence(
+            missing_domain,
+            &Keys::generate(),
+            Duration::from_secs(300),
+            true,
+        );
+        assert_eq!(
+            db.resolve_verified_identity_binding(&missing_evidence)
+                .await
+                .expect("missing policy is a closed denial"),
+            VerifiedIdentityBindingOutcome::Denied(
+                VerifiedIdentityBindingDenial::PolicyUnavailable
+            )
+        );
+        assert_eq!(canonical_counts(&db, missing_domain).await, [0, 0, 0, 0]);
+
+        for (label, effective_at, expires_at) in [
+            (
+                "future",
+                now + chrono::TimeDelta::hours(1),
+                Some(now + chrono::TimeDelta::hours(2)),
+            ),
+            (
+                "expired",
+                now - chrono::TimeDelta::hours(2),
+                Some(now - chrono::TimeDelta::hours(1)),
+            ),
+        ] {
+            let domain = fresh_community(&db).await;
+            let (digest, evidence) =
+                verified_evidence(domain, &Keys::generate(), Duration::from_secs(300), true);
+            db.install_attested_identity_enrollment_policy(
+                domain,
+                1,
+                digest,
+                effective_at,
+                expires_at,
+                AuthorizationEventCapacityPolicy::new(100, 1_048_576, 65_536)
+                    .expect("valid unavailable-policy capacity"),
+            )
+            .await
+            .expect("install unavailable policy fixture");
+            assert_eq!(
+                db.resolve_verified_identity_binding(&evidence)
+                    .await
+                    .expect("unavailable policy is a closed denial"),
+                VerifiedIdentityBindingOutcome::Denied(
+                    VerifiedIdentityBindingDenial::PolicyUnavailable
+                ),
+                "{label} policy must fail closed",
+            );
+            assert_eq!(canonical_counts(&db, domain).await, [0, 0, 0, 0]);
+        }
+
+        let unhealthy_domain = fresh_community(&db).await;
+        let (unhealthy_digest, unhealthy_evidence) = verified_evidence(
+            unhealthy_domain,
+            &Keys::generate(),
+            Duration::from_secs(300),
+            true,
+        );
+        install_fixture_policy(&db, unhealthy_domain, unhealthy_digest).await;
+        sqlx::query(
+            "UPDATE authorization_event_capacity \
+             SET health_state=2,failure_code=1,failure_observed_at=clock_timestamp() \
+             WHERE community_id=$1",
+        )
+        .bind(unhealthy_domain.as_uuid())
+        .execute(&db.pool)
+        .await
+        .expect("latch unavailable identity audit capacity");
+        assert_eq!(
+            db.resolve_verified_identity_binding(&unhealthy_evidence)
+                .await
+                .expect("unhealthy capacity is a closed denial"),
+            VerifiedIdentityBindingOutcome::Denied(
+                VerifiedIdentityBindingDenial::PolicyUnavailable
+            )
+        );
+        assert_eq!(canonical_counts(&db, unhealthy_domain).await, [0, 0, 0, 0]);
     }
 
     #[tokio::test]

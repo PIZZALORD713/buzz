@@ -60,6 +60,7 @@ pub mod user;
 /// Workflow, run, and approval persistence.
 pub mod workflow;
 
+pub use authorization_policy::AttestedIdentityConfiguration;
 pub use error::{DbError, Result};
 pub use event::{EventQuery, ReactionEventInsertOutcome, DEFAULT_MAX_PAGE_LIMIT};
 
@@ -1376,6 +1377,18 @@ impl Db {
         &self,
         normalized_host: &str,
     ) -> Result<EnsuredCommunityRecord> {
+        self.ensure_configured_community_with_attested_identity(normalized_host, None, None)
+            .await
+    }
+
+    /// Ensure a community, optional configured owner, and identity policy atomically.
+    pub async fn ensure_configured_community_with_attested_identity(
+        &self,
+        normalized_host: &str,
+        owner_pubkey: Option<&str>,
+        identity_configuration: Option<AttestedIdentityConfiguration>,
+    ) -> Result<EnsuredCommunityRecord> {
+        let mut transaction = self.pool.begin().await?;
         let row = sqlx::query(
             r#"
             INSERT INTO communities (host)
@@ -1385,15 +1398,30 @@ impl Db {
             "#,
         )
         .bind(normalized_host)
-        .fetch_one(&self.pool)
+        .fetch_one(&mut *transaction)
         .await?;
 
         let id: Uuid = row.try_get("id")?;
         let host: String = row.try_get("host")?;
         let created: bool = row.try_get("created")?;
+        let community_id = CommunityId::from_uuid(id);
+
+        if let Some(configuration) = identity_configuration {
+            authorization_policy::install_attested_identity_configuration_tx(
+                &mut transaction,
+                community_id,
+                configuration.policy_digest(),
+                configuration.event_capacity(),
+            )
+            .await?;
+        }
+        if let Some(owner_pubkey) = owner_pubkey {
+            relay_members::bootstrap_owner_tx(&mut transaction, community_id, owner_pubkey).await?;
+        }
+        transaction.commit().await?;
 
         Ok(EnsuredCommunityRecord {
-            id: CommunityId::from_uuid(id),
+            id: community_id,
             host,
             created,
         })
@@ -1408,6 +1436,17 @@ impl Db {
         &self,
         normalized_host: &str,
         owner_pubkey: &str,
+    ) -> Result<CreateCommunityWithOwnerResult> {
+        self.create_community_with_owner_and_attested_identity(normalized_host, owner_pubkey, None)
+            .await
+    }
+
+    /// Atomically create a community, owner, and configured identity policy.
+    pub async fn create_community_with_owner_and_attested_identity(
+        &self,
+        normalized_host: &str,
+        owner_pubkey: &str,
+        identity_configuration: Option<AttestedIdentityConfiguration>,
     ) -> Result<CreateCommunityWithOwnerResult> {
         let owner_pubkey = owner_pubkey.to_ascii_lowercase();
         let mut tx = self.pool.begin().await?;
@@ -1479,10 +1518,21 @@ impl Db {
             (existing.try_get("id")?, existing.try_get("host")?)
         };
 
+        let community_id = CommunityId::from_uuid(id);
+        if let Some(configuration) = identity_configuration {
+            authorization_policy::install_attested_identity_configuration_tx(
+                &mut tx,
+                community_id,
+                configuration.policy_digest(),
+                configuration.event_capacity(),
+            )
+            .await?;
+        }
+
         tx.commit().await?;
         Ok(CreateCommunityWithOwnerResult::Created(
             CreatedCommunityRecord {
-                id: CommunityId::from_uuid(id),
+                id: community_id,
                 host,
             },
         ))

@@ -276,6 +276,20 @@ pub async fn provision_community(
             })
         })
         .transpose()?;
+    let identity_configuration = if state.config.corporate_identity.require {
+        Some(
+            state
+                .corporate_identity
+                .as_ref()
+                .and_then(|service| service.identity_configuration())
+                .ok_or_else(|| {
+                    "corporate identity configuration is unavailable; provisioning denied"
+                        .to_owned()
+                })?,
+        )
+    } else {
+        None
+    };
 
     if request.create_only {
         let owner_hex = initial_owner.as_deref().ok_or_else(|| {
@@ -283,7 +297,11 @@ pub async fn provision_community(
         })?;
         let record = match state
             .db
-            .create_community_with_owner(&request.host, owner_hex)
+            .create_community_with_owner_and_attested_identity(
+                &request.host,
+                owner_hex,
+                identity_configuration,
+            )
             .await
             .map_err(|e| format!("failed to create community: {e}"))?
         {
@@ -320,16 +338,15 @@ pub async fn provision_community(
     // create_only so an existing owner can never be rotated by a create race.
     let record = state
         .db
-        .ensure_configured_community(&request.host)
+        .ensure_configured_community_with_attested_identity(
+            &request.host,
+            initial_owner.as_deref(),
+            identity_configuration,
+        )
         .await
         .map_err(|e| format!("failed to create community: {e}"))?;
 
-    if let Some(owner_hex) = &initial_owner {
-        state
-            .db
-            .bootstrap_owner(record.id, owner_hex)
-            .await
-            .map_err(|e| format!("community provisioned but owner bootstrap failed: {e}"))?;
+    if initial_owner.is_some() {
         publish_membership_snapshot_if_required(state, record.id, &record.host).await;
     }
 

@@ -412,8 +412,18 @@ pub async fn bootstrap_owner(
     community: CommunityId,
     owner_pubkey: &str,
 ) -> Result<()> {
-    let pubkey = owner_pubkey.to_ascii_lowercase();
     let mut tx = pool.begin().await?;
+    bootstrap_owner_tx(&mut tx, community, owner_pubkey).await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+pub(crate) async fn bootstrap_owner_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    community: CommunityId,
+    owner_pubkey: &str,
+) -> Result<()> {
+    let pubkey = owner_pubkey.to_ascii_lowercase();
 
     // 1. Upsert the configured owner for this community.
     sqlx::query(
@@ -423,7 +433,7 @@ pub async fn bootstrap_owner(
     )
     .bind(community.as_uuid())
     .bind(&pubkey)
-    .execute(&mut *tx)
+    .execute(&mut **tx)
     .await?;
 
     // 2. Demote any other owners in this community to admin.
@@ -433,10 +443,8 @@ pub async fn bootstrap_owner(
     )
     .bind(community.as_uuid())
     .bind(&pubkey)
-    .execute(&mut *tx)
+    .execute(&mut **tx)
     .await?;
-
-    tx.commit().await?;
     Ok(())
 }
 
