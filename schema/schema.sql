@@ -161,6 +161,33 @@ CREATE TYPE public.workflow_status AS ENUM (
 
 
 --
+-- Name: authorization_authority_epoch_guard_v1(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.authorization_authority_epoch_guard_v1() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+BEGIN
+    IF NEW IS NOT DISTINCT FROM OLD THEN
+        RETURN NEW;
+    END IF;
+    IF NEW.community_id IS DISTINCT FROM OLD.community_id
+        OR NEW.object_kind IS DISTINCT FROM OLD.object_kind
+        OR NEW.object_key IS DISTINCT FROM OLD.object_key
+        OR NEW.authority_epoch <= OLD.authority_epoch
+        OR NEW.fence IS NOT DISTINCT FROM OLD.fence
+        OR NEW.operation_id IS NOT DISTINCT FROM OLD.operation_id
+        OR NEW.updated_at <= OLD.updated_at
+    THEN
+        RAISE EXCEPTION 'authorization authority epoch cannot move backward'
+            USING ERRCODE = 'check_violation';
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+
+--
 -- Name: authorization_event_capacity_before_insert_v1(); Type: FUNCTION; Schema: public; Owner: -
 --
 
@@ -416,6 +443,30 @@ BEGIN
     NEW.retained_largest_envelope_bytes := actual_largest;
     NEW.configured_at := transaction_timestamp();
     NEW.updated_at := transaction_timestamp();
+    RETURN NEW;
+END;
+$$;
+
+
+--
+-- Name: authorization_invalidation_domain_guard_v1(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.authorization_invalidation_domain_guard_v1() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+BEGIN
+    IF NEW IS NOT DISTINCT FROM OLD THEN
+        RETURN NEW;
+    END IF;
+    IF NEW.community_id IS DISTINCT FROM OLD.community_id
+        OR NEW.activated_at IS DISTINCT FROM OLD.activated_at
+        OR NEW.current_generation <= OLD.current_generation
+        OR NEW.updated_at <= OLD.updated_at
+    THEN
+        RAISE EXCEPTION 'authorization invalidation activation/generation cannot move backward'
+            USING ERRCODE = 'check_violation';
+    END IF;
     RETURN NEW;
 END;
 $$;
@@ -1262,6 +1313,33 @@ $$;
 
 
 --
+-- Name: protected_object_authority_guard_v1(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.protected_object_authority_guard_v1() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+BEGIN
+    IF NEW IS NOT DISTINCT FROM OLD THEN
+        RETURN NEW;
+    END IF;
+    IF NEW.community_id IS DISTINCT FROM OLD.community_id
+        OR NEW.object_kind IS DISTINCT FROM OLD.object_kind
+        OR NEW.object_key IS DISTINCT FROM OLD.object_key
+        OR NEW.authority_epoch <= OLD.authority_epoch
+        OR NEW.fence IS NOT DISTINCT FROM OLD.fence
+        OR NEW.operation_id IS NOT DISTINCT FROM OLD.operation_id
+        OR NEW.issued_at <= OLD.issued_at
+    THEN
+        RAISE EXCEPTION 'protected authority replacement requires a new operation and epoch'
+            USING ERRCODE = 'check_violation';
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+
+--
 -- Name: purge_soft_deleted_buzz_mesh_status(); Type: FUNCTION; Schema: public; Owner: -
 --
 
@@ -1448,6 +1526,27 @@ CREATE TABLE public.audit_log (
 
 
 --
+-- Name: authorization_authority_epochs; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.authorization_authority_epochs (
+    community_id uuid NOT NULL,
+    object_kind smallint NOT NULL,
+    object_key bytea NOT NULL,
+    authority_epoch bigint NOT NULL,
+    fence bytea NOT NULL,
+    operation_id uuid NOT NULL,
+    request_fingerprint bytea NOT NULL,
+    updated_at timestamp with time zone DEFAULT transaction_timestamp() NOT NULL,
+    CONSTRAINT authorization_authority_epochs_authority_epoch_check CHECK ((authority_epoch > 0)),
+    CONSTRAINT authorization_authority_epochs_fence_check CHECK (((octet_length(fence) = 32) AND (fence <> decode(repeat('00'::text, 32), 'hex'::text)))),
+    CONSTRAINT authorization_authority_epochs_object_key_check CHECK ((octet_length(object_key) = 32)),
+    CONSTRAINT authorization_authority_epochs_object_kind_check CHECK ((object_kind = ANY (ARRAY[1, 2, 3, 4, 5, 6, 7]))),
+    CONSTRAINT authorization_authority_epochs_request_fingerprint_check CHECK ((octet_length(request_fingerprint) = 32))
+);
+
+
+--
 -- Name: authorization_event_capacity; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -1517,6 +1616,19 @@ CREATE TABLE public.authorization_events (
     CONSTRAINT authorization_events_request_fingerprint_check CHECK (((request_fingerprint IS NULL) OR (octet_length(request_fingerprint) = 32))),
     CONSTRAINT authorization_events_schema_version_check CHECK ((schema_version = 1)),
     CONSTRAINT authorization_events_subject_fingerprint_check CHECK (((subject_fingerprint IS NULL) OR (octet_length(subject_fingerprint) = 32)))
+);
+
+
+--
+-- Name: authorization_invalidation_domains; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.authorization_invalidation_domains (
+    community_id uuid NOT NULL,
+    current_generation bigint NOT NULL,
+    activated_at timestamp with time zone DEFAULT transaction_timestamp() NOT NULL,
+    updated_at timestamp with time zone DEFAULT transaction_timestamp() NOT NULL,
+    CONSTRAINT authorization_invalidation_domains_current_generation_check CHECK ((current_generation >= 0))
 );
 
 
@@ -2353,6 +2465,49 @@ CREATE TABLE public.product_feedback (
 
 
 --
+-- Name: protected_object_authority; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.protected_object_authority (
+    community_id uuid NOT NULL,
+    object_kind smallint NOT NULL,
+    object_key bytea NOT NULL,
+    capability smallint NOT NULL,
+    actor_pubkey bytea NOT NULL,
+    owner_pubkey bytea,
+    binding_id uuid NOT NULL,
+    binding_version bigint NOT NULL,
+    delegated_relationship_id uuid,
+    delegated_relationship_revision bigint,
+    delegation_conditions_fingerprint bytea,
+    policy_revision bigint NOT NULL,
+    invalidation_generation bigint NOT NULL,
+    authority_epoch bigint NOT NULL,
+    fence bytea NOT NULL,
+    issued_at timestamp with time zone NOT NULL,
+    expires_at timestamp with time zone NOT NULL,
+    operation_id uuid NOT NULL,
+    request_fingerprint bytea NOT NULL,
+    CONSTRAINT protected_object_authority_actor_pubkey_check CHECK ((octet_length(actor_pubkey) = 32)),
+    CONSTRAINT protected_object_authority_authority_epoch_check CHECK ((authority_epoch > 0)),
+    CONSTRAINT protected_object_authority_binding_version_check CHECK ((binding_version > 0)),
+    CONSTRAINT protected_object_authority_capability_check CHECK ((capability = ANY (ARRAY[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27]))),
+    CONSTRAINT protected_object_authority_check CHECK ((issued_at < expires_at)),
+    CONSTRAINT protected_object_authority_check1 CHECK ((((owner_pubkey IS NULL) AND (delegated_relationship_id IS NULL) AND (delegated_relationship_revision IS NULL) AND (delegation_conditions_fingerprint IS NULL)) OR ((owner_pubkey IS NOT NULL) AND (delegated_relationship_id IS NOT NULL) AND (delegated_relationship_revision IS NOT NULL) AND (delegation_conditions_fingerprint IS NOT NULL)))),
+    CONSTRAINT protected_object_authority_delegated_relationship_non_nil CHECK (((delegated_relationship_id IS NULL) OR (delegated_relationship_id <> '00000000-0000-0000-0000-000000000000'::uuid))),
+    CONSTRAINT protected_object_authority_delegated_relationship_revisio_check CHECK (((delegated_relationship_revision IS NULL) OR (delegated_relationship_revision > 0))),
+    CONSTRAINT protected_object_authority_delegation_conditions_fingerpr_check CHECK (((delegation_conditions_fingerprint IS NULL) OR (octet_length(delegation_conditions_fingerprint) = 32))),
+    CONSTRAINT protected_object_authority_fence_check CHECK (((octet_length(fence) = 32) AND (fence <> decode(repeat('00'::text, 32), 'hex'::text)))),
+    CONSTRAINT protected_object_authority_invalidation_generation_check CHECK ((invalidation_generation >= 0)),
+    CONSTRAINT protected_object_authority_object_key_check CHECK ((octet_length(object_key) = 32)),
+    CONSTRAINT protected_object_authority_object_kind_check CHECK ((object_kind = ANY (ARRAY[1, 2, 3, 4, 5, 6, 7]))),
+    CONSTRAINT protected_object_authority_owner_pubkey_check CHECK (((owner_pubkey IS NULL) OR (octet_length(owner_pubkey) = 32))),
+    CONSTRAINT protected_object_authority_policy_revision_check CHECK ((policy_revision > 0)),
+    CONSTRAINT protected_object_authority_request_fingerprint_check CHECK ((octet_length(request_fingerprint) = 32))
+);
+
+
+--
 -- Name: pubkey_allowlist; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -2913,6 +3068,22 @@ ALTER TABLE ONLY public.audit_log
 
 
 --
+-- Name: authorization_authority_epochs authorization_authority_epoch_community_id_object_kind_obje_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.authorization_authority_epochs
+    ADD CONSTRAINT authorization_authority_epoch_community_id_object_kind_obje_key UNIQUE (community_id, object_kind, object_key, authority_epoch, fence, operation_id, request_fingerprint);
+
+
+--
+-- Name: authorization_authority_epochs authorization_authority_epochs_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.authorization_authority_epochs
+    ADD CONSTRAINT authorization_authority_epochs_pkey PRIMARY KEY (community_id, object_kind, object_key);
+
+
+--
 -- Name: authorization_event_capacity authorization_event_capacity_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -2950,6 +3121,14 @@ ALTER TABLE ONLY public.authorization_events
 
 ALTER TABLE ONLY public.authorization_events
     ADD CONSTRAINT authorization_events_pkey PRIMARY KEY (community_id, event_id);
+
+
+--
+-- Name: authorization_invalidation_domains authorization_invalidation_domains_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.authorization_invalidation_domains
+    ADD CONSTRAINT authorization_invalidation_domains_pkey PRIMARY KEY (community_id);
 
 
 --
@@ -3302,6 +3481,14 @@ ALTER TABLE ONLY public.product_feedback
 
 ALTER TABLE ONLY public.product_feedback
     ADD CONSTRAINT product_feedback_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: protected_object_authority protected_object_authority_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.protected_object_authority
+    ADD CONSTRAINT protected_object_authority_pkey PRIMARY KEY (community_id, object_kind, object_key);
 
 
 --
@@ -5391,6 +5578,27 @@ ALTER INDEX public.idx_events_tags_gin ATTACH PARTITION public.events_p_past_tag
 
 
 --
+-- Name: authorization_authority_epochs authorization_authority_epochs_monotonic; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER authorization_authority_epochs_monotonic BEFORE UPDATE ON public.authorization_authority_epochs FOR EACH ROW EXECUTE FUNCTION public.authorization_authority_epoch_guard_v1();
+
+
+--
+-- Name: authorization_authority_epochs authorization_authority_epochs_no_delete; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER authorization_authority_epochs_no_delete BEFORE DELETE ON public.authorization_authority_epochs FOR EACH ROW EXECUTE FUNCTION public.nip_fi_reject_row_mutation_v1();
+
+
+--
+-- Name: authorization_authority_epochs authorization_authority_epochs_no_truncate; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER authorization_authority_epochs_no_truncate BEFORE TRUNCATE ON public.authorization_authority_epochs FOR EACH STATEMENT EXECUTE FUNCTION public.nip_fi_reject_truncate_v1();
+
+
+--
 -- Name: authorization_event_capacity authorization_event_capacity_monotonic; Type: TRIGGER; Schema: public; Owner: -
 --
 
@@ -5444,6 +5652,27 @@ CREATE CONSTRAINT TRIGGER authorization_events_lifecycle_cardinality AFTER INSER
 --
 
 CREATE TRIGGER authorization_events_no_truncate BEFORE TRUNCATE ON public.authorization_events FOR EACH STATEMENT EXECUTE FUNCTION public.nip_fi_reject_truncate_v1();
+
+
+--
+-- Name: authorization_invalidation_domains authorization_invalidation_domains_monotonic; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER authorization_invalidation_domains_monotonic BEFORE UPDATE ON public.authorization_invalidation_domains FOR EACH ROW EXECUTE FUNCTION public.authorization_invalidation_domain_guard_v1();
+
+
+--
+-- Name: authorization_invalidation_domains authorization_invalidation_domains_no_delete; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER authorization_invalidation_domains_no_delete BEFORE DELETE ON public.authorization_invalidation_domains FOR EACH ROW EXECUTE FUNCTION public.nip_fi_reject_row_mutation_v1();
+
+
+--
+-- Name: authorization_invalidation_domains authorization_invalidation_domains_no_truncate; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER authorization_invalidation_domains_no_truncate BEFORE TRUNCATE ON public.authorization_invalidation_domains FOR EACH STATEMENT EXECUTE FUNCTION public.nip_fi_reject_truncate_v1();
 
 
 --
@@ -5657,6 +5886,27 @@ CREATE CONSTRAINT TRIGGER identity_lifecycle_transition_integrity AFTER INSERT O
 
 
 --
+-- Name: protected_object_authority protected_object_authority_no_delete; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER protected_object_authority_no_delete BEFORE DELETE ON public.protected_object_authority FOR EACH ROW EXECUTE FUNCTION public.nip_fi_reject_row_mutation_v1();
+
+
+--
+-- Name: protected_object_authority protected_object_authority_no_truncate; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER protected_object_authority_no_truncate BEFORE TRUNCATE ON public.protected_object_authority FOR EACH STATEMENT EXECUTE FUNCTION public.nip_fi_reject_truncate_v1();
+
+
+--
+-- Name: protected_object_authority protected_object_authority_strict_replacement; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER protected_object_authority_strict_replacement BEFORE UPDATE ON public.protected_object_authority FOR EACH ROW EXECUTE FUNCTION public.protected_object_authority_guard_v1();
+
+
+--
 -- Name: channels trg_channels_community_id_immutable; Type: TRIGGER; Schema: public; Owner: -
 --
 
@@ -5731,6 +5981,22 @@ ALTER TABLE ONLY public.audit_log
 
 
 --
+-- Name: authorization_authority_epochs authorization_authority_epoch_community_id_operation_id_re_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.authorization_authority_epochs
+    ADD CONSTRAINT authorization_authority_epoch_community_id_operation_id_re_fkey FOREIGN KEY (community_id, operation_id, request_fingerprint) REFERENCES public.authorization_operation_receipts(community_id, operation_id, request_fingerprint) DEFERRABLE INITIALLY DEFERRED;
+
+
+--
+-- Name: authorization_authority_epochs authorization_authority_epochs_community_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.authorization_authority_epochs
+    ADD CONSTRAINT authorization_authority_epochs_community_id_fkey FOREIGN KEY (community_id) REFERENCES public.communities(id);
+
+
+--
 -- Name: authorization_event_capacity authorization_event_capacity_community_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -5752,6 +6018,14 @@ ALTER TABLE ONLY public.authorization_events
 
 ALTER TABLE ONLY public.authorization_events
     ADD CONSTRAINT authorization_events_community_id_operation_id_request_fin_fkey FOREIGN KEY (community_id, operation_id, request_fingerprint) REFERENCES public.authorization_operation_receipts(community_id, operation_id, request_fingerprint) DEFERRABLE INITIALLY DEFERRED;
+
+
+--
+-- Name: authorization_invalidation_domains authorization_invalidation_domains_community_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.authorization_invalidation_domains
+    ADD CONSTRAINT authorization_invalidation_domains_community_id_fkey FOREIGN KEY (community_id) REFERENCES public.communities(id);
 
 
 --
@@ -6027,6 +6301,38 @@ ALTER TABLE ONLY public.product_feedback
 
 
 --
+-- Name: protected_object_authority protected_object_authority_community_id_binding_id_binding_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.protected_object_authority
+    ADD CONSTRAINT protected_object_authority_community_id_binding_id_binding_fkey FOREIGN KEY (community_id, binding_id, binding_version) REFERENCES public.identity_bindings(community_id, binding_id, binding_version) DEFERRABLE INITIALLY DEFERRED;
+
+
+--
+-- Name: protected_object_authority protected_object_authority_community_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.protected_object_authority
+    ADD CONSTRAINT protected_object_authority_community_id_fkey FOREIGN KEY (community_id) REFERENCES public.communities(id);
+
+
+--
+-- Name: protected_object_authority protected_object_authority_community_id_object_kind_object_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.protected_object_authority
+    ADD CONSTRAINT protected_object_authority_community_id_object_kind_object_fkey FOREIGN KEY (community_id, object_kind, object_key, authority_epoch, fence, operation_id, request_fingerprint) REFERENCES public.authorization_authority_epochs(community_id, object_kind, object_key, authority_epoch, fence, operation_id, request_fingerprint) DEFERRABLE INITIALLY DEFERRED;
+
+
+--
+-- Name: protected_object_authority protected_object_authority_community_id_operation_id_reque_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.protected_object_authority
+    ADD CONSTRAINT protected_object_authority_community_id_operation_id_reque_fkey FOREIGN KEY (community_id, operation_id, request_fingerprint) REFERENCES public.authorization_operation_receipts(community_id, operation_id, request_fingerprint) DEFERRABLE INITIALLY DEFERRED;
+
+
+--
 -- Name: pubkey_allowlist pubkey_allowlist_community_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -6237,6 +6543,7 @@ ALTER TABLE ONLY public.workflows
 --
 -- PostgreSQL database dump complete
 --
+
 
 -- Deterministic seed state installed by migrations.
 INSERT INTO public._operator_global_tables (table_name, reason) VALUES

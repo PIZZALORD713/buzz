@@ -254,11 +254,25 @@ async fn parity_scenario() {
     assert_eq!(preserved.2, vec![0x41; 32]);
     assert_eq!(preserved.3, 1);
     assert!(preserved.4 > 0);
+    MIGRATOR
+        .run_to(32, &pool)
+        .await
+        .expect("apply protected-authority prerequisite 0032");
+    let protected_rows: (i64, i64, i64) = sqlx::query_as(
+        "SELECT \
+            (SELECT count(*) FROM authorization_invalidation_domains), \
+            (SELECT count(*) FROM authorization_authority_epochs), \
+            (SELECT count(*) FROM protected_object_authority)",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("read empty protected-authority prerequisite tables");
+    assert_eq!(protected_rows, (0, 0, 0));
     let populated_catalog = catalog_snapshot(&pool).await;
     let populated_seeds = seed_snapshot(&pool).await;
     assert_eq!(
         populated_catalog, fresh_catalog,
-        "populated synthesized-#1476 upgrade must produce the fresh 0031 catalog"
+        "populated synthesized-#1476 upgrade must produce the fresh 0032 catalog"
     );
     assert_eq!(populated_seeds, fresh_seeds);
 
@@ -295,7 +309,8 @@ async fn parity_scenario() {
 
 #[tokio::test]
 #[ignore = "requires a dedicated disposable Postgres database"]
-async fn identity_0031_fresh_populated_and_desired_schema_have_full_postgresql_catalog_parity() {
+async fn protected_authority_0032_fresh_populated_and_desired_schema_have_full_postgresql_catalog_parity(
+) {
     tokio::time::timeout(TEST_DEADLINE, parity_scenario())
         .await
         .expect("full catalog parity exceeded its 120-second wall-clock budget");

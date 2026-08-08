@@ -565,7 +565,7 @@ mod tests {
         let mut migrations: Vec<_> = MIGRATOR.iter().collect();
         migrations.sort_by_key(|migration| migration.version);
 
-        assert_eq!(migrations.len(), 31);
+        assert_eq!(migrations.len(), 32);
         assert_eq!(migrations[0].version, 1);
         assert_eq!(&*migrations[0].description, "initial schema");
         assert!(migrations[0]
@@ -997,6 +997,20 @@ mod tests {
             .sql
             .as_str()
             .contains("CREATE TABLE authorization_events"));
+        assert_eq!(migrations[31].version, 32);
+        assert_eq!(&*migrations[31].description, "nip fi protected authority");
+        assert!(migrations[31]
+            .sql
+            .as_str()
+            .contains("CREATE TABLE authorization_invalidation_domains"));
+        assert!(migrations[31]
+            .sql
+            .as_str()
+            .contains("CREATE TABLE authorization_authority_epochs"));
+        assert!(migrations[31]
+            .sql
+            .as_str()
+            .contains("CREATE TABLE protected_object_authority"));
     }
 
     #[test]
@@ -1014,12 +1028,12 @@ mod tests {
         }
         assert_eq!(
             migrations.last().map(|migration| migration.version),
-            Some(31)
+            Some(32)
         );
     }
 
     #[test]
-    fn synthesized_0029_and_0030_migration_identity_is_frozen() {
+    fn synthesized_0029_through_0031_migration_identity_is_frozen() {
         let expected = [
             (
                 29,
@@ -1030,6 +1044,11 @@ mod tests {
                 30,
                 "identity binding lifecycle",
                 "5cfea5f92cab63b9d9dc31ac1d0e7e09f291c9ab631662c2160662ba79d783515d3ed40417e641ded428f63a50a4881b",
+            ),
+            (
+                31,
+                "nip fi identity lifecycle upgrade",
+                "31e919e55af4c50d4de4247eaddbdb454178df218a07fcb635466fecf632bdbb7b2f25cb1d486d1225dc9f2dfef92065",
             ),
         ];
         for (version, description, checksum) in expected {
@@ -1371,7 +1390,7 @@ mod tests {
         run_migrations(&pool)
             .await
             .expect("retry succeeds after operator repair");
-        assert_eq!(applied_versions(&pool).await.last().copied(), Some(31));
+        assert_eq!(applied_versions(&pool).await.last().copied(), Some(32));
     }
 
     #[tokio::test]
@@ -1902,5 +1921,261 @@ mod tests {
         })
         .await
         .expect("0031 projection rejection test exceeded 120 seconds");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn protected_authority_0032_enforces_exact_fence_and_immutability() {
+        tokio::time::timeout(std::time::Duration::from_secs(120), async {
+            let pool = connect_test_pool().await;
+            reset_public_schema(&pool).await;
+            MIGRATOR
+                .run_to(30, &pool)
+                .await
+                .expect("apply synthesized #1476 boundary");
+            sqlx::raw_sql(
+                r#"
+                INSERT INTO communities (id,host)
+                VALUES ('62000000-0000-0000-0000-000000000001','protected-authority.example');
+                INSERT INTO identity_bindings
+                    (community_id,issuer,uid,pubkey,source,created_at,updated_at,last_seen_at)
+                VALUES
+                    ('62000000-0000-0000-0000-000000000001','protected-issuer',
+                     'protected-subject',decode(repeat('62',32),'hex'),'jwt_npub',
+                     '2026-04-01 00:00:00+00','2026-04-01 00:00:00+00',
+                     '2026-04-01 00:00:00+00');
+                "#,
+            )
+            .execute(&pool)
+            .await
+            .expect("seed populated #1476 identity");
+            MIGRATOR
+                .run_to(32, &pool)
+                .await
+                .expect("project identity and apply protected-authority prerequisite");
+            for later_table in [
+                "authorization_invalidation_floors",
+                "authorization_operation_version_delta_manifests",
+                "authorization_operation_version_deltas",
+                "client_status_revisions",
+                "authorization_operator_authentication_denial_attempts",
+                "git_repo_publications",
+                "media_publications",
+                "audio_session_admissions",
+            ] {
+                let present: Option<String> = sqlx::query_scalar("SELECT to_regclass($1)::text")
+                    .bind(format!("public.{later_table}"))
+                    .fetch_one(&pool)
+                    .await
+                    .expect("inspect excluded later-scope table");
+                assert_eq!(present, None, "0032 must not create {later_table}");
+            }
+            sqlx::query(
+                "SELECT authorization_event_capacity_install_v1( \
+                    '62000000-0000-0000-0000-000000000001',10000,16777216,16384)",
+            )
+            .execute(&pool)
+            .await
+            .expect("adopt fixture capacity policy");
+
+            sqlx::raw_sql(
+                r#"
+                INSERT INTO authorization_operation_receipts
+                    (community_id,operation_id,request_fingerprint,operation_kind,
+                     actor_fingerprint,outcome_code,result_digest)
+                VALUES
+                    ('62000000-0000-0000-0000-000000000001',
+                     '62000000-0000-0000-0000-000000000011',decode(repeat('11',32),'hex'),
+                     11,decode(repeat('12',32),'hex'),1,decode(repeat('13',32),'hex'));
+                INSERT INTO authorization_events
+                    (community_id,event_id,event_kind,outcome_code,reason_code,actor_kind,
+                     actor_fingerprint,operation_id,request_fingerprint,correlation_id,
+                     attempt_id,occurred_at,canonical_envelope,envelope_digest)
+                VALUES
+                    ('62000000-0000-0000-0000-000000000001',
+                     '62000000-0000-0000-0000-000000000012',10,1,1,1,
+                     decode(repeat('12',32),'hex'),
+                     '62000000-0000-0000-0000-000000000011',decode(repeat('11',32),'hex'),
+                     '62000000-0000-0000-0000-000000000013',
+                     '62000000-0000-0000-0000-000000000014',clock_timestamp(),
+                     decode('01','hex'),digest(decode('01','hex'),'sha256'));
+                INSERT INTO authorization_invalidation_domains
+                    (community_id,current_generation)
+                VALUES ('62000000-0000-0000-0000-000000000001',0);
+                "#,
+            )
+            .execute(&pool)
+            .await
+            .expect("seed protected operation receipt, event, and domain marker");
+
+            for statement in [
+                "INSERT INTO authorization_authority_epochs \
+                 (community_id,object_kind,object_key,authority_epoch,fence,operation_id,request_fingerprint) \
+                 VALUES ('62000000-0000-0000-0000-000000000001',3,decode(repeat('31',32),'hex'),1, \
+                         decode(repeat('00',32),'hex'),'62000000-0000-0000-0000-000000000011', \
+                         decode(repeat('11',32),'hex'))",
+                "INSERT INTO authorization_authority_epochs \
+                 (community_id,object_kind,object_key,authority_epoch,fence,operation_id,request_fingerprint) \
+                 VALUES ('62000000-0000-0000-0000-000000000001',8,decode(repeat('31',32),'hex'),1, \
+                         decode(repeat('21',32),'hex'),'62000000-0000-0000-0000-000000000011', \
+                         decode(repeat('11',32),'hex'))",
+            ] {
+                assert!(
+                    sqlx::query(statement).execute(&pool).await.is_err(),
+                    "invalid epoch/fence row must be rejected: {statement}"
+                );
+            }
+
+            sqlx::raw_sql(
+                r#"
+                INSERT INTO authorization_authority_epochs
+                    (community_id,object_kind,object_key,authority_epoch,fence,
+                     operation_id,request_fingerprint)
+                VALUES
+                    ('62000000-0000-0000-0000-000000000001',3,
+                     decode(repeat('31',32),'hex'),1,decode(repeat('21',32),'hex'),
+                     '62000000-0000-0000-0000-000000000011',decode(repeat('11',32),'hex'));
+                INSERT INTO protected_object_authority
+                    (community_id,object_kind,object_key,capability,actor_pubkey,
+                     binding_id,binding_version,policy_revision,invalidation_generation,
+                     authority_epoch,fence,issued_at,expires_at,operation_id,request_fingerprint)
+                SELECT
+                    '62000000-0000-0000-0000-000000000001',3,
+                    decode(repeat('31',32),'hex'),16,decode(repeat('62',32),'hex'),
+                    binding_id,binding_version,1,0,1,decode(repeat('21',32),'hex'),
+                    '2026-04-02 00:00:00+00','2026-04-02 01:00:00+00',
+                    '62000000-0000-0000-0000-000000000011',decode(repeat('11',32),'hex')
+                FROM identity_bindings
+                WHERE community_id='62000000-0000-0000-0000-000000000001';
+                "#,
+            )
+            .execute(&pool)
+            .await
+            .expect("insert exact epoch and protected authority");
+
+            for statement in [
+                "UPDATE authorization_invalidation_domains \
+                 SET current_generation=-1,updated_at=updated_at+interval '1 microsecond'",
+                "DELETE FROM authorization_invalidation_domains",
+                "TRUNCATE authorization_invalidation_domains",
+                "UPDATE authorization_authority_epochs \
+                 SET authority_epoch=2,updated_at=updated_at+interval '1 microsecond'",
+                "UPDATE authorization_authority_epochs \
+                 SET fence=decode(repeat('22',32),'hex'),updated_at=updated_at+interval '1 microsecond'",
+                "DELETE FROM authorization_authority_epochs",
+                "TRUNCATE authorization_authority_epochs",
+                "UPDATE protected_object_authority \
+                 SET expires_at=expires_at+interval '1 second'",
+                "UPDATE protected_object_authority \
+                 SET authority_epoch=2,issued_at=issued_at+interval '1 second'",
+                "DELETE FROM protected_object_authority",
+                "TRUNCATE protected_object_authority",
+            ] {
+                assert!(
+                    sqlx::query(statement).execute(&pool).await.is_err(),
+                    "forbidden mutation must fail closed: {statement}"
+                );
+            }
+
+            for statement in [
+                "INSERT INTO protected_object_authority \
+                 (community_id,object_kind,object_key,capability,actor_pubkey,binding_id, \
+                  binding_version,owner_pubkey,delegated_relationship_id, \
+                  delegated_relationship_revision,delegation_conditions_fingerprint, \
+                  policy_revision,invalidation_generation,authority_epoch,fence,issued_at, \
+                  expires_at,operation_id,request_fingerprint) \
+                 SELECT community_id,4,decode(repeat('41',32),'hex'),18, \
+                        event_author_pubkey,binding_id,binding_version,decode(repeat('62',32),'hex'), \
+                        '00000000-0000-0000-0000-000000000000',1,decode(repeat('42',32),'hex'), \
+                        1,0,1,decode(repeat('21',32),'hex'),'2026-04-02 00:00:00+00', \
+                        '2026-04-02 01:00:00+00','62000000-0000-0000-0000-000000000011', \
+                        decode(repeat('11',32),'hex') FROM identity_bindings \
+                 WHERE community_id='62000000-0000-0000-0000-000000000001'",
+                "INSERT INTO protected_object_authority \
+                 (community_id,object_kind,object_key,capability,actor_pubkey,binding_id, \
+                  binding_version,owner_pubkey,policy_revision,invalidation_generation, \
+                  authority_epoch,fence,issued_at,expires_at,operation_id,request_fingerprint) \
+                 SELECT community_id,4,decode(repeat('42',32),'hex'),18, \
+                        event_author_pubkey,binding_id,binding_version,decode(repeat('62',32),'hex'), \
+                        1,0,1,decode(repeat('21',32),'hex'),'2026-04-02 00:00:00+00', \
+                        '2026-04-02 01:00:00+00','62000000-0000-0000-0000-000000000011', \
+                        decode(repeat('11',32),'hex') FROM identity_bindings \
+                 WHERE community_id='62000000-0000-0000-0000-000000000001'",
+                "INSERT INTO protected_object_authority \
+                 (community_id,object_kind,object_key,capability,actor_pubkey,binding_id, \
+                  binding_version,policy_revision,invalidation_generation,authority_epoch,fence, \
+                  issued_at,expires_at,operation_id,request_fingerprint) \
+                 SELECT community_id,4,decode(repeat('43',32),'hex'),18,event_author_pubkey, \
+                        binding_id,binding_version,1,0,1,decode(repeat('21',32),'hex'), \
+                        '2026-04-02 00:00:00+00','2026-04-02 01:00:00+00', \
+                        '62000000-0000-0000-0000-000000000011',decode(repeat('11',32),'hex') \
+                 FROM identity_bindings \
+                 WHERE community_id='62000000-0000-0000-0000-000000000001'",
+            ] {
+                assert!(
+                    sqlx::query(statement).execute(&pool).await.is_err(),
+                    "invalid delegation or mismatched epoch witness must fail: {statement}"
+                );
+            }
+
+            sqlx::raw_sql(
+                r#"
+                INSERT INTO authorization_operation_receipts
+                    (community_id,operation_id,request_fingerprint,operation_kind,
+                     actor_fingerprint,outcome_code,result_digest)
+                VALUES
+                    ('62000000-0000-0000-0000-000000000001',
+                     '62000000-0000-0000-0000-000000000021',decode(repeat('51',32),'hex'),
+                     11,decode(repeat('52',32),'hex'),1,decode(repeat('53',32),'hex'));
+                INSERT INTO authorization_events
+                    (community_id,event_id,event_kind,outcome_code,reason_code,actor_kind,
+                     actor_fingerprint,operation_id,request_fingerprint,correlation_id,
+                     attempt_id,occurred_at,canonical_envelope,envelope_digest)
+                VALUES
+                    ('62000000-0000-0000-0000-000000000001',
+                     '62000000-0000-0000-0000-000000000022',10,1,1,1,
+                     decode(repeat('52',32),'hex'),
+                     '62000000-0000-0000-0000-000000000021',decode(repeat('51',32),'hex'),
+                     '62000000-0000-0000-0000-000000000023',
+                     '62000000-0000-0000-0000-000000000024',clock_timestamp(),
+                     decode('02','hex'),digest(decode('02','hex'),'sha256'));
+                BEGIN;
+                UPDATE authorization_authority_epochs
+                SET authority_epoch=2,fence=decode(repeat('22',32),'hex'),
+                    operation_id='62000000-0000-0000-0000-000000000021',
+                    request_fingerprint=decode(repeat('51',32),'hex'),
+                    updated_at=updated_at+interval '1 second'
+                WHERE community_id='62000000-0000-0000-0000-000000000001'
+                  AND object_kind=3 AND object_key=decode(repeat('31',32),'hex');
+                UPDATE protected_object_authority
+                SET authority_epoch=2,fence=decode(repeat('22',32),'hex'),
+                    operation_id='62000000-0000-0000-0000-000000000021',
+                    request_fingerprint=decode(repeat('51',32),'hex'),
+                    issued_at=issued_at+interval '1 second',
+                    expires_at=expires_at+interval '1 second'
+                WHERE community_id='62000000-0000-0000-0000-000000000001'
+                  AND object_kind=3 AND object_key=decode(repeat('31',32),'hex');
+                COMMIT;
+                "#,
+            )
+            .execute(&pool)
+            .await
+            .expect("strict new-operation epoch/fence replacement commits atomically");
+            let replaced: (i64, Vec<u8>, uuid::Uuid) = sqlx::query_as(
+                "SELECT authority_epoch,fence,operation_id FROM protected_object_authority",
+            )
+            .fetch_one(&pool)
+            .await
+            .expect("read replaced authority");
+            assert_eq!(replaced.0, 2);
+            assert_eq!(replaced.1, vec![0x22; 32]);
+            assert_eq!(
+                replaced.2,
+                uuid::Uuid::parse_str("62000000-0000-0000-0000-000000000021").unwrap()
+            );
+            pool.close().await;
+        })
+        .await
+        .expect("0032 protected-authority test exceeded 120 seconds");
     }
 }
