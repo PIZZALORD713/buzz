@@ -8,6 +8,10 @@ use sqlx::PgPool;
 
 use crate::Result;
 
+#[cfg(test)]
+#[path = "migration_catalog_tests.rs"]
+mod catalog_tests;
+
 static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("../../migrations");
 
 /// Run all pending Buzz database migrations.
@@ -561,7 +565,7 @@ mod tests {
         let mut migrations: Vec<_> = MIGRATOR.iter().collect();
         migrations.sort_by_key(|migration| migration.version);
 
-        assert_eq!(migrations.len(), 30);
+        assert_eq!(migrations.len(), 31);
         assert_eq!(migrations[0].version, 1);
         assert_eq!(&*migrations[0].description, "initial schema");
         assert!(migrations[0]
@@ -900,7 +904,7 @@ mod tests {
 
         let desired_schema = include_str!("../../../schema/schema.sql");
         assert!(
-            desired_schema.contains("CREATE TABLE join_policy_acceptances"),
+            desired_schema.contains("CREATE TABLE public.join_policy_acceptances"),
             "desired-state schema must include join-policy evidence used by invite claims",
         );
         // Replica heartbeat (this branch, renumbered to 0026 after
@@ -942,7 +946,7 @@ mod tests {
         assert!(
             long_reactions.contains("ALTER TABLE reactions ALTER COLUMN emoji TYPE VARCHAR(66)")
         );
-        assert!(desired_schema.contains("emoji               VARCHAR(66) NOT NULL"));
+        assert!(desired_schema.contains("emoji character varying(66) NOT NULL"));
 
         // Relay-verified identity bindings are additive and community-scoped.
         assert_eq!(migrations[28].version, 29);
@@ -980,6 +984,67 @@ mod tests {
             .sql
             .as_str()
             .contains("CREATE TABLE identity_revoked_keys"));
+        assert_eq!(migrations[30].version, 31);
+        assert_eq!(
+            &*migrations[30].description,
+            "nip fi identity lifecycle upgrade"
+        );
+        assert!(migrations[30]
+            .sql
+            .as_str()
+            .contains("CREATE TABLE authorization_operation_receipts"));
+        assert!(migrations[30]
+            .sql
+            .as_str()
+            .contains("CREATE TABLE authorization_events"));
+    }
+
+    #[test]
+    fn embedded_migration_ordinals_and_names_are_unique_and_contiguous() {
+        let mut migrations: Vec<_> = MIGRATOR.iter().collect();
+        migrations.sort_by_key(|migration| migration.version);
+        let mut names = BTreeSet::new();
+        for (index, migration) in migrations.iter().enumerate() {
+            assert_eq!(migration.version, i64::try_from(index + 1).unwrap());
+            assert!(
+                names.insert(migration.description.to_string()),
+                "duplicate migration description: {}",
+                migration.description
+            );
+        }
+        assert_eq!(
+            migrations.last().map(|migration| migration.version),
+            Some(31)
+        );
+    }
+
+    #[test]
+    fn synthesized_0029_and_0030_migration_identity_is_frozen() {
+        let expected = [
+            (
+                29,
+                "identity bindings",
+                "704658523afe4e20544a6411b165fd2ad38f1f8aa7751072b6da2ce5fc7a7a64510156da3c68269be7516aa38e43124e",
+            ),
+            (
+                30,
+                "identity binding lifecycle",
+                "5cfea5f92cab63b9d9dc31ac1d0e7e09f291c9ab631662c2160662ba79d783515d3ed40417e641ded428f63a50a4881b",
+            ),
+        ];
+        for (version, description, checksum) in expected {
+            let migration = MIGRATOR
+                .iter()
+                .find(|migration| migration.version == version)
+                .unwrap_or_else(|| panic!("missing migration {version}"));
+            assert_eq!(&*migration.description, description);
+            let actual = migration
+                .checksum
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>();
+            assert_eq!(actual, checksum, "migration {version} checksum changed");
+        }
     }
 
     #[test]
@@ -1130,7 +1195,26 @@ mod tests {
             .or_else(|_| std::env::var("DATABASE_URL"))
             .unwrap_or_else(|_| TEST_DB_URL.to_owned());
 
-        PgPool::connect(&database_url)
+        sqlx::postgres::PgPoolOptions::new()
+            .max_connections(4)
+            .after_connect(|connection, _| {
+                Box::pin(async move {
+                    sqlx::query("SET statement_timeout = '30s'")
+                        .execute(&mut *connection)
+                        .await?;
+                    sqlx::query("SET lock_timeout = '5s'")
+                        .execute(&mut *connection)
+                        .await?;
+                    sqlx::query("SET idle_in_transaction_session_timeout = '30s'")
+                        .execute(&mut *connection)
+                        .await?;
+                    sqlx::query("SET TIME ZONE 'UTC'")
+                        .execute(&mut *connection)
+                        .await?;
+                    Ok(())
+                })
+            })
+            .connect(&database_url)
             .await
             .expect("connect to test DB")
     }
@@ -1153,6 +1237,71 @@ mod tests {
         .fetch_all(pool)
         .await
         .expect("read applied migrations")
+    }
+
+    async fn assert_0031_projection_rejects_atomically(
+        pool: &PgPool,
+        seed_0029: &'static str,
+        complete_0030: &'static str,
+        expected_constraint: &'static str,
+    ) {
+        reset_public_schema(pool).await;
+        MIGRATOR
+            .run_to(29, pool)
+            .await
+            .expect("apply migrations through 0029");
+        sqlx::raw_sql(seed_0029)
+            .execute(pool)
+            .await
+            .expect("seed rejected projection corpus");
+        MIGRATOR
+            .run_to(30, pool)
+            .await
+            .expect("apply frozen migration 0030");
+        if !complete_0030.is_empty() {
+            sqlx::raw_sql(complete_0030)
+                .execute(pool)
+                .await
+                .expect("complete rejected 0030 corpus");
+        }
+        let before_count: i64 = sqlx::query_scalar("SELECT count(*) FROM identity_bindings")
+            .fetch_one(pool)
+            .await
+            .expect("count legacy rows before blocked migration");
+        let error = MIGRATOR
+            .run_to(31, pool)
+            .await
+            .expect_err("ambiguous 0030 authority must block projection");
+        assert!(
+            format!("{error:#}").contains(expected_constraint),
+            "unexpected 0031 projection error: {error:#}"
+        );
+        assert_eq!(applied_versions(pool).await.last().copied(), Some(30));
+        assert_eq!(
+            sqlx::query_scalar::<_, Option<String>>(
+                "SELECT to_regclass('public.identity_bindings')::text",
+            )
+            .fetch_one(pool)
+            .await
+            .expect("read legacy table identity"),
+            Some("identity_bindings".to_owned())
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, Option<String>>(
+                "SELECT to_regclass('public.identity_bindings_legacy_0031')::text",
+            )
+            .fetch_one(pool)
+            .await
+            .expect("read staging table identity"),
+            None
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM identity_bindings")
+                .fetch_one(pool)
+                .await
+                .expect("count legacy rows after blocked migration"),
+            before_count
+        );
     }
 
     #[tokio::test]
@@ -1222,7 +1371,7 @@ mod tests {
         run_migrations(&pool)
             .await
             .expect("retry succeeds after operator repair");
-        assert_eq!(applied_versions(&pool).await.last().copied(), Some(30));
+        assert_eq!(applied_versions(&pool).await.last().copied(), Some(31));
     }
 
     #[tokio::test]
@@ -1345,5 +1494,413 @@ mod tests {
             search_expression.contains("ELSE NULL::tsvector"),
             "fresh installs must default non-allowlisted kinds to NULL: {search_expression}"
         );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn populated_0030_projects_exact_lifecycle_and_capacity_bootstrap() {
+        tokio::time::timeout(std::time::Duration::from_secs(120), async {
+            let pool = connect_test_pool().await;
+            reset_public_schema(&pool).await;
+            MIGRATOR
+                .run_to(29, &pool)
+                .await
+                .expect("apply frozen migrations through 0029");
+
+            sqlx::raw_sql(
+                r#"
+                INSERT INTO communities (id, host) VALUES
+                    ('10000000-0000-0000-0000-000000000001', 'projection.example');
+
+                INSERT INTO identity_bindings
+                    (community_id,issuer,uid,pubkey,source,created_at,updated_at,last_seen_at,
+                     revoked_at,revoked_by,revoked_reason)
+                VALUES
+                    ('10000000-0000-0000-0000-000000000001','issuer-a','active',
+                     decode(repeat('11',32),'hex'),'db_binding',
+                     '2026-01-01 00:00:00+00','2026-01-01 00:00:00+00','2026-01-01 00:00:00+00',
+                     NULL,NULL,NULL),
+                    ('10000000-0000-0000-0000-000000000001','issuer-b','disabled',
+                     decode(repeat('22',32),'hex'),'jwt_npub',
+                     '2026-01-02 00:00:00+00','2026-01-03 00:00:00+00','2026-01-03 00:00:00+00',
+                     '2026-01-03 00:00:00+00',decode(repeat('a2',32),'hex'),'disabled'),
+                    ('10000000-0000-0000-0000-000000000001','issuer-c','revoked',
+                     decode(repeat('33',32),'hex'),'jwt_npub',
+                     '2026-01-04 00:00:00+00','2026-01-05 00:00:00+00','2026-01-05 00:00:00+00',
+                     '2026-01-05 00:00:00+00',decode(repeat('a3',32),'hex'),'revoked'),
+                    ('10000000-0000-0000-0000-000000000001','issuer-d','rotated',
+                     decode(repeat('44',32),'hex'),'jwt_npub',
+                     '2026-01-06 00:00:00+00','2026-01-07 00:00:00+00','2026-01-07 00:00:00+00',
+                     '2026-01-07 00:00:00+00',decode(repeat('a4',32),'hex'),'rotated'),
+                    ('10000000-0000-0000-0000-000000000001','issuer-d','rotated',
+                     decode(repeat('45',32),'hex'),'jwt_npub',
+                     '2026-01-07 00:00:00+00','2026-01-07 00:00:00+00','2026-01-07 00:00:00+00',
+                     NULL,NULL,NULL),
+                    ('10000000-0000-0000-0000-000000000001','issuer-e','recovered',
+                     decode(repeat('55',32),'hex'),'jwt_npub',
+                     '2026-01-08 00:00:00+00','2026-01-09 00:00:00+00','2026-01-09 00:00:00+00',
+                     '2026-01-09 00:00:00+00',decode(repeat('a5',32),'hex'),'revoked before recovery'),
+                    ('10000000-0000-0000-0000-000000000001','issuer-e','recovered',
+                     decode(repeat('56',32),'hex'),'jwt_npub',
+                     '2026-01-10 00:00:00+00','2026-01-10 00:00:00+00','2026-01-10 00:00:00+00',
+                     NULL,NULL,NULL);
+                "#,
+            )
+            .execute(&pool)
+            .await
+            .expect("seed populated 0029 corpus");
+
+            MIGRATOR
+                .run_to(30, &pool)
+                .await
+                .expect("apply frozen migration 0030");
+            sqlx::raw_sql(
+                r#"
+                UPDATE identity_bindings
+                SET revocation_scope='key'
+                WHERE issuer='issuer-c' AND uid='revoked';
+                UPDATE identity_bindings
+                SET revocation_scope='rotation',
+                    rotation_completed_at='2026-01-07 00:00:00+00',
+                    rotated_to_pubkey=decode(repeat('45',32),'hex'),
+                    rotation_by=decode(repeat('a4',32),'hex'),
+                    rotation_reason='rotated'
+                WHERE issuer='issuer-d' AND uid='rotated'
+                  AND pubkey=decode(repeat('44',32),'hex');
+                UPDATE identity_bindings
+                SET revocation_scope='key',
+                    rotation_completed_at='2026-01-10 00:00:00+00',
+                    rotated_to_pubkey=decode(repeat('56',32),'hex'),
+                    rotation_by=decode(repeat('b5',32),'hex'),
+                    rotation_reason='recovered'
+                WHERE issuer='issuer-e' AND uid='recovered'
+                  AND pubkey=decode(repeat('55',32),'hex');
+                DELETE FROM identity_principals
+                WHERE issuer IN ('issuer-c','issuer-d','issuer-e');
+                INSERT INTO identity_principals
+                    (community_id,issuer,uid,disabled_at,disabled_by,disabled_reason)
+                VALUES
+                    ('10000000-0000-0000-0000-000000000001','issuer-f','inactive',
+                     '2026-01-11 00:00:00+00',decode(repeat('a6',32),'hex'),'inactive disable');
+                INSERT INTO identity_revoked_keys
+                    (community_id,pubkey,revoked_at,revoked_by,reason)
+                VALUES
+                    ('10000000-0000-0000-0000-000000000001',decode(repeat('77',32),'hex'),
+                     '2026-01-12 00:00:00+00',decode(repeat('a7',32),'hex'),'standalone revoke');
+                "#,
+            )
+            .execute(&pool)
+            .await
+            .expect("complete authoritative 0030 lifecycle corpus");
+
+            MIGRATOR
+                .run_to(31, &pool)
+                .await
+                .expect("project populated 0030 corpus through 0031");
+
+            assert_eq!(
+                sqlx::query_scalar::<_, i64>("SELECT count(*) FROM identity_bindings")
+                    .fetch_one(&pool)
+                    .await
+                    .expect("count bindings"),
+                7
+            );
+            assert_eq!(
+                sqlx::query_scalar::<_, i64>("SELECT count(*) FROM identity_lifecycle_history")
+                    .fetch_one(&pool)
+                    .await
+                    .expect("count history"),
+                14
+            );
+            assert_eq!(
+                sqlx::query_scalar::<_, i64>("SELECT count(*) FROM authorization_events")
+                    .fetch_one(&pool)
+                    .await
+                    .expect("count events"),
+                14
+            );
+            assert_eq!(
+                sqlx::query_scalar::<_, i64>("SELECT count(*) FROM identity_lifecycle_selectors")
+                    .fetch_one(&pool)
+                .await
+                .expect("count selectors"),
+                14
+            );
+            assert_eq!(
+                sqlx::query_as::<_, (i16, i64)>(
+                    "SELECT selector_kind,count(*) FROM identity_lifecycle_selectors \
+                     GROUP BY selector_kind ORDER BY selector_kind",
+                )
+                .fetch_all(&pool)
+                .await
+                .expect("count P/X/Y/Q selectors"),
+                vec![(1, 4), (2, 2), (3, 5), (4, 3)]
+            );
+            assert_eq!(
+                sqlx::query_scalar::<_, i64>(
+                    "SELECT count(*) FROM identity_lifecycle_selector_consumptions",
+                )
+                .fetch_one(&pool)
+                .await
+                .expect("count selector consumptions"),
+                1
+            );
+            assert_eq!(
+                sqlx::query_scalar::<_, i64>(
+                    "SELECT count(*) FROM identity_lifecycle_selectors selector \
+                     LEFT JOIN identity_lifecycle_selector_consumptions consumption \
+                       USING (community_id,selector_id) \
+                     WHERE selector.selector_kind=4 AND consumption.selector_id IS NULL",
+                )
+                .fetch_one(&pool)
+                .await
+                .expect("count effective pending replacements"),
+                2
+            );
+            let capacity: (i16, i64, i64, i32) = sqlx::query_as(
+                "SELECT configuration_state,retained_event_count,retained_envelope_bytes, \
+                        retained_largest_envelope_bytes \
+                 FROM authorization_event_capacity",
+            )
+            .fetch_one(&pool)
+            .await
+            .expect("read migration capacity bootstrap");
+            assert_eq!(capacity.0, 1);
+            assert_eq!(capacity.1, 14);
+            assert!(capacity.2 > 0);
+            assert!(capacity.3 > 0);
+
+            let unconfigured_event = sqlx::query(
+                "INSERT INTO authorization_events \
+                 (community_id,event_id,event_kind,outcome_code,reason_code,actor_kind, \
+                  operation_id,correlation_id,attempt_id,occurred_at,canonical_envelope, \
+                  envelope_digest) \
+                 VALUES ('10000000-0000-0000-0000-000000000001', \
+                         '21000000-0000-0000-0000-000000000001',9,2,1,4, \
+                         '21000000-0000-0000-0000-000000000002', \
+                         '21000000-0000-0000-0000-000000000003', \
+                         '21000000-0000-0000-0000-000000000004',clock_timestamp(), \
+                         decode('01','hex'),digest(decode('01','hex'),'sha256'))",
+            )
+            .execute(&pool)
+            .await;
+            assert!(
+                unconfigured_event.is_err(),
+                "migration bootstrap must reject event writes before policy adoption"
+            );
+            assert_eq!(
+                sqlx::query_scalar::<_, i64>("SELECT count(*) FROM authorization_events")
+                    .fetch_one(&pool)
+                    .await
+                    .expect("count events after blocked unconfigured write"),
+                14
+            );
+            assert_eq!(
+                sqlx::query_scalar::<_, i64>(
+                    "SELECT retained_event_count FROM authorization_event_capacity",
+                )
+                .fetch_one(&pool)
+                .await
+                .expect("read counters after blocked unconfigured write"),
+                14
+            );
+
+            let blocked = sqlx::query(
+                "INSERT INTO authorization_operation_receipts \
+                 (community_id,operation_id,request_fingerprint,operation_kind,actor_fingerprint, \
+                  outcome_code,result_digest) \
+                 VALUES ('10000000-0000-0000-0000-000000000001', \
+                         '20000000-0000-0000-0000-000000000001',decode(repeat('01',32),'hex'), \
+                         1,decode(repeat('02',32),'hex'),1,decode(repeat('03',32),'hex'))",
+            )
+            .execute(&pool)
+            .await;
+            assert!(blocked.is_err(), "lifecycle receipt without event must fail closed");
+
+            sqlx::query(
+                "SELECT authorization_event_capacity_install_v1( \
+                    '10000000-0000-0000-0000-000000000001',10000,16777216,16384)",
+            )
+            .execute(&pool)
+            .await
+            .expect("adopt configured fixture capacity");
+            sqlx::query(
+                "SELECT authorization_event_capacity_install_v1( \
+                    '10000000-0000-0000-0000-000000000001',10000,16777216,16384)",
+            )
+            .execute(&pool)
+            .await
+            .expect("exact capacity replay is idempotent");
+            let conflict = sqlx::query(
+                "SELECT authorization_event_capacity_install_v1( \
+                    '10000000-0000-0000-0000-000000000001',10001,16777216,16384)",
+            )
+            .execute(&pool)
+            .await;
+            assert!(conflict.is_err(), "changed capacity policy must conflict");
+        })
+        .await
+        .expect("populated 0030 projection test exceeded 120 seconds");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn authorization_capacity_hard_boundaries_are_exact() {
+        tokio::time::timeout(std::time::Duration::from_secs(120), async {
+            let pool = connect_test_pool().await;
+            reset_public_schema(&pool).await;
+            MIGRATOR.run(&pool).await.expect("apply all migrations");
+            sqlx::raw_sql(
+                "INSERT INTO communities (id,host) VALUES \
+                 ('30000000-0000-0000-0000-000000000001','capacity.example')",
+            )
+            .execute(&pool)
+            .await
+            .expect("insert capacity community");
+
+            sqlx::query(
+                "SELECT authorization_event_capacity_install_v1( \
+                    '30000000-0000-0000-0000-000000000001',1000000,4294967296,65536)",
+            )
+            .execute(&pool)
+            .await
+            .expect("exact hard maxima are accepted");
+            sqlx::query(
+                "INSERT INTO authorization_events \
+                 (community_id,event_id,event_kind,outcome_code,reason_code,actor_kind, \
+                  operation_id,correlation_id,attempt_id,occurred_at,canonical_envelope, \
+                  envelope_digest) \
+                 VALUES ('30000000-0000-0000-0000-000000000001', \
+                         '30000000-0000-0000-0000-000000000002',9,2,1,4, \
+                         '30000000-0000-0000-0000-000000000003', \
+                         '30000000-0000-0000-0000-000000000004', \
+                         '30000000-0000-0000-0000-000000000005',clock_timestamp(), \
+                         decode(repeat('aa',65536),'hex'), \
+                         digest(decode(repeat('aa',65536),'hex'),'sha256'))",
+            )
+            .execute(&pool)
+            .await
+            .expect("exact 64 KiB envelope ceiling is accepted");
+            let oversized = sqlx::query(
+                "INSERT INTO authorization_events \
+                 (community_id,event_id,event_kind,outcome_code,reason_code,actor_kind, \
+                  operation_id,correlation_id,attempt_id,occurred_at,canonical_envelope, \
+                  envelope_digest) \
+                 VALUES ('30000000-0000-0000-0000-000000000001', \
+                         '30000000-0000-0000-0000-000000000012',9,2,1,4, \
+                         '30000000-0000-0000-0000-000000000013', \
+                         '30000000-0000-0000-0000-000000000014', \
+                         '30000000-0000-0000-0000-000000000015',clock_timestamp(), \
+                         decode(repeat('bb',65537),'hex'), \
+                         digest(decode(repeat('bb',65537),'hex'),'sha256'))",
+            )
+            .execute(&pool)
+            .await;
+            assert!(oversized.is_err(), "64 KiB + 1 envelope must be rejected");
+            for statement in [
+                "SELECT authorization_event_capacity_install_v1( \
+                    '30000000-0000-0000-0000-000000000001',1000001,4294967296,65536)",
+                "SELECT authorization_event_capacity_install_v1( \
+                    '30000000-0000-0000-0000-000000000001',1000000,4294967297,65536)",
+                "SELECT authorization_event_capacity_install_v1( \
+                    '30000000-0000-0000-0000-000000000001',1000000,4294967296,65537)",
+            ] {
+                assert!(
+                    sqlx::query(statement).execute(&pool).await.is_err(),
+                    "hard maximum +1 must be rejected: {statement}"
+                );
+            }
+        })
+        .await
+        .expect("capacity boundary test exceeded 120 seconds");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn identity_0031_rejects_duplicate_ambiguous_and_open_lineage_atomically() {
+        tokio::time::timeout(std::time::Duration::from_secs(120), async {
+            let duplicate_pool = connect_test_pool().await;
+            assert_0031_projection_rejects_atomically(
+                &duplicate_pool,
+                r#"
+                INSERT INTO communities (id,host)
+                VALUES ('51000000-0000-0000-0000-000000000001','duplicate.example');
+                INSERT INTO identity_bindings
+                    (community_id,issuer,uid,pubkey,source,created_at,updated_at,last_seen_at,
+                     revoked_at,revoked_by,revoked_reason)
+                SELECT '51000000-0000-0000-0000-000000000001','issuer','duplicate',
+                       decode(repeat('51',32),'hex'),'jwt_npub',
+                       '2026-03-01 00:00:00+00','2026-03-02 00:00:00+00',
+                       '2026-03-02 00:00:00+00','2026-03-02 00:00:00+00',
+                       decode(repeat('d1',32),'hex'),'duplicate'
+                FROM generate_series(1,2);
+                "#,
+                "",
+                "duplicate binding birth coordinates",
+            )
+            .await;
+            duplicate_pool.close().await;
+
+            let ambiguous_pool = connect_test_pool().await;
+            assert_0031_projection_rejects_atomically(
+                &ambiguous_pool,
+                r#"
+                INSERT INTO communities (id,host)
+                VALUES ('52000000-0000-0000-0000-000000000001','ambiguous.example');
+                INSERT INTO identity_bindings
+                    (community_id,issuer,uid,pubkey,source,created_at,updated_at,last_seen_at,
+                     revoked_at,revoked_by,revoked_reason)
+                VALUES ('52000000-0000-0000-0000-000000000001','issuer','missing-successor',
+                        decode(repeat('52',32),'hex'),'jwt_npub',
+                        '2026-03-03 00:00:00+00','2026-03-04 00:00:00+00',
+                        '2026-03-04 00:00:00+00','2026-03-04 00:00:00+00',
+                        decode(repeat('d2',32),'hex'),'rotation');
+                "#,
+                r#"
+                UPDATE identity_bindings
+                SET revocation_scope='rotation',
+                    rotation_completed_at='2026-03-04 00:00:00+00',
+                    rotated_to_pubkey=decode(repeat('53',32),'hex'),
+                    rotation_by=decode(repeat('d2',32),'hex'),
+                    rotation_reason='rotation';
+                DELETE FROM identity_principals;
+                "#,
+                "ambiguous rotation lineage",
+            )
+            .await;
+            ambiguous_pool.close().await;
+
+            let open_pool = connect_test_pool().await;
+            assert_0031_projection_rejects_atomically(
+                &open_pool,
+                r#"
+                INSERT INTO communities (id,host)
+                VALUES ('53000000-0000-0000-0000-000000000001','open-lineage.example');
+                INSERT INTO identity_bindings
+                    (community_id,issuer,uid,pubkey,source,created_at,updated_at,last_seen_at,
+                     revoked_at,revoked_by,revoked_reason)
+                VALUES
+                    ('53000000-0000-0000-0000-000000000001','issuer','two-open',
+                     decode(repeat('54',32),'hex'),'jwt_npub',
+                     '2026-03-05 00:00:00+00','2026-03-06 00:00:00+00',
+                     '2026-03-06 00:00:00+00','2026-03-06 00:00:00+00',
+                     decode(repeat('d3',32),'hex'),'first'),
+                    ('53000000-0000-0000-0000-000000000001','issuer','two-open',
+                     decode(repeat('55',32),'hex'),'jwt_npub',
+                     '2026-03-07 00:00:00+00','2026-03-08 00:00:00+00',
+                     '2026-03-08 00:00:00+00','2026-03-08 00:00:00+00',
+                     decode(repeat('d4',32),'hex'),'second');
+                "#,
+                r#"
+                UPDATE identity_bindings SET revocation_scope='key';
+                DELETE FROM identity_principals;
+                "#,
+                "multiple open pending replacements",
+            )
+            .await;
+            open_pool.close().await;
+        })
+        .await
+        .expect("0031 projection rejection test exceeded 120 seconds");
     }
 }

@@ -331,7 +331,7 @@ jobs:
             target/ci/buzz-relay
             target/ci/git-credential-nostr
             target/ci/backend-integration-tests.tar.zst
-          key: relay-artifacts-${{ runner.os }}-${{ hashFiles('crates/**', 'migrations/**', 'Dockerfile', 'Cargo.toml', 'Cargo.lock', 'rust-toolchain.toml', '.cargo/config.toml', '.github/workflows/ci.yml') }}
+          key: relay-artifacts-${{ runner.os }}-${{ hashFiles('crates/**', 'migrations/**', 'schema/**', 'Dockerfile', 'Cargo.toml', 'Cargo.lock', 'rust-toolchain.toml', '.cargo/config.toml', '.github/workflows/ci.yml') }}
       - uses: rui314/setup-mold@9c9c13bf4c3f1adef0cc596abc155580bcb04444 # v1
         if: steps.relay-artifacts-cache.outputs.cache-hit != 'true'
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
@@ -366,7 +366,7 @@ jobs:
             target/ci/buzz-relay
             target/ci/git-credential-nostr
             target/ci/backend-integration-tests.tar.zst
-          key: relay-artifacts-${{ runner.os }}-${{ hashFiles('crates/**', 'migrations/**', 'Dockerfile', 'Cargo.toml', 'Cargo.lock', 'rust-toolchain.toml', '.cargo/config.toml', '.github/workflows/ci.yml') }}
+          key: relay-artifacts-${{ runner.os }}-${{ hashFiles('crates/**', 'migrations/**', 'schema/**', 'Dockerfile', 'Cargo.toml', 'Cargo.lock', 'rust-toolchain.toml', '.cargo/config.toml', '.github/workflows/ci.yml') }}
       - name: Upload relay artifacts
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
@@ -704,6 +704,18 @@ jobs:
             --run-ignored ignored-only
         env:
           DATABASE_URL: postgres://buzz:${{ env.BUZZ_TEST_POSTGRES_PASSWORD }}@localhost:5432/buzz_identity_tests
+      - name: NIP-FI 0031 projection and exact catalog parity
+        run: |
+          docker exec -e PGPASSWORD="${BUZZ_TEST_POSTGRES_PASSWORD}" buzz-postgres \
+            psql -U buzz -d postgres -v ON_ERROR_STOP=1 \
+            -c "CREATE DATABASE buzz_schema_parity"
+          cargo nextest run \
+            --archive-file target/ci/backend-integration-tests.tar.zst \
+            -E 'package(buzz-db) and (test(identity_0031_fresh_populated_and_desired_schema_have_full_postgresql_catalog_parity) or test(populated_0030_projects_exact_lifecycle_and_capacity_bootstrap) or test(identity_0031_rejects_duplicate_ambiguous_and_open_lineage_atomically) or test(authorization_capacity_hard_boundaries_are_exact))' \
+            --test-threads 1 \
+            --run-ignored ignored-only
+        env:
+          DATABASE_URL: postgres://buzz:${{ env.BUZZ_TEST_POSTGRES_PASSWORD }}@localhost:5432/buzz_schema_parity
       - name: Workspace profile (kind:9033) gate tests
         # Call-site integration for the 9033 authorization gate: open relay
         # rosterless/steward transitions and the closed-relay admin/owner rule,
