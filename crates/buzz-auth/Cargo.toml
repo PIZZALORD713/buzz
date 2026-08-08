@@ -13,6 +13,7 @@ dev = []
 
 [dependencies]
 buzz-core = { workspace = true }
+chrono       = { workspace = true }
 nostr        = { workspace = true }
 serde        = { workspace = true }
 serde_json   = { workspace = true }

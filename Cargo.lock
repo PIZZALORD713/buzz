@@ -904,6 +904,7 @@ name = "buzz-auth"
 version = "0.1.0"
 dependencies = [
  "buzz-core",
+ "chrono",
  "hex",
  "nostr",
  "rand 0.10.1",
