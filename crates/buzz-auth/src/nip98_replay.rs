@@ -60,12 +60,48 @@ pub const MAX_REPLAY_TTL_SECS: u64 = 3600;
 ///
 /// The production implementation lives in `buzz-pubsub` (Redis `SET NX EX`).
 /// A test impl is provided behind `cfg(any(test, feature = "test-utils"))`.
+///
+/// A legacy guard that implements only the single-id operation is rejected at
+/// compile time rather than failing a live multi-proof authorization request:
+///
+/// ```compile_fail,E0046
+/// use std::{future::Future, pin::Pin};
+///
+/// use buzz_auth::{AuthError, Nip98ReplayGuard};
+/// use nostr::EventId;
+///
+/// struct LegacySingleIdGuard;
+///
+/// impl Nip98ReplayGuard for LegacySingleIdGuard {
+///     fn try_mark_in_scope<'a>(
+///         &'a self,
+///         _scope: &'a str,
+///         _event_id: &'a EventId,
+///         _ttl_secs: u64,
+///     ) -> Pin<Box<dyn Future<Output = Result<bool, AuthError>> + Send + 'a>> {
+///         Box::pin(async { Ok(true) })
+///     }
+/// }
+/// ```
 pub trait Nip98ReplayGuard: Send + Sync {
     /// Atomically claim `event_id` in an explicit deployment or community scope.
     fn try_mark_in_scope<'a>(
         &'a self,
         scope: &'a str,
         event_id: &'a EventId,
+        ttl_secs: u64,
+    ) -> Pin<Box<dyn Future<Output = Result<bool, AuthError>> + Send + 'a>>;
+
+    /// Atomically claim one complete proof set in an explicit scope.
+    ///
+    /// Every implementation MUST provide one atomic all-or-none operation.
+    /// It must never emulate atomicity by claiming ids sequentially. Requiring
+    /// the method prevents legacy single-id guards from reaching live
+    /// multi-proof authorization and failing only at runtime.
+    fn try_mark_all_in_scope<'a>(
+        &'a self,
+        scope: &'a str,
+        event_ids: &'a [EventId],
         ttl_secs: u64,
     ) -> Pin<Box<dyn Future<Output = Result<bool, AuthError>> + Send + 'a>>;
 
@@ -135,6 +171,28 @@ impl Nip98ReplayGuard for AlwaysFreshReplayGuard {
         _ttl_secs: u64,
     ) -> Pin<Box<dyn Future<Output = Result<bool, AuthError>> + Send + 'a>> {
         Box::pin(async { Ok(true) })
+    }
+
+    fn try_mark_all_in_scope<'a>(
+        &'a self,
+        _scope: &'a str,
+        event_ids: &'a [EventId],
+        _ttl_secs: u64,
+    ) -> Pin<Box<dyn Future<Output = Result<bool, AuthError>> + Send + 'a>> {
+        Box::pin(async move {
+            let valid_cardinality = (1..=3).contains(&event_ids.len());
+            let distinct = event_ids
+                .iter()
+                .enumerate()
+                .all(|(index, event_id)| !event_ids[..index].contains(event_id));
+            if valid_cardinality && distinct {
+                Ok(true)
+            } else {
+                Err(AuthError::Internal(
+                    "invalid NIP-98 proof-set replay claim".to_owned(),
+                ))
+            }
+        })
     }
 }
 
@@ -245,5 +303,33 @@ mod tests {
             .try_mark(&ctx, &eid, DEFAULT_REPLAY_TTL_SECS)
             .await
             .unwrap());
+    }
+
+    #[tokio::test]
+    async fn always_fresh_batch_contract_accepts_one_two_three_and_rejects_malformed_sets() {
+        let guard = AlwaysFreshReplayGuard;
+        let event_ids = [fixture_event_id(), fixture_event_id(), fixture_event_id()];
+        for count in 1..=3 {
+            assert!(guard
+                .try_mark_all_in_scope(
+                    "mandatory-batch",
+                    &event_ids[..count],
+                    DEFAULT_REPLAY_TTL_SECS,
+                )
+                .await
+                .expect("valid atomic proof set"));
+        }
+        assert!(guard
+            .try_mark_all_in_scope("empty", &[], DEFAULT_REPLAY_TTL_SECS)
+            .await
+            .is_err());
+        assert!(guard
+            .try_mark_all_in_scope(
+                "duplicate",
+                &[event_ids[0], event_ids[0]],
+                DEFAULT_REPLAY_TTL_SECS,
+            )
+            .await
+            .is_err());
     }
 }
