@@ -629,6 +629,17 @@ fn sealed_identity_expiry(
         .map_err(|_| CorporateIdentityError::InvalidJwt("invalid assertion expiry".to_string()))
 }
 
+async fn adopt_verified_identity_policy(
+    state: &AppState,
+    evidence: &VerifiedIdentityBindingEvidence,
+) -> Result<(), CorporateIdentityError> {
+    state
+        .db
+        .adopt_verified_identity_enrollment_policy(evidence)
+        .await?;
+    Ok(())
+}
+
 /// Extract a corporate identity JWT from the configured request header.
 pub fn identity_jwt_from_headers(
     headers: &HeaderMap,
@@ -702,6 +713,7 @@ async fn verify_corporate_identity_inner(
         let evidence = service
             .verify_binding_evidence(token, community_id, signer, transport)
             .await?;
+        adopt_verified_identity_policy(state, &evidence).await?;
         let expires_at = sealed_identity_expiry(&evidence)?;
         let claims = service.validate_jwt(token).await?;
         return Ok(CorporateIdentityProof(
@@ -1197,6 +1209,7 @@ mod tests {
     use jsonwebtoken::jwk::JwkSet;
     use jsonwebtoken::{encode, EncodingKey, Header};
     use nostr::{Keys, ToBech32};
+    use sha2::{Digest, Sha256};
     use sqlx::PgPool;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
@@ -2016,6 +2029,152 @@ mod tests {
         (Arc::new(state), pool, community_id)
     }
 
+    fn fixture_framed_digest(domain: &[u8], fields: &[&[u8]]) -> [u8; 32] {
+        let mut digest = Sha256::new();
+        digest.update((domain.len() as u64).to_be_bytes());
+        digest.update(domain);
+        for field in fields {
+            digest.update((field.len() as u64).to_be_bytes());
+            digest.update(field);
+        }
+        digest.finalize().into()
+    }
+
+    async fn seed_projected_migration_binding(
+        pool: &PgPool,
+        community_id: CommunityId,
+        actor: PublicKey,
+    ) {
+        let operation_id = Uuid::new_v4();
+        let history_id = Uuid::new_v4();
+        let binding_id = Uuid::new_v4();
+        let event_id = Uuid::new_v4();
+        let request_fingerprint = [41_u8; 32];
+        let actor_fingerprint = [42_u8; 32];
+        let result_digest = [43_u8; 32];
+        let transition_digest = [44_u8; 32];
+        let migration_policy_digest = [45_u8; 32];
+        let enrollment_evidence_digest = [46_u8; 32];
+        let principal_fingerprint = fixture_framed_digest(
+            b"buzz:identity-principal:v1",
+            &[
+                community_id.as_uuid().as_bytes(),
+                b"https://idp.example",
+                b"user-1",
+            ],
+        );
+        let canonical_envelope = br#"{"schema_version":1,"source":"migration-0031"}"#.to_vec();
+        let envelope_digest: [u8; 32] = Sha256::digest(&canonical_envelope).into();
+        let now = chrono::Utc::now();
+        let mut transaction = pool.begin().await.expect("begin migration fixture");
+        sqlx::query("SET LOCAL session_replication_role = replica")
+            .execute(&mut *transaction)
+            .await
+            .expect("suspend insert triggers for exact projected fixture");
+        sqlx::query(
+            "INSERT INTO identity_enrollment_policies \
+             (community_id,policy_revision,enrollment_mode,policy_digest,effective_at,expires_at) \
+             VALUES ($1,1,1,$2,$3,NULL)",
+        )
+        .bind(community_id.as_uuid())
+        .bind(migration_policy_digest.as_slice())
+        .bind(now - chrono::TimeDelta::hours(1))
+        .execute(&mut *transaction)
+        .await
+        .expect("insert migration-derived policy");
+        sqlx::query(
+            "INSERT INTO authorization_operation_receipts \
+             (community_id,operation_id,request_fingerprint,operation_kind,actor_fingerprint,\
+              outcome_code,result_digest) VALUES ($1,$2,$3,1,$4,1,$5)",
+        )
+        .bind(community_id.as_uuid())
+        .bind(operation_id)
+        .bind(request_fingerprint.as_slice())
+        .bind(actor_fingerprint.as_slice())
+        .bind(result_digest.as_slice())
+        .execute(&mut *transaction)
+        .await
+        .expect("insert projected receipt");
+        let binding_version: i64 = sqlx::query_scalar(
+            "INSERT INTO identity_bindings \
+             (community_id,binding_id,issuer,subject,principal_fingerprint,event_author_pubkey,\
+              binding_state,lifecycle_revision,binding_provenance,policy_revision,\
+              enrollment_evidence_digest,expires_at,birth_history_id,creation_operation_id,\
+              creation_request_fingerprint) \
+             VALUES ($1,$2,'https://idp.example','user-1',$3,$4,1,1,1,1,$5,$6,$7,$8,$9) \
+             RETURNING binding_version",
+        )
+        .bind(community_id.as_uuid())
+        .bind(binding_id)
+        .bind(principal_fingerprint.as_slice())
+        .bind(actor.to_bytes().as_slice())
+        .bind(enrollment_evidence_digest.as_slice())
+        .bind(now + chrono::TimeDelta::hours(1))
+        .bind(history_id)
+        .bind(operation_id)
+        .bind(request_fingerprint.as_slice())
+        .fetch_one(&mut *transaction)
+        .await
+        .expect("insert projected binding");
+        sqlx::query(
+            "INSERT INTO identity_lifecycle_history \
+             (community_id,history_id,transition_kind,outcome_code,successor_binding_id,\
+              successor_binding_version,successor_lifecycle_revision,successor_state,operation_id,\
+              request_fingerprint,transition_digest) VALUES ($1,$2,1,1,$3,$4,1,1,$5,$6,$7)",
+        )
+        .bind(community_id.as_uuid())
+        .bind(history_id)
+        .bind(binding_id)
+        .bind(binding_version)
+        .bind(operation_id)
+        .bind(request_fingerprint.as_slice())
+        .bind(transition_digest.as_slice())
+        .execute(&mut *transaction)
+        .await
+        .expect("insert projected lifecycle history");
+        sqlx::query(
+            "INSERT INTO authorization_events \
+             (community_id,event_id,event_kind,outcome_code,reason_code,actor_kind,\
+              actor_fingerprint,subject_fingerprint,operation_id,request_fingerprint,\
+              correlation_id,attempt_id,occurred_at,canonical_envelope,envelope_digest) \
+             VALUES ($1,$2,1,1,1,1,$3,$4,$5,$6,$7,$8,$9,$10,$11)",
+        )
+        .bind(community_id.as_uuid())
+        .bind(event_id)
+        .bind(actor_fingerprint.as_slice())
+        .bind(principal_fingerprint.as_slice())
+        .bind(operation_id)
+        .bind(request_fingerprint.as_slice())
+        .bind(Uuid::new_v4())
+        .bind(Uuid::new_v4())
+        .bind(now)
+        .bind(&canonical_envelope)
+        .bind(envelope_digest.as_slice())
+        .execute(&mut *transaction)
+        .await
+        .expect("insert projected authorization event");
+        sqlx::query(
+            "INSERT INTO authorization_event_capacity \
+             (community_id,configuration_state,max_events_per_domain,max_bytes_per_domain,\
+              max_envelope_bytes,retained_event_count,retained_envelope_bytes,\
+              retained_largest_envelope_bytes,health_state,configured_at) \
+             VALUES ($1,1,NULL,NULL,NULL,1,$2,$2,1,NULL)",
+        )
+        .bind(community_id.as_uuid())
+        .bind(i64::try_from(canonical_envelope.len()).expect("fixture envelope length"))
+        .execute(&mut *transaction)
+        .await
+        .expect("insert migration capacity bootstrap");
+        sqlx::query("SET LOCAL session_replication_role = origin")
+            .execute(&mut *transaction)
+            .await
+            .expect("restore insert triggers after projected fixture");
+        transaction
+            .commit()
+            .await
+            .expect("commit projected fixture");
+    }
+
     #[tokio::test]
     #[ignore = "requires Postgres migrated through 0031"]
     async fn required_direct_identity_finalizes_and_rechecks_only_canonical_state() {
@@ -2052,29 +2211,6 @@ mod tests {
             set: JwkSet { keys: vec![jwk] },
             expires_at: Instant::now() + Duration::from_secs(60),
         });
-        let evidence = service
-            .verify_binding_evidence(
-                &token,
-                community_id,
-                actor.public_key(),
-                ProofTransport::Nip42,
-            )
-            .await
-            .expect("derive installed policy digest from sealed verifier");
-        state
-            .db
-            .install_attested_identity_enrollment_policy(
-                community_id,
-                1,
-                evidence.enrollment_policy_digest(),
-                chrono::Utc::now() - chrono::TimeDelta::minutes(1),
-                Some(chrono::Utc::now() + chrono::TimeDelta::hours(1)),
-                buzz_auth::AuthorizationEventCapacityPolicy::new(100, 1_048_576, 65_536)
-                    .expect("bounded event capacity"),
-            )
-            .await
-            .expect("install explicit verifier policy and capacity");
-
         let first_proof = verify_corporate_identity(
             &state,
             community_id,
@@ -2148,6 +2284,169 @@ mod tests {
         .await
         .expect("check removed legacy columns");
         assert_eq!(legacy_columns, 0);
+        let capacity: (i16, i64, i64, i32) = sqlx::query_as(
+            "SELECT configuration_state,max_events_per_domain,max_bytes_per_domain,\
+                    max_envelope_bytes FROM authorization_event_capacity WHERE community_id=$1",
+        )
+        .bind(community_id.as_uuid())
+        .fetch_one(&pool)
+        .await
+        .expect("read production-adopted capacity");
+        assert_eq!(
+            capacity,
+            (
+                2,
+                i64::try_from(buzz_auth::HARD_MAX_AUTHORIZATION_EVENTS_PER_DOMAIN)
+                    .expect("event hard ceiling"),
+                i64::try_from(buzz_auth::HARD_MAX_AUTHORIZATION_EVENT_BYTES_PER_DOMAIN)
+                    .expect("byte hard ceiling"),
+                i32::try_from(buzz_auth::HARD_MAX_AUTHORIZATION_EVENT_ENVELOPE_BYTES)
+                    .expect("envelope hard ceiling"),
+            )
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres migrated through 0031"]
+    async fn migrated_identity_reauth_adopts_bootstrap_and_rolls_policy_exactly() {
+        let database_url = std::env::var("BUZZ_TEST_DATABASE_URL")
+            .or_else(|_| std::env::var("DATABASE_URL"))
+            .unwrap_or_else(|_| TEST_DB_URL.to_owned());
+        let host = format!("corporate-migrated-{}.example", Uuid::new_v4().simple());
+        let (state, pool, community_id) = canonical_test_state(&database_url, &host).await;
+        let actor = Keys::generate();
+        seed_projected_migration_binding(&pool, community_id, actor.public_key()).await;
+
+        let binding_token = |private_key: &[u8], kid: &str| {
+            let now = Timestamp::now().as_secs();
+            let mut claims = valid_test_claims(now)
+                .as_object()
+                .expect("claims object")
+                .clone();
+            claims.insert(
+                "buzz_npub".to_owned(),
+                Value::String(actor.public_key().to_hex()),
+            );
+            let mut header = Header::new(Algorithm::RS256);
+            header.kid = Some(kid.to_owned());
+            encode(
+                &header,
+                &Value::Object(claims),
+                &EncodingKey::from_rsa_der(private_key),
+            )
+            .expect("sign migrated reauthentication JWT")
+        };
+        let first_key = rsa_private_key(include_str!("testdata/rsa_private_key_1.der.b64"));
+        let first_jwk = rsa_test_jwk(&first_key, "migrated-current-key");
+        let first_token = binding_token(&first_key, "migrated-current-key");
+        let service = state
+            .corporate_identity
+            .as_ref()
+            .expect("required corporate identity service");
+        *service.jwks.write().await = Some(CachedJwks {
+            set: JwkSet {
+                keys: vec![first_jwk],
+            },
+            expires_at: Instant::now() + Duration::from_secs(60),
+        });
+
+        let first_proof = verify_corporate_identity(
+            &state,
+            community_id,
+            actor.public_key(),
+            ProofTransport::Nip42,
+            Some(&first_token),
+            None,
+        )
+        .await
+        .expect("production path adopts migration bootstrap");
+        let first =
+            finalize_corporate_identity(&state, community_id, actor.public_key(), first_proof)
+                .await
+                .expect("migrated identity reauthenticates");
+        let binding = match first.0 {
+            CorporateIdentityDecisionInner::Direct { binding, .. } => binding,
+            CorporateIdentityDecisionInner::NotRequired => {
+                panic!("required migrated identity unexpectedly bypassed")
+            }
+        };
+        assert!(state
+            .db
+            .revalidate_verified_identity_binding(&binding)
+            .await
+            .expect("revalidate migrated binding"));
+
+        let second_key = rsa_private_key(include_str!("testdata/rsa_private_key_2.der.b64"));
+        let second_jwk = rsa_test_jwk(&second_key, "migrated-rollover-key");
+        let second_token = binding_token(&second_key, "migrated-rollover-key");
+        *service.jwks.write().await = Some(CachedJwks {
+            set: JwkSet {
+                keys: vec![second_jwk],
+            },
+            expires_at: Instant::now() + Duration::from_secs(60),
+        });
+        for _ in 0..2 {
+            let proof = verify_corporate_identity(
+                &state,
+                community_id,
+                actor.public_key(),
+                ProofTransport::Nip42,
+                Some(&second_token),
+                None,
+            )
+            .await
+            .expect("trusted verifier rollover is adopted");
+            finalize_corporate_identity(&state, community_id, actor.public_key(), proof)
+                .await
+                .expect("rollover reauthentication matches migrated binding");
+        }
+
+        let revisions: Vec<i64> = sqlx::query_scalar(
+            "SELECT policy_revision FROM identity_enrollment_policies \
+             WHERE community_id=$1 ORDER BY policy_revision",
+        )
+        .bind(community_id.as_uuid())
+        .fetch_all(&pool)
+        .await
+        .expect("read exact policy rollover");
+        assert_eq!(revisions, vec![1, 2, 3]);
+        let capacity: (i16, i64, i64, i32, i64) = sqlx::query_as(
+            "SELECT configuration_state,max_events_per_domain,max_bytes_per_domain,\
+                    max_envelope_bytes,retained_event_count \
+             FROM authorization_event_capacity WHERE community_id=$1",
+        )
+        .bind(community_id.as_uuid())
+        .fetch_one(&pool)
+        .await
+        .expect("read adopted migration capacity");
+        assert_eq!(
+            capacity,
+            (
+                2,
+                i64::try_from(buzz_auth::HARD_MAX_AUTHORIZATION_EVENTS_PER_DOMAIN)
+                    .expect("event hard ceiling"),
+                i64::try_from(buzz_auth::HARD_MAX_AUTHORIZATION_EVENT_BYTES_PER_DOMAIN)
+                    .expect("byte hard ceiling"),
+                i32::try_from(buzz_auth::HARD_MAX_AUTHORIZATION_EVENT_ENVELOPE_BYTES)
+                    .expect("envelope hard ceiling"),
+                1,
+            )
+        );
+        for table in [
+            "identity_bindings",
+            "authorization_operation_receipts",
+            "identity_lifecycle_history",
+            "authorization_events",
+        ] {
+            let count: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+                "SELECT count(*) FROM {table} WHERE community_id=$1"
+            )))
+            .bind(community_id.as_uuid())
+            .fetch_one(&pool)
+            .await
+            .expect("count migrated exact-once state");
+            assert_eq!(count, 1, "{table} must remain migration exact-once");
+        }
     }
 
     async fn validate_rsa_jwt(

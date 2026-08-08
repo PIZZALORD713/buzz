@@ -4,10 +4,16 @@
 //! Identity evidence can select an already-installed attested-key policy but
 //! can never mint policy bytes or silently adopt migration-bootstrap limits.
 
-use buzz_auth::AuthorizationEventCapacityPolicy;
+use buzz_auth::{
+    AuthorizationEventCapacityPolicy, VerifiedIdentityBindingEvidence,
+    HARD_MAX_AUTHORIZATION_EVENTS_PER_DOMAIN, HARD_MAX_AUTHORIZATION_EVENT_BYTES_PER_DOMAIN,
+    HARD_MAX_AUTHORIZATION_EVENT_ENVELOPE_BYTES,
+};
 use buzz_core::CommunityId;
-use chrono::{DateTime, Utc};
 use sqlx::{Postgres, Row, Transaction};
+
+#[cfg(test)]
+use chrono::{DateTime, Utc};
 
 use crate::{
     authorization_events::{
@@ -17,13 +23,96 @@ use crate::{
 };
 
 impl Db {
+    /// Adopt or exactly replay the policy sealed by a trusted verifier.
+    ///
+    /// This is the production configuration path for corporate identity. The
+    /// caller cannot supply a raw domain, digest, or capacity: identity is read
+    /// from sealed evidence and the capacity uses the user-approved hard
+    /// ceilings. Bootstrap adoption and monotonic policy rollover commit
+    /// atomically. A conflicting installed capacity fails closed.
+    pub async fn adopt_verified_identity_enrollment_policy(
+        &self,
+        evidence: &VerifiedIdentityBindingEvidence,
+    ) -> Result<u64> {
+        let community_id = evidence.assertion().authorization_domain();
+        let policy_digest = evidence.enrollment_policy_digest();
+        if community_id.as_uuid().is_nil() || policy_digest == [0; 32] {
+            return Err(DbError::InvalidData(
+                "verified identity enrollment policy is invalid".to_owned(),
+            ));
+        }
+        let event_capacity = AuthorizationEventCapacityPolicy::new(
+            HARD_MAX_AUTHORIZATION_EVENTS_PER_DOMAIN,
+            HARD_MAX_AUTHORIZATION_EVENT_BYTES_PER_DOMAIN,
+            HARD_MAX_AUTHORIZATION_EVENT_ENVELOPE_BYTES,
+        )
+        .map_err(|_| {
+            DbError::InvalidData("corporate identity event capacity is invalid".to_owned())
+        })?;
+        let mut transaction = self.pool.begin().await?;
+        install_authorization_event_capacity_tx(&mut transaction, community_id, event_capacity)
+            .await?;
+        sqlx::query(
+            "SELECT pg_advisory_xact_lock(hashtextextended(\
+             'buzz:identity-enrollment-policy:v1:' || $1::text,0))",
+        )
+        .bind(community_id.as_uuid())
+        .execute(&mut *transaction)
+        .await?;
+
+        let existing: Option<i64> = sqlx::query_scalar(
+            "SELECT policy_revision FROM identity_enrollment_policies \
+             WHERE community_id=$1 AND enrollment_mode=1 AND policy_digest=$2 \
+               AND effective_at<=clock_timestamp() \
+               AND (expires_at IS NULL OR expires_at>clock_timestamp()) \
+             ORDER BY policy_revision DESC LIMIT 1 FOR SHARE",
+        )
+        .bind(community_id.as_uuid())
+        .bind(policy_digest.as_slice())
+        .fetch_optional(&mut *transaction)
+        .await?;
+        if let Some(existing) = existing {
+            let existing = u64::try_from(existing)
+                .ok()
+                .filter(|revision| *revision > 0)
+                .ok_or_else(invalid_policy_revision)?;
+            transaction.commit().await?;
+            return Ok(existing);
+        }
+
+        let newest_revision: Option<i64> = sqlx::query_scalar(
+            "SELECT max(policy_revision) FROM identity_enrollment_policies WHERE community_id=$1",
+        )
+        .bind(community_id.as_uuid())
+        .fetch_one(&mut *transaction)
+        .await?;
+        let next_revision = newest_revision
+            .unwrap_or(0)
+            .checked_add(1)
+            .filter(|revision| *revision > 0)
+            .ok_or_else(invalid_policy_revision)?;
+        sqlx::query(
+            "INSERT INTO identity_enrollment_policies \
+             (community_id,policy_revision,enrollment_mode,policy_digest,effective_at,expires_at) \
+             VALUES ($1,$2,1,$3,clock_timestamp(),NULL)",
+        )
+        .bind(community_id.as_uuid())
+        .bind(next_revision)
+        .bind(policy_digest.as_slice())
+        .execute(&mut *transaction)
+        .await?;
+        transaction.commit().await?;
+        u64::try_from(next_revision).map_err(|_| invalid_policy_revision())
+    }
+
     /// Install or exactly replay one immutable attested-key enrollment policy.
     ///
     /// Audit bounds are mandatory and are installed in the same transaction.
     /// Revision reuse with different policy bytes or time bounds is rejected,
     /// as is insertion behind an already-installed higher revision.
     #[allow(clippy::too_many_arguments)]
-    pub async fn install_attested_identity_enrollment_policy(
+    #[cfg(test)]
+    pub(crate) async fn install_attested_identity_enrollment_policy(
         &self,
         community_id: CommunityId,
         policy_revision: u64,
@@ -111,6 +200,10 @@ impl Db {
         transaction.commit().await?;
         Ok(())
     }
+}
+
+fn invalid_policy_revision() -> DbError {
+    DbError::InvalidData("identity enrollment policy revision is invalid".to_owned())
 }
 
 #[derive(Clone, Copy)]
