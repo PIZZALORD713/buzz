@@ -867,7 +867,7 @@ where
 
     let content_type = object.content_type().to_owned();
     let total = object.size();
-    let cache_control = blob_cache_control(state.config.require_media_get_auth);
+    let cache_control = blob_cache_control();
     let disposition = if buzz_media::serve_inline(&content_type) {
         "inline"
     } else {

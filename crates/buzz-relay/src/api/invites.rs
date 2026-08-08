@@ -651,6 +651,29 @@ mod tests {
         > {
             Box::pin(async { Ok(true) })
         }
+
+        fn try_mark_all_in_scope<'a>(
+            &'a self,
+            _scope: &'a str,
+            event_ids: &'a [nostr::EventId],
+            _ttl_secs: u64,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<bool, buzz_auth::AuthError>> + Send + 'a>,
+        > {
+            Box::pin(async move {
+                if !(1..=3).contains(&event_ids.len())
+                    || event_ids
+                        .iter()
+                        .enumerate()
+                        .any(|(index, event_id)| event_ids[..index].contains(event_id))
+                {
+                    return Err(buzz_auth::AuthError::Internal(
+                        "invalid atomic NIP-98 proof set".to_owned(),
+                    ));
+                }
+                Ok(true)
+            })
+        }
     }
 
     const TEST_DB_URL: &str = "postgres://buzz:buzz_dev@localhost:5432/buzz"; // sadscan:disable np.postgres.1
@@ -1649,6 +1672,38 @@ mod tests {
             let bytes = *event_id.as_bytes();
             let inserted = self.seen.lock().expect("replay set").insert(bytes);
             Box::pin(async move { Ok(inserted) })
+        }
+
+        fn try_mark_all_in_scope<'a>(
+            &'a self,
+            _scope: &'a str,
+            event_ids: &'a [EventId],
+            _ttl_secs: u64,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<bool, buzz_auth::AuthError>> + Send + 'a>,
+        > {
+            if !(1..=3).contains(&event_ids.len())
+                || event_ids
+                    .iter()
+                    .enumerate()
+                    .any(|(index, event_id)| event_ids[..index].contains(event_id))
+            {
+                return Box::pin(async {
+                    Err(buzz_auth::AuthError::Internal(
+                        "invalid atomic NIP-98 proof set".to_owned(),
+                    ))
+                });
+            }
+            let ids = event_ids
+                .iter()
+                .map(|event_id| *event_id.as_bytes())
+                .collect::<Vec<_>>();
+            let mut seen = self.seen.lock().expect("replay set");
+            if ids.iter().any(|event_id| seen.contains(event_id)) {
+                return Box::pin(async { Ok(false) });
+            }
+            seen.extend(ids);
+            Box::pin(async { Ok(true) })
         }
     }
 
