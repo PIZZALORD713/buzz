@@ -255,9 +255,9 @@ async fn parity_scenario() {
     assert_eq!(preserved.3, 1);
     assert!(preserved.4 > 0);
     MIGRATOR
-        .run_to(32, &pool)
+        .run_to(33, &pool)
         .await
-        .expect("apply protected-authority prerequisite 0032");
+        .expect("apply invalidation/restore/status prerequisite 0033");
     let protected_rows: (i64, i64, i64) = sqlx::query_as(
         "SELECT \
             (SELECT count(*) FROM authorization_invalidation_domains), \
@@ -272,7 +272,7 @@ async fn parity_scenario() {
     let populated_seeds = seed_snapshot(&pool).await;
     assert_eq!(
         populated_catalog, fresh_catalog,
-        "populated synthesized-#1476 upgrade must produce the fresh 0032 catalog"
+        "populated synthesized-#1476 upgrade must produce the fresh 0033 catalog"
     );
     assert_eq!(populated_seeds, fresh_seeds);
 
@@ -309,7 +309,7 @@ async fn parity_scenario() {
 
 #[tokio::test]
 #[ignore = "requires a dedicated disposable Postgres database"]
-async fn protected_authority_0032_fresh_populated_and_desired_schema_have_full_postgresql_catalog_parity(
+async fn invalidation_restore_status_0033_fresh_populated_and_desired_schema_have_full_postgresql_catalog_parity(
 ) {
     tokio::time::timeout(TEST_DEADLINE, parity_scenario())
         .await

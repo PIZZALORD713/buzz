@@ -15,28 +15,46 @@ use std::time::{Duration, Instant};
 
 use axum::{
     body::Body,
-    extract::{Path as AxumPath, Query, State},
+    extract::{Extension, Path as AxumPath, Query, State},
     http::{header, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
     Router,
 };
 use base64::Engine;
+use buzz_auth::{
+    AuthContext, CanonicalGitSmartHttpRequest, GitSmartHttpOperation,
+    VerifiedGitSmartHttpAuthorization,
+};
+use buzz_db::authorization_version::{ProtectedPublicationError, ProtectedPublicationRequest};
 use hex;
 use serde::Deserialize;
 use tokio::process::Command;
+#[cfg(test)]
 use tokio_util::sync::CancellationToken;
 use tower_http::limit::RequestBodyLimitLayer;
 use tracing::{error, info, warn};
 
 use super::binding::{resolve_repo_binding, RepoBinding};
-use super::cas_publish::{cas_publish, CasError, ParentState, PublishLimits};
+use super::cas_publish::{
+    cas_publish, publish_pointer_cache, stage_git_publication, CasError, ParentState,
+    PointerCacheUpdate, PublishLimits, StagedGitPublication,
+};
 use super::hook::install_hook;
 use super::hydrate::{
-    hydrate_authoritative_read, hydrate_for_read, hydrate_for_write, load_authoritative_manifest,
-    load_manifest_for_read, HydrateError, HydratedRepo, HydrationOptions,
+    hydrate_authoritative_read, hydrate_authoritative_write, hydrate_for_read, hydrate_for_write,
+    load_authoritative_manifest, load_manifest_for_read, HydrateError, HydratedRepo,
+    HydrationOptions,
 };
 use super::manifest_event::{build_ref_state_event, RefStateInputs};
+use crate::api::protected_publication::{
+    authorize_git_publication, commit_observe_project_revalidate, verify_git_proxy_direct_evidence,
+    ProtectedPublicationAccess,
+};
+use crate::authorization_runtime::{
+    LiveProtectedPublicationWitness, OperationRestoreRuntime,
+    ProtectedPublicationAuthorizationHandle, RestoredProtectedPublicationError,
+};
 use crate::state::AppState;
 use buzz_core::TenantContext;
 
@@ -75,70 +93,131 @@ pub struct GitAuth {
     pub pubkey: nostr::PublicKey,
     /// Server-resolved tenant bound from the request Host before auth checks.
     pub tenant: TenantContext,
-    /// Cryptographically verified identity staged until repository policy
-    /// authorization succeeds.
+    /// Accepted #4772 identity proof, finalized only after protected route
+    /// finalization succeeds (or immediately for a legacy route).
     identity_proof: crate::corporate_identity::CorporateIdentityProof,
+    authorization: VerifiedGitSmartHttpAuthorization,
+    auth_tag: Option<String>,
 }
 
-/// Temporary adapter for a sealed joined publication witness.
-struct ProvisionalGitPublicationWitness {
+/// Legacy Git admission wrapper. Protected routes deliberately extract the
+/// raw origin-sealed [`GitAuth`] instead and defer these checks until after
+/// protected finalization succeeds.
+pub struct AdmittedGitAuth(GitAuth);
+
+struct ProtectedGitAuth {
+    auth: GitAuth,
+    access: ProtectedPublicationAccess,
+}
+
+/// Exact repository target joined to S5's sealed live publication witness.
+struct ProtectedGitPublicationWitness {
     tenant: TenantContext,
     owner: String,
     repo: String,
-    result_digest: [u8; 32],
-    cancellation: CancellationToken,
+    live: LiveProtectedPublicationWitness,
 }
 
-#[allow(dead_code)]
-impl ProvisionalGitPublicationWitness {
-    fn from_joined_witness_parts(
+impl ProtectedGitPublicationWitness {
+    fn from_live_witness(
+        context: &AuthContext,
         tenant: TenantContext,
         owner: impl Into<String>,
         repo: impl Into<String>,
-        result_digest: [u8; 32],
-        cancellation: CancellationToken,
+        live: LiveProtectedPublicationWitness,
     ) -> Option<Self> {
         let owner = owner.into();
         let repo = repo.into();
         let canonical_repo = validate_repo_id(&owner, &repo).ok()?.to_owned();
-        if result_digest == [0; 32] {
+        if tenant.community() != context.authorization_domain() {
             return None;
         }
         Some(Self {
             tenant,
             owner,
             repo: canonical_repo,
-            result_digest,
-            cancellation,
+            live,
         })
     }
 }
 
-impl std::fmt::Debug for ProvisionalGitPublicationWitness {
+impl std::fmt::Debug for ProtectedGitPublicationWitness {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str("ProvisionalGitPublicationWitness([REDACTED])")
+        formatter.write_str("ProtectedGitPublicationWitness([REDACTED])")
     }
+}
+
+/// Resolve and subscribe to the DB-authoritative publication for one finalized
+/// repository route. The sealed context and ready observer come from root
+/// composition; raw pointers never participate.
+#[allow(dead_code)] // Wired by S5 root composition after observer acceptance.
+async fn observe_git_publication(
+    access: &ProtectedPublicationAccess,
+    tenant: TenantContext,
+    owner: impl Into<String>,
+    repo: impl Into<String>,
+) -> Result<Option<ProtectedGitPublicationWitness>, Response> {
+    let Some(live) = access
+        .observer()
+        .observe_current(access.coordinate())
+        .await
+        .map_err(|_| git_witness_invalid_response())?
+    else {
+        return Ok(None);
+    };
+    ProtectedGitPublicationWitness::from_live_witness(access.context(), tenant, owner, repo, live)
+        .map(Some)
+        .ok_or_else(git_witness_invalid_response)
 }
 
 fn git_witness_invalid_response() -> Response {
     (StatusCode::SERVICE_UNAVAILABLE, "repository unavailable").into_response()
 }
 
-async fn final_git_witness_recheck<F, Fut, E>(
-    cancellation: &CancellationToken,
+trait GitPublicationStreamAuthority: Clone + Send + 'static {
+    fn is_cancelled(&self) -> bool;
+    fn cancelled_future(&self) -> std::pin::Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
+}
+
+impl GitPublicationStreamAuthority for LiveProtectedPublicationWitness {
+    fn is_cancelled(&self) -> bool {
+        self.is_cancelled()
+    }
+
+    fn cancelled_future(&self) -> std::pin::Pin<Box<dyn Future<Output = ()> + Send + 'static>> {
+        let witness = self.clone();
+        Box::pin(async move { witness.cancelled().await })
+    }
+}
+
+#[cfg(test)]
+impl GitPublicationStreamAuthority for CancellationToken {
+    fn is_cancelled(&self) -> bool {
+        self.is_cancelled()
+    }
+
+    fn cancelled_future(&self) -> std::pin::Pin<Box<dyn Future<Output = ()> + Send + 'static>> {
+        let cancellation = self.clone();
+        Box::pin(async move { cancellation.cancelled().await })
+    }
+}
+
+async fn final_git_witness_recheck<A, F, Fut, E>(
+    authority: &A,
     final_recheck: F,
 ) -> Result<(), Response>
 where
+    A: GitPublicationStreamAuthority,
     F: FnOnce() -> Fut,
     Fut: Future<Output = Result<(), E>>,
 {
-    if cancellation.is_cancelled() {
+    if authority.is_cancelled() {
         return Err(git_witness_invalid_response());
     }
     final_recheck()
         .await
         .map_err(|_| git_witness_invalid_response())?;
-    if cancellation.is_cancelled() {
+    if authority.is_cancelled() {
         return Err(git_witness_invalid_response());
     }
     Ok(())
@@ -153,6 +232,50 @@ fn exact_git_nostr_token(headers: &axum::http::HeaderMap) -> Result<String, &'st
         .filter(|token| !token.is_empty())
         .map(str::to_owned)
         .ok_or("expected Authorization: Nostr <base64>")
+}
+
+#[allow(clippy::result_large_err)] // Axum Response is the natural extractor rejection.
+fn exact_git_auth_tag(
+    event: &nostr::Event,
+    headers: &axum::http::HeaderMap,
+) -> Result<Option<String>, Response> {
+    let event_tag = crate::handlers::auth::extract_auth_tag_json(event);
+    let mut header_values = headers.get_all("x-auth-tag").iter();
+    let header_tag = header_values
+        .next()
+        .map(|value| value.to_str().map(str::to_owned))
+        .transpose()
+        .map_err(|_| (StatusCode::UNAUTHORIZED, "ambiguous git auth tag").into_response())?;
+    if header_values.next().is_some()
+        || header_tag
+            .as_deref()
+            .is_some_and(|value| value.is_empty() || value != value.trim())
+        || matches!((&event_tag, &header_tag), (Some(left), Some(right)) if left != right)
+    {
+        return Err((StatusCode::UNAUTHORIZED, "ambiguous git auth tag").into_response());
+    }
+    Ok(event_tag.or(header_tag))
+}
+
+#[allow(clippy::result_large_err)] // Axum Response is the natural extractor rejection.
+fn preflight_git_delegation(
+    event: &nostr::Event,
+    headers: &axum::http::HeaderMap,
+) -> Result<Option<String>, Response> {
+    let auth_tag = exact_git_auth_tag(event, headers)?;
+    if let Some(auth_tag) = auth_tag.as_deref() {
+        buzz_sdk::nip_oa::verify_auth_tag(auth_tag, &event.pubkey).map_err(|_| {
+            (StatusCode::UNAUTHORIZED, "invalid git delegation proof").into_response()
+        })?;
+        let _ = buzz_auth::verify_git_smart_http_delegated()
+            .expect_err("delegated Git authority is unavailable in V1");
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "delegated git authorization unavailable",
+        )
+            .into_response());
+    }
+    Ok(auth_tag)
 }
 
 impl axum::extract::FromRequestParts<Arc<AppState>> for GitAuth {
@@ -181,6 +304,9 @@ impl axum::extract::FromRequestParts<Arc<AppState>> for GitAuth {
             .map_err(|_| (StatusCode::UNAUTHORIZED, "invalid base64").into_response())?;
         let event_json = String::from_utf8(event_bytes)
             .map_err(|_| (StatusCode::UNAUTHORIZED, "invalid utf-8").into_response())?;
+        let event: nostr::Event = serde_json::from_str(&event_json)
+            .map_err(|_| (StatusCode::UNAUTHORIZED, "invalid auth event").into_response())?;
+        let auth_tag = preflight_git_delegation(&event, &parts.headers)?;
 
         // Row zero for Git HTTP: bind the request Host to a server-resolved
         // tenant before URL verification. We still do not trust forwarded
@@ -195,86 +321,22 @@ impl axum::extract::FromRequestParts<Arc<AppState>> for GitAuth {
         let tenant = crate::tenant::bind_community(&state.db, raw_host)
             .await
             .map_err(|_| (StatusCode::NOT_FOUND, "repository not found").into_response())?;
-        let expected_url = git_expected_url(
-            &state.config.relay_url,
-            &tenant,
-            parts
-                .uri
-                .path_and_query()
-                .map(|pq| pq.as_str())
-                .unwrap_or(parts.uri.path()),
+        let route =
+            canonical_git_request(&state.config.relay_url, &tenant, &parts.method, &parts.uri)
+                .ok_or_else(|| {
+                    (StatusCode::BAD_REQUEST, "unrecognized git endpoint").into_response()
+                })?;
+        let authorization = buzz_auth::verify_git_smart_http_authorization(
+            &event_json,
+            &route,
+            &buzz_auth::SystemEvidenceClock,
         )
-        .ok_or_else(|| (StatusCode::BAD_REQUEST, "unrecognized git endpoint").into_response())?;
+        .map_err(|error| {
+            warn!(error = %error, "git smart-HTTP auth failed");
+            (StatusCode::UNAUTHORIZED, "git auth failed").into_response()
+        })?;
+        let pubkey = authorization.actor_pubkey();
 
-        // Repo-root URL verification.
-        //
-        // The credential helper signs a NIP-98 token with:
-        //   u = <repo-root>   (e.g., http://host/git/{owner}/{repo})
-        //
-        // Git's credential protocol does NOT pass query strings to helpers, so
-        // service-scoping (`?service=...`) cannot be implemented at the NIP-98
-        // level without protocol changes. The token is repo-scoped, not service-scoped.
-        //
-        // Security is still provided by:
-        // - ±60s timestamp window (limits replay)
-        // - HTTPS in production (prevents token theft)
-        // - Pre-receive hook for push authorization (role + protection rules)
-        // - Endpoint routing (clone/push are different HTTP paths)
-
-        // Skip HTTP method check for git routes.
-        //
-        // Git's credential helper signs with `method=GET` (the initial /info/refs request)
-        // then reuses the token for POST (pack data). Method binding can't work here.
-        //
-        // Security is provided by: service-binding in the URL (clone vs push scoped),
-        // ±60s timestamp, and the pre-receive hook for push authorization.
-        // We pass the method from the event itself so verify_nip98_event always accepts.
-        let event_method = serde_json::from_str::<serde_json::Value>(&event_json)
-            .ok()
-            .and_then(|v| {
-                v["tags"]
-                    .as_array()?
-                    .iter()
-                    .find(|t| t[0].as_str() == Some("method"))?[1]
-                    .as_str()
-                    .map(str::to_owned)
-            })
-            .unwrap_or_else(|| method.to_owned());
-
-        // SECURITY: method intentionally not verified for git routes. The tautological
-        // check (event.method == event.method) is deliberate — see comment block above.
-        // Git's credential protocol signs once with GET and reuses for POST. The URL tag
-        // provides the real security boundary (±60s timestamp + URL lock + HTTPS).
-
-        // body=None: can't buffer streaming pack data to verify payload hash.
-        // Token is time-bounded (±60s) and URL-locked — acceptable trade-off.
-        let pubkey =
-            buzz_auth::nip98::verify_nip98_event(&event_json, &expected_url, &event_method, None)
-                .map_err(|e| {
-                warn!(error = %e, "git NIP-98 auth failed");
-                (StatusCode::UNAUTHORIZED, "NIP-98 auth failed").into_response()
-            })?;
-
-        // NOTE: NIP-98 event-ID dedup intentionally NOT implemented here.
-        // Git's credential protocol reuses one signed token across multiple requests
-        // in a session (info_refs GET → upload-pack/receive-pack POST). Rejecting
-        // replayed event IDs would break normal clone/push operations.
-        // The ±60s timestamp window + URL scoping + HTTPS transport provide sufficient
-        // replay protection for v1. Per-request signing requires protocol changes.
-
-        let event: nostr::Event = serde_json::from_str(&event_json)
-            .map_err(|_| (StatusCode::UNAUTHORIZED, "invalid auth event").into_response())?;
-
-        // Relay membership gate (NIP-43). Git cannot carry a standalone
-        // x-auth-tag header through the credential-helper protocol, so agents
-        // attach their NIP-OA attestation to the signed NIP-98 event, matching
-        // the WebSocket NIP-42 flow.
-        let event_auth_tag = crate::handlers::auth::extract_auth_tag_json(&event);
-        let header_auth_tag = parts
-            .headers
-            .get("x-auth-tag")
-            .and_then(|value| value.to_str().ok());
-        let auth_tag = event_auth_tag.as_deref().or(header_auth_tag);
         let identity_jwt = crate::corporate_identity::identity_jwt_from_headers(
             &parts.headers,
             &state.config.corporate_identity,
@@ -285,7 +347,7 @@ impl axum::extract::FromRequestParts<Arc<AppState>> for GitAuth {
             pubkey,
             buzz_auth::ProofTransport::GitSmartHttpSession,
             identity_jwt.as_deref(),
-            auth_tag,
+            auth_tag.as_deref(),
         )
         .await
         {
@@ -295,24 +357,12 @@ impl axum::extract::FromRequestParts<Arc<AppState>> for GitAuth {
                 return Err((e.status_code(), e.public_message()).into_response());
             }
         };
-        if crate::api::relay_members::enforce_relay_membership(
-            state,
-            tenant.community(),
-            pubkey.as_bytes(),
-            auth_tag,
-        )
-        .await
-        .is_err()
-        {
-            warn!(pubkey = %pubkey.to_hex(), "git: relay membership denied");
-            return Err((StatusCode::FORBIDDEN, "restricted: not a relay member").into_response());
-        }
-        deny_banned_git_principal(&state.db, tenant.community(), &pubkey, auth_tag).await?;
-
         Ok(GitAuth {
             pubkey,
             tenant,
             identity_proof,
+            authorization,
+            auth_tag,
         })
     }
 }
@@ -330,6 +380,90 @@ async fn finalize_git_corporate_identity(state: &AppState, auth: &GitAuth) -> Re
         warn!(pubkey = %auth.pubkey.to_hex(), error = %e, "git: corporate identity finalization denied");
         (e.status_code(), e.public_message()).into_response()
     })
+}
+
+async fn admit_git_principal(state: &AppState, auth: &GitAuth) -> Result<(), Response> {
+    finalize_git_corporate_identity(state, auth).await?;
+    if crate::api::relay_members::enforce_relay_membership(
+        state,
+        auth.tenant.community(),
+        auth.pubkey.as_bytes(),
+        auth.auth_tag.as_deref(),
+    )
+    .await
+    .is_err()
+    {
+        warn!(pubkey = %auth.pubkey.to_hex(), "git: relay membership denied");
+        return Err((StatusCode::FORBIDDEN, "restricted: not a relay member").into_response());
+    }
+    deny_banned_git_principal(
+        &state.db,
+        auth.tenant.community(),
+        &auth.pubkey,
+        auth.auth_tag.as_deref(),
+    )
+    .await
+}
+
+impl axum::extract::FromRequestParts<Arc<AppState>> for AdmittedGitAuth {
+    type Rejection = Response;
+
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        state: &Arc<AppState>,
+    ) -> Result<Self, Self::Rejection> {
+        let auth = GitAuth::from_request_parts(parts, state).await?;
+        admit_git_principal(state, &auth).await?;
+        Ok(Self(auth))
+    }
+}
+
+impl axum::extract::FromRequestParts<Arc<AppState>> for ProtectedGitAuth {
+    type Rejection = Response;
+
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        state: &Arc<AppState>,
+    ) -> Result<Self, Self::Rejection> {
+        let auth = GitAuth::from_request_parts(parts, state).await?;
+        let access = crate::api::protected_publication::finalize_before_legacy_admission(
+            || async {
+                let handle = parts
+                    .extensions
+                    .get::<ProtectedPublicationAuthorizationHandle>()
+                    .cloned()
+                    .ok_or_else(git_witness_invalid_response)?;
+                let direct = verify_git_proxy_direct_evidence(
+                    handle.trusted_proxy_assertion_verifier().as_ref(),
+                    &parts.headers,
+                    auth.tenant.community(),
+                    &auth.authorization,
+                )
+                .map_err(|_| git_witness_invalid_response())?;
+                authorize_git_publication(
+                    &handle,
+                    auth.tenant.community(),
+                    &auth.authorization,
+                    direct,
+                )
+                .await
+                .map_err(|_| git_witness_invalid_response())
+            },
+            || async {
+                admit_git_principal(state, &auth).await?;
+                authorize_git_read(
+                    &state.db,
+                    auth.tenant.community(),
+                    &auth.pubkey,
+                    auth.authorization.request().owner(),
+                    auth.authorization.request().repository(),
+                )
+                .await
+            },
+        )
+        .await?;
+        Ok(Self { auth, access })
+    }
 }
 
 /// Deny banned principals on every Git HTTP request.
@@ -422,24 +556,32 @@ fn enforce_git_ban_cascade(
 /// `http://`) so a request to community B cannot authenticate with a token
 /// signed for community A's URL just because the deployment has one global
 /// `relay_url`.
-fn git_expected_url(
+fn canonical_git_request(
     config_relay_url: &str,
     tenant: &TenantContext,
-    path_and_query: &str,
-) -> Option<String> {
-    let scheme = if config_relay_url.trim_start().starts_with("wss://") {
-        "https"
-    } else {
-        "http"
-    };
-    let repo_path = if let Some((prefix, _query)) = path_and_query.split_once("/info/refs") {
-        prefix
-    } else if let Some(prefix) = path_and_query.strip_suffix("/git-upload-pack") {
-        prefix
-    } else {
-        path_and_query.strip_suffix("/git-receive-pack")?
-    };
-    Some(format!("{scheme}://{}{repo_path}", tenant.host()))
+    method: &axum::http::Method,
+    uri: &axum::http::Uri,
+) -> Option<CanonicalGitSmartHttpRequest> {
+    let config_relay_url = config_relay_url.trim_start();
+    let scheme =
+        if config_relay_url.starts_with("wss://") || config_relay_url.starts_with("https://") {
+            axum::http::uri::Scheme::HTTPS
+        } else {
+            axum::http::uri::Scheme::HTTP
+        };
+    let route = uri.path().strip_prefix("/git/")?;
+    let (owner, remainder) = route.split_once('/')?;
+    let (repo, _) = remainder.split_once('/')?;
+    let authority = tenant.host().parse().ok()?;
+    CanonicalGitSmartHttpRequest::from_server_parts(
+        &scheme,
+        &authority,
+        owner,
+        repo,
+        method,
+        uri.path_and_query()?,
+    )
+    .ok()
 }
 
 /// Validate URL `(owner, repo)` parameters and return the canonical repo
@@ -834,27 +976,22 @@ fn build_upload_pack_advertisement(manifest: &super::manifest::Manifest) -> Vec<
 /// The immutable manifest is fully digest-verified before `final_recheck` and
 /// no response is constructed until that recheck succeeds. An ineligible
 /// tagged manifest returns `Ok(None)` for the witnessed subprocess fallback.
-#[allow(dead_code)] // Activated by the pending high-level S5 read witness.
-async fn witnessed_fast_upload_pack_advertisement<F, Fut, E>(
+#[allow(dead_code)] // Wired by S5 root composition after observer acceptance.
+async fn witnessed_fast_upload_pack_advertisement(
     state: &AppState,
-    witness: &ProvisionalGitPublicationWitness,
-    final_recheck: F,
-) -> Result<Option<Response>, Response>
-where
-    F: FnOnce() -> Fut,
-    Fut: Future<Output = Result<(), E>>,
-{
+    witness: &ProtectedGitPublicationWitness,
+) -> Result<Option<Response>, Response> {
     if witness.tenant.community().as_uuid().is_nil() {
         return Err(git_witness_invalid_response());
     }
-    let manifest = load_authoritative_manifest(&state.git_store, witness.result_digest)
+    let manifest = load_authoritative_manifest(&state.git_store, witness.live.result_digest())
         .await
         .map_err(|error| hydrate_error_to_response(&witness.owner, &witness.repo, error))?;
     if !fast_path_eligible(&manifest) {
         return Ok(None);
     }
     let body = build_upload_pack_advertisement(&manifest);
-    final_git_witness_recheck(&witness.cancellation, final_recheck).await?;
+    final_git_witness_recheck(&witness.live, || witness.live.revalidate()).await?;
     Ok(Some(
         Response::builder()
             .status(StatusCode::OK)
@@ -888,10 +1025,11 @@ where
 /// error" behavior is gone — A1 detectability holds on the read side too.
 pub async fn info_refs(
     State(state): State<Arc<AppState>>,
-    auth: GitAuth,
+    auth: AdmittedGitAuth,
     AxumPath(params): AxumPath<GitRepoParams>,
     Query(query): Query<InfoRefsQuery>,
 ) -> Result<Response, Response> {
+    let AdmittedGitAuth(auth) = auth;
     // Validate service parameter: exact allowlist.
     let service = match query.service.as_str() {
         "git-upload-pack" | "git-receive-pack" => &query.service,
@@ -910,7 +1048,6 @@ pub async fn info_refs(
         repo_name,
     )
     .await?;
-    finalize_git_corporate_identity(&state, &auth).await?;
 
     // Track C fast path: only for clone advertisement. The receive-pack
     // advertisement carries a different capability set (report-status,
@@ -947,6 +1084,62 @@ pub async fn info_refs(
     // Subprocess path: receive-pack advertisement, or upload-pack for a
     // tagged repo. Acquires a permit and hydrates — today's behavior.
     info_refs_subprocess(&state, &auth.tenant, service, &params).await
+}
+
+/// DB-authoritative protected ref advertisement.
+///
+/// Root composition installs the finalized route context and operation
+/// identity. The raw Git pointer is never read; both the fast path and
+/// subprocess fallback are driven by the exact live witness digest.
+async fn protected_info_refs(
+    State(state): State<Arc<AppState>>,
+    auth: ProtectedGitAuth,
+    AxumPath(params): AxumPath<GitRepoParams>,
+    Query(query): Query<InfoRefsQuery>,
+) -> Result<Response, Response> {
+    let service = match query.service.as_str() {
+        "git-upload-pack" | "git-receive-pack" => &query.service,
+        _ => return Err((StatusCode::BAD_REQUEST, "invalid service").into_response()),
+    };
+    let expected_operation = match service.as_str() {
+        "git-upload-pack" => GitSmartHttpOperation::AdvertiseUploadPack,
+        "git-receive-pack" => GitSmartHttpOperation::AdvertiseReceivePack,
+        _ => unreachable!("service was closed above"),
+    };
+    let ProtectedGitAuth { auth, access } = auth;
+    validate_repo_id(&params.owner, &params.repo)?;
+    validate_protected_git_access(&access, &auth, &params, expected_operation)?;
+    let witness = observe_git_publication(&access, auth.tenant, &params.owner, &params.repo)
+        .await?
+        .ok_or_else(|| (StatusCode::NOT_FOUND, "repository not found").into_response())?;
+
+    if service == "git-upload-pack" {
+        if let Some(response) = witnessed_fast_upload_pack_advertisement(&state, &witness).await? {
+            return Ok(response);
+        }
+    }
+    info_refs_subprocess_witnessed(&state, witness, service).await
+}
+
+#[allow(clippy::result_large_err)]
+fn validate_protected_git_access(
+    access: &ProtectedPublicationAccess,
+    auth: &GitAuth,
+    params: &GitRepoParams,
+    operation: GitSmartHttpOperation,
+) -> Result<(), Response> {
+    if auth.authorization.operation() != operation
+        || !access.matches_git(
+            auth.tenant.community(),
+            auth.pubkey,
+            &params.owner,
+            &params.repo,
+            operation,
+        )
+    {
+        return Err(git_witness_invalid_response());
+    }
+    Ok(())
 }
 
 /// Subprocess-backed `info/refs` advertisement: hydrate the published state
@@ -1084,6 +1277,105 @@ async fn info_refs_subprocess(
         .unwrap())
 }
 
+async fn info_refs_subprocess_witnessed(
+    state: &Arc<AppState>,
+    witness: ProtectedGitPublicationWitness,
+    service: &str,
+) -> Result<Response, Response> {
+    let _permit = acquire_git_permit(state, "info_refs")?;
+    let repo = hydrate_authoritative_read(
+        &state.git_store,
+        witness.live.result_digest(),
+        HydrationOptions {
+            pack_cache: &state.git_pack_cache,
+            scratch_dir: &state.config.git_repo_path,
+            max_pack_bytes: state.config.git_max_pack_bytes,
+            max_repo_bytes: state.config.git_max_repo_bytes,
+        },
+    )
+    .await
+    .map_err(|error| hydrate_error_to_response(&witness.owner, &witness.repo, error))?;
+
+    let git_subcmd = service.strip_prefix("git-").unwrap_or(service);
+    let stdout_tmp = tempfile::NamedTempFile::new_in(&state.config.git_repo_path).map_err(|e| {
+        error!(error = %e, "git info_refs stdout tempfile failed");
+        (StatusCode::INTERNAL_SERVER_ERROR, "git error").into_response()
+    })?;
+    let stderr_tmp = tempfile::NamedTempFile::new_in(&state.config.git_repo_path).map_err(|e| {
+        error!(error = %e, "git info_refs stderr tempfile failed");
+        (StatusCode::INTERNAL_SERVER_ERROR, "git error").into_response()
+    })?;
+    let stdout_file = stdout_tmp.reopen().map_err(|e| {
+        error!(error = %e, "git info_refs stdout tempfile reopen failed");
+        (StatusCode::INTERNAL_SERVER_ERROR, "git error").into_response()
+    })?;
+    let stderr_file = stderr_tmp.reopen().map_err(|e| {
+        error!(error = %e, "git info_refs stderr tempfile reopen failed");
+        (StatusCode::INTERNAL_SERVER_ERROR, "git error").into_response()
+    })?;
+
+    let mut cmd = Command::new("git");
+    cmd.arg(git_subcmd)
+        .arg("--stateless-rpc")
+        .arg("--advertise-refs")
+        .arg(repo.path())
+        .stdout(std::process::Stdio::from(stdout_file))
+        .stderr(std::process::Stdio::from(stderr_file))
+        .kill_on_drop(true);
+    harden_git_env(&mut cmd);
+    let mut child = cmd.spawn().map_err(|e| {
+        error!(error = %e, "git subprocess failed to spawn");
+        (StatusCode::INTERNAL_SERVER_ERROR, "git error").into_response()
+    })?;
+    let status = tokio::time::timeout(INFO_REFS_TIMEOUT, child.wait())
+        .await
+        .map_err(|_| (StatusCode::GATEWAY_TIMEOUT, "git operation timed out").into_response())?
+        .map_err(|e| {
+            error!(error = %e, "git subprocess failed");
+            (StatusCode::INTERNAL_SERVER_ERROR, "git error").into_response()
+        })?;
+    if !status.success() {
+        let stderr = read_log_prefix(stderr_tmp.path(), 64 * 1024).await;
+        error!(stderr = %stderr, "git --advertise-refs failed");
+        return Err((StatusCode::INTERNAL_SERVER_ERROR, "git error").into_response());
+    }
+    let stdout_len = tokio::fs::metadata(stdout_tmp.path())
+        .await
+        .map_err(|e| {
+            error!(error = %e, "git info_refs stdout metadata failed");
+            (StatusCode::INTERNAL_SERVER_ERROR, "git error").into_response()
+        })?
+        .len();
+    if stdout_len > INFO_REFS_MAX_OUTPUT_BYTES {
+        return Err((
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "git ref advertisement exceeds relay limits",
+        )
+            .into_response());
+    }
+    let stdout = tokio::fs::read(stdout_tmp.path()).await.map_err(|e| {
+        error!(error = %e, "git info_refs stdout read failed");
+        (StatusCode::INTERNAL_SERVER_ERROR, "git error").into_response()
+    })?;
+    drop(repo);
+
+    let svc_line = format!("# service={service}\n");
+    let svc_pkt = format!("{:04x}{svc_line}", svc_line.len() + 4);
+    let mut body = Vec::with_capacity(svc_pkt.len() + 4 + stdout.len());
+    body.extend_from_slice(svc_pkt.as_bytes());
+    body.extend_from_slice(b"0000");
+    body.extend_from_slice(&stdout);
+
+    final_git_witness_recheck(&witness.live, || witness.live.revalidate()).await?;
+    let content_type = format!("application/x-{service}-advertisement");
+    Ok(Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, content_type)
+        .header(header::CACHE_CONTROL, "no-cache")
+        .body(Body::from(body))
+        .expect("static witnessed git advertisement response"))
+}
+
 /// Decode a smart-HTTP git request body according to its `Content-Encoding`.
 ///
 /// Git's smart-HTTP client gzip-compresses the `git-upload-pack` /
@@ -1148,11 +1440,12 @@ fn decode_git_request_body(
 /// the tempdir lives only for the duration of this request.
 pub async fn upload_pack(
     State(state): State<Arc<AppState>>,
-    auth: GitAuth,
+    auth: AdmittedGitAuth,
     headers: axum::http::HeaderMap,
     AxumPath(params): AxumPath<GitRepoParams>,
     body: Body,
 ) -> Result<Response, Response> {
+    let AdmittedGitAuth(auth) = auth;
     let repo_name = validate_repo_id(&params.owner, &params.repo)?;
 
     // SEC-005: the reused NIP-98 token means the GET advertisement's
@@ -1167,7 +1460,6 @@ pub async fn upload_pack(
         repo_name,
     )
     .await?;
-    finalize_git_corporate_identity(&state, &auth).await?;
 
     let body = decode_git_request_body(&headers, body, UPLOAD_PACK_MAX_DECODED_BYTES);
     let permit = acquire_git_permit(&state, "upload_pack")?;
@@ -1206,6 +1498,25 @@ pub async fn upload_pack(
     )
 }
 
+/// DB-authoritative protected clone/fetch path.
+async fn protected_upload_pack(
+    State(state): State<Arc<AppState>>,
+    auth: ProtectedGitAuth,
+    headers: axum::http::HeaderMap,
+    AxumPath(params): AxumPath<GitRepoParams>,
+    body: Body,
+) -> Result<Response, Response> {
+    let ProtectedGitAuth { auth, access } = auth;
+    validate_repo_id(&params.owner, &params.repo)?;
+    validate_protected_git_access(&access, &auth, &params, GitSmartHttpOperation::UploadPack)?;
+    let witness = observe_git_publication(&access, auth.tenant, &params.owner, &params.repo)
+        .await?
+        .ok_or_else(|| (StatusCode::NOT_FOUND, "repository not found").into_response())?;
+    let body = decode_git_request_body(&headers, body, UPLOAD_PACK_MAX_DECODED_BYTES);
+    let permit = acquire_git_permit(&state, "upload_pack")?;
+    stream_witnessed_upload_pack(&state, witness, permit, body).await
+}
+
 /// `POST /git/{owner}/{repo}/git-receive-pack`
 ///
 /// Handles push — client sends ref updates + pack data.
@@ -1235,12 +1546,13 @@ pub async fn upload_pack(
 ///    *only then* builds the 2xx.
 pub async fn receive_pack(
     State(state): State<Arc<AppState>>,
-    auth: GitAuth,
+    auth: AdmittedGitAuth,
     headers: axum::http::HeaderMap,
     AxumPath(params): AxumPath<GitRepoParams>,
     body: Body,
 ) -> Result<Response, Response> {
-    let repo_name = validate_repo_id(&params.owner, &params.repo)?;
+    let AdmittedGitAuth(auth) = auth;
+    let repo_name = validate_repo_id(&params.owner, &params.repo)?.to_owned();
     let body = decode_git_request_body(&headers, body, state.config.git_max_pack_bytes);
     let pusher_hex = hex::encode(auth.pubkey.to_bytes());
     let _permit = acquire_git_permit(&state, "receive_pack")?;
@@ -1278,15 +1590,87 @@ pub async fn receive_pack(
     .await
     .map_err(|e| hydrate_error_to_response(&params.owner, &params.repo, e))?;
 
-    // Install the pre-receive hook into the ephemeral workspace. The
-    // hook script is fixed per-deployment; per-push state (callback URL,
-    // HMAC secret, pusher pubkey) rides in env at exec time.
+    let ctx = run_receive_pack_in_workspace(
+        &state,
+        auth,
+        params,
+        &repo_name,
+        repo,
+        parent_state,
+        body,
+        pusher_hex,
+    )
+    .await?;
+    Ok(finalize_push(&state, ctx).await)
+}
+
+/// DB-authoritative protected push path. The workspace is hydrated from the
+/// exact witnessed parent, the new immutable manifest is staged without a raw
+/// pointer write, and the canonical publication transaction commits before
+/// any success bytes or cache projections exist.
+async fn protected_receive_pack(
+    State(state): State<Arc<AppState>>,
+    Extension(restore): Extension<OperationRestoreRuntime>,
+    auth: ProtectedGitAuth,
+    headers: axum::http::HeaderMap,
+    AxumPath(params): AxumPath<GitRepoParams>,
+    body: Body,
+) -> Result<Response, Response> {
+    let ProtectedGitAuth { auth, access } = auth;
+    let repo_name = validate_repo_id(&params.owner, &params.repo)?.to_owned();
+    validate_protected_git_access(&access, &auth, &params, GitSmartHttpOperation::ReceivePack)?;
+    let body = decode_git_request_body(&headers, body, state.config.git_max_pack_bytes);
+    let pusher_hex = hex::encode(auth.pubkey.to_bytes());
+    let _permit = acquire_git_permit(&state, "receive_pack")?;
+
+    let parent_digest = access
+        .observer()
+        .observe_current(access.coordinate())
+        .await
+        .map_err(|_| git_witness_invalid_response())?
+        .map(|witness| witness.result_digest());
+    let (repo, parent_state) = hydrate_authoritative_write(
+        &state.git_store,
+        parent_digest,
+        HydrationOptions {
+            pack_cache: &state.git_pack_cache,
+            scratch_dir: &state.config.git_repo_path,
+            max_pack_bytes: state.config.git_max_pack_bytes,
+            max_repo_bytes: state.config.git_max_repo_bytes,
+        },
+    )
+    .await
+    .map_err(|error| hydrate_error_to_response(&params.owner, &params.repo, error))?;
+    let ctx = run_receive_pack_in_workspace(
+        &state,
+        auth,
+        params,
+        &repo_name,
+        repo,
+        parent_state,
+        body,
+        pusher_hex,
+    )
+    .await?;
+    Ok(finalize_protected_push(&state, &restore, ctx, access).await)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_receive_pack_in_workspace(
+    state: &Arc<AppState>,
+    auth: GitAuth,
+    params: GitRepoParams,
+    repo_name: &str,
+    repo: HydratedRepo,
+    parent_state: ParentState,
+    body: Body,
+    pusher_hex: String,
+) -> Result<PushContext, Response> {
     install_hook(repo.path()).await.map_err(|e| {
         error!(error = %e, "install pre-receive hook into hydrated workspace");
         (StatusCode::INTERNAL_SERVER_ERROR, "git hook install failed").into_response()
     })?;
 
-    // Build hook env vars for the pre-receive hook.
     let hook_url = format!(
         "http://127.0.0.1:{}/internal/git/policy",
         state.config.bind_addr.port()
@@ -1298,19 +1682,15 @@ pub async fn receive_pack(
             "BUZZ_HOOK_SECRET",
             state.config.git_hook_hmac_secret.clone(),
         ),
-        ("BUZZ_REPO_ID", repo_name.to_string()),
+        ("BUZZ_REPO_ID", repo_name.to_owned()),
         ("BUZZ_REPO_OWNER", params.owner.clone()),
         (
             "BUZZ_COMMUNITY_ID",
             auth.tenant.community().as_uuid().to_string(),
         ),
-        ("BUZZ_PUSHER_PUBKEY", pusher_hex.clone()),
+        ("BUZZ_PUSHER_PUBKEY", pusher_hex),
     ];
     hook_env.extend(receive_pack_git_config(hooks_dir));
-
-    // Run receive-pack against the tempdir. Returns the *owned* subprocess
-    // output (PackOutput) — crucially NOT a Response, so the post-push
-    // fence in finalize_push can sequence the CAS before any 2xx exists.
     let pack = run_git_at(
         repo.path(),
         "receive-pack",
@@ -1320,19 +1700,16 @@ pub async fn receive_pack(
         RECEIVE_PACK_MAX_OUTPUT_BYTES,
     )
     .await?;
-
-    let ctx = PushContext {
+    Ok(PushContext {
         pack,
         parent_state,
-        owner: params.owner.clone(),
-        repo: params.repo.clone(),
-        repo_id: repo_name.to_string(),
+        owner: params.owner,
+        repo: params.repo,
+        repo_id: repo_name.to_owned(),
         pusher: auth.pubkey,
         tenant: auth.tenant,
-        identity_proof: auth.identity_proof,
         repo_handle: repo,
-    };
-    Ok(finalize_push(&state, ctx).await)
+    })
 }
 
 /// Per-process git configuration for the hydrated receive-pack workspace.
@@ -1686,25 +2063,29 @@ struct GitPermitStream<S> {
     _permit: tokio::sync::OwnedSemaphorePermit,
 }
 
-struct CancellationCheckedGitStream<S> {
+struct CancellationCheckedGitStream<S, A = LiveProtectedPublicationWitness> {
     inner: std::pin::Pin<Box<S>>,
-    cancellation: CancellationToken,
+    authority: A,
+    cancelled: std::pin::Pin<Box<dyn Future<Output = ()> + Send + 'static>>,
     finished: bool,
 }
 
-impl<S> CancellationCheckedGitStream<S> {
-    fn new(inner: S, cancellation: CancellationToken) -> Self {
+impl<S, A: GitPublicationStreamAuthority> CancellationCheckedGitStream<S, A> {
+    fn new(inner: S, authority: A) -> Self {
+        let cancelled = authority.cancelled_future();
         Self {
             inner: Box::pin(inner),
-            cancellation,
+            authority,
+            cancelled,
             finished: false,
         }
     }
 }
 
-impl<S> futures_util::Stream for CancellationCheckedGitStream<S>
+impl<S, A> futures_util::Stream for CancellationCheckedGitStream<S, A>
 where
     S: futures_util::Stream<Item = Result<bytes::Bytes, std::io::Error>>,
+    A: GitPublicationStreamAuthority + Unpin,
 {
     type Item = Result<bytes::Bytes, std::io::Error>;
 
@@ -1715,14 +2096,14 @@ where
         if self.finished {
             return std::task::Poll::Ready(None);
         }
-        if self.cancellation.is_cancelled() {
+        if self.authority.is_cancelled() || self.cancelled.as_mut().poll(context).is_ready() {
             self.finished = true;
             return std::task::Poll::Ready(Some(Err(std::io::Error::other(
                 "protected git witness is no longer current",
             ))));
         }
         match self.inner.as_mut().poll_next(context) {
-            std::task::Poll::Ready(Some(Ok(_bytes))) if self.cancellation.is_cancelled() => {
+            std::task::Poll::Ready(Some(Ok(_bytes))) if self.authority.is_cancelled() => {
                 self.finished = true;
                 std::task::Poll::Ready(Some(Err(std::io::Error::other(
                     "protected git witness is no longer current",
@@ -1870,7 +2251,7 @@ fn stream_git_read(
         body,
         prefix,
         content_type,
-        cancellation: None,
+        publication_authority: None,
     })
 }
 
@@ -1879,24 +2260,19 @@ fn stream_git_read(
 /// Hydration verifies every immutable manifest/pack digest. The authoritative
 /// callback runs afterward, immediately before subprocess/response creation;
 /// its sticky cancellation signal is then checked before every emitted chunk.
-#[allow(dead_code)] // Activated by the pending high-level S5 read witness.
-async fn stream_witnessed_upload_pack<F, Fut, E>(
+#[allow(dead_code)] // Wired by S5 root composition after observer acceptance.
+async fn stream_witnessed_upload_pack(
     state: &Arc<AppState>,
-    witness: ProvisionalGitPublicationWitness,
+    witness: ProtectedGitPublicationWitness,
     permit: tokio::sync::OwnedSemaphorePermit,
     body: Body,
-    final_recheck: F,
-) -> Result<Response, Response>
-where
-    F: FnOnce() -> Fut,
-    Fut: Future<Output = Result<(), E>>,
-{
+) -> Result<Response, Response> {
     if witness.tenant.community().as_uuid().is_nil() {
         return Err(git_witness_invalid_response());
     }
     let repo = hydrate_authoritative_read(
         &state.git_store,
-        witness.result_digest,
+        witness.live.result_digest(),
         HydrationOptions {
             pack_cache: &state.git_pack_cache,
             scratch_dir: &state.config.git_repo_path,
@@ -1906,7 +2282,7 @@ where
     )
     .await
     .map_err(|error| hydrate_error_to_response(&witness.owner, &witness.repo, error))?;
-    final_git_witness_recheck(&witness.cancellation, final_recheck).await?;
+    final_git_witness_recheck(&witness.live, || witness.live.revalidate()).await?;
     spawn_git_read_stream(GitReadStreamInput {
         repo,
         permit,
@@ -1915,7 +2291,7 @@ where
         body,
         prefix: Vec::new(),
         content_type: "application/x-git-upload-pack-result".to_owned(),
-        cancellation: Some(witness.cancellation),
+        publication_authority: Some(witness.live),
     })
 }
 
@@ -1927,7 +2303,7 @@ struct GitReadStreamInput<'a> {
     body: Body,
     prefix: Vec<u8>,
     content_type: String,
-    cancellation: Option<CancellationToken>,
+    publication_authority: Option<LiveProtectedPublicationWitness>,
 }
 
 #[allow(clippy::result_large_err)]
@@ -1940,7 +2316,7 @@ fn spawn_git_read_stream(input: GitReadStreamInput<'_>) -> Result<Response, Resp
         body,
         prefix,
         content_type,
-        cancellation,
+        publication_authority,
     } = input;
     let mut cmd = Command::new("git");
     cmd.arg(service).arg("--stateless-rpc");
@@ -2007,9 +2383,9 @@ fn spawn_git_read_stream(input: GitReadStreamInput<'_>) -> Result<Response, Resp
         _permit: permit,
     };
 
-    let body = match cancellation {
-        Some(cancellation) => {
-            Body::from_stream(CancellationCheckedGitStream::new(body_stream, cancellation))
+    let body = match publication_authority {
+        Some(authority) => {
+            Body::from_stream(CancellationCheckedGitStream::new(body_stream, authority))
         }
         None => Body::from_stream(body_stream),
     };
@@ -2035,6 +2411,183 @@ fn build_git_response(service: &str, output: PackOutput) -> Response {
         .unwrap()
 }
 
+async fn finalize_protected_push(
+    state: &Arc<AppState>,
+    restore: &OperationRestoreRuntime,
+    ctx: PushContext,
+    access: ProtectedPublicationAccess,
+) -> Response {
+    if !ctx.pack.ok {
+        let response = build_git_response("receive-pack", ctx.pack);
+        drop(ctx.repo_handle);
+        return response;
+    }
+
+    let staged = match stage_git_publication(
+        &state.git_store,
+        &ctx.tenant,
+        &ctx.owner,
+        &ctx.repo,
+        ctx.repo_handle.path(),
+        &ctx.parent_state,
+        PublishLimits {
+            parent_hydrated_bytes: ctx.repo_handle.hydrated_bytes(),
+            max_pack_bytes: state.config.git_max_pack_bytes,
+            max_repo_bytes: state.config.git_max_repo_bytes,
+        },
+    )
+    .await
+    {
+        Ok(staged) => staged,
+        Err(CasError::ManifestInvalid(error)) => {
+            warn!(error = %error, "protected push produced an invalid manifest");
+            return (
+                StatusCode::BAD_REQUEST,
+                "push produced invalid manifest state",
+            )
+                .into_response();
+        }
+        Err(CasError::ResourceLimit(error)) => {
+            warn!(error = %error, "protected push exceeded repository limits");
+            return (
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "repository exceeds relay resource limits",
+            )
+                .into_response();
+        }
+        Err(error) => {
+            error!(error = %error, "protected push staging failed");
+            return (StatusCode::INTERNAL_SERVER_ERROR, "git backend error").into_response();
+        }
+    };
+
+    if staged.community_id() != access.context().authorization_domain()
+        || staged.owner() != ctx.owner
+        || staged.repo() != ctx.repo_id
+    {
+        return git_witness_invalid_response();
+    }
+    let request = match ProtectedPublicationRequest::new(
+        access.context(),
+        access.coordinate().clone(),
+        match access.operation() {
+            Some(operation) => operation,
+            None => return git_witness_invalid_response(),
+        },
+        staged.result_digest(),
+        staged.expected_parent_result_digest(),
+    ) {
+        Ok(request) => request,
+        Err(_) => return git_witness_invalid_response(),
+    };
+    let staged_digest = staged.result_digest();
+    let completion = commit_observe_project_revalidate(
+        || async {
+            match restore.commit_protected_publication(&request).await {
+                Ok(committed) => Ok(committed),
+                Err(RestoredProtectedPublicationError::Publication(
+                    ProtectedPublicationError::Conflict,
+                )) => Err(Box::new(
+                    (
+                        StatusCode::CONFLICT,
+                        "push superseded by a concurrent writer; pull and retry",
+                    )
+                        .into_response(),
+                )),
+                Err(error) => {
+                    warn!(error = %error, "protected push publication failed closed");
+                    Err(Box::new(git_witness_invalid_response()))
+                }
+            }
+        },
+        |committed| {
+            if committed.result_digest() == staged_digest {
+                Ok(())
+            } else {
+                Err(Box::new(git_witness_invalid_response()))
+            }
+        },
+        |committed| async {
+            access
+                .observer()
+                .observe_committed(committed.into_witness())
+                .await
+                .map_err(|error| {
+                    warn!(error = %error, "protected push live witness upgrade failed");
+                    Box::new(git_witness_invalid_response())
+                })
+        },
+        || async {
+            match publish_pointer_cache(&state.git_store, &staged).await {
+                Ok(PointerCacheUpdate::Updated) => {}
+                Ok(PointerCacheUpdate::Stale) => {
+                    warn!(owner = %ctx.owner, repo = %ctx.repo_id, "git pointer cache lost a post-commit race");
+                }
+                Err(error) => {
+                    warn!(error = %error, owner = %ctx.owner, repo = %ctx.repo_id, "git pointer cache refresh failed");
+                }
+            }
+            publish_protected_ref_state_event(state, &ctx, &staged).await;
+            Ok(())
+        },
+        |live| async move {
+            live.revalidate().await.map_err(|error| {
+                warn!(error = %error, "protected push final witness recheck failed");
+                Box::new(git_witness_invalid_response())
+            })
+        },
+    )
+    .await;
+    if let Err(response) = completion {
+        drop(ctx.repo_handle);
+        return *response;
+    }
+    let response = build_git_response("receive-pack", ctx.pack);
+    drop(ctx.repo_handle);
+    response
+}
+
+async fn publish_protected_ref_state_event(
+    state: &Arc<AppState>,
+    ctx: &PushContext,
+    staged: &StagedGitPublication,
+) {
+    if staged.expected_parent_result_digest() == Some(staged.result_digest()) {
+        return;
+    }
+    let inputs = RefStateInputs {
+        repo_id: &ctx.repo_id,
+        head: &staged.manifest().head,
+        refs: &staged.manifest().refs,
+        actor_pubkey_hex: &hex::encode(ctx.pusher.to_bytes()),
+    };
+    let event = match build_ref_state_event(&inputs, &state.relay_keypair) {
+        Ok(event) => event,
+        Err(error) => {
+            warn!(error = %error, "protected push ref-state event build failed");
+            return;
+        }
+    };
+    match state
+        .db
+        .insert_event(ctx.tenant.community(), &event, None)
+        .await
+    {
+        Ok((stored, true)) => {
+            crate::handlers::event::fan_out_event_to_local_subscribers(
+                state,
+                ctx.tenant.community(),
+                &stored,
+            )
+            .await;
+        }
+        Ok((_, false)) => {}
+        Err(error) => {
+            warn!(error = %error, "protected push ref-state event insert failed");
+        }
+    }
+}
+
 /// Per-push state captured between subprocess completion and response
 /// construction. Constructing a `PushContext` is the only path from a
 /// push subprocess to a 2xx push response (see [`finalize_push`]) — the
@@ -2058,8 +2611,6 @@ pub(crate) struct PushContext {
     /// Server-resolved tenant that selected the pointer namespace and owns
     /// any derived kind:30618 event from this push.
     pub tenant: TenantContext,
-    /// Identity proof finalized only after the pre-receive policy hook accepts.
-    pub identity_proof: crate::corporate_identity::CorporateIdentityProof,
     /// The hydrated workspace handle. Held until response construction
     /// (which happens *after* `cas_publish` returns) so the tempdir
     /// outlives the receive-pack subprocess and the CAS publish.
@@ -2104,18 +2655,6 @@ async fn finalize_push(state: &Arc<AppState>, ctx: PushContext) -> Response {
         let response = build_git_response("receive-pack", ctx.pack);
         drop(ctx.repo_handle);
         return response;
-    }
-
-    if let Err(error) = crate::corporate_identity::finalize_corporate_identity(
-        state,
-        ctx.tenant.community(),
-        ctx.pusher,
-        ctx.identity_proof.clone(),
-    )
-    .await
-    {
-        warn!(pusher = %ctx.pusher.to_hex(), error = %error, "git: post-policy corporate identity finalization denied");
-        return (error.status_code(), error.public_message()).into_response();
     }
 
     // Step 7 (CAS). The PushContext binds `parent_state` (observed at
@@ -2302,6 +2841,30 @@ pub fn git_router(state: Arc<AppState>) -> Router {
         .route("/git/{owner}/{repo}/info/refs", get(info_refs))
         .route("/git/{owner}/{repo}/git-upload-pack", post(upload_pack))
         .route("/git/{owner}/{repo}/git-receive-pack", post(receive_pack))
+        .layer(RequestBodyLimitLayer::new(body_limit))
+        .with_state(state)
+}
+
+/// Build the DB-authoritative protected Git sub-router.
+///
+/// Root composition installs one ready
+/// [`ProtectedPublicationAuthorizationHandle`]. [`ProtectedGitAuth`] retains
+/// sole ownership of raw credentials and finalizes exact route-bound access
+/// before any observer, body, or repository storage I/O. Missing authority is
+/// an extractor rejection, never a legacy fallback.
+pub fn protected_git_router(state: Arc<AppState>) -> Router {
+    let body_limit = state.config.git_max_pack_bytes as usize;
+
+    Router::new()
+        .route("/git/{owner}/{repo}/info/refs", get(protected_info_refs))
+        .route(
+            "/git/{owner}/{repo}/git-upload-pack",
+            post(protected_upload_pack),
+        )
+        .route(
+            "/git/{owner}/{repo}/git-receive-pack",
+            post(protected_receive_pack),
+        )
         .layer(RequestBodyLimitLayer::new(body_limit))
         .with_state(state)
 }
@@ -2743,78 +3306,108 @@ mod track_c_tests {
     }
 
     #[test]
-    fn git_expected_url_uses_tenant_host_not_config_host() {
+    fn canonical_git_request_uses_tenant_host_not_config_host() {
         let tenant_a = tenant("host-a.example", 1);
         let tenant_b = tenant("host-b.example", 2);
-
-        let url_a = git_expected_url(
+        let owner = "a".repeat(64);
+        let uri: axum::http::Uri = format!("/git/{owner}/repo/info/refs?service=git-upload-pack")
+            .parse()
+            .expect("fixture URI");
+        let route_a = canonical_git_request(
             "wss://config-host.example",
             &tenant_a,
-            "/git/owner/repo/info/refs?service=git-upload-pack",
+            &axum::http::Method::GET,
+            &uri,
         )
         .expect("recognized info/refs path");
-        let url_b = git_expected_url(
+        let route_b = canonical_git_request(
             "wss://config-host.example",
             &tenant_b,
-            "/git/owner/repo/info/refs?service=git-upload-pack",
+            &axum::http::Method::GET,
+            &uri,
         )
         .expect("recognized info/refs path");
+        assert_ne!(
+            route_a
+                .evidence_binding(tenant_a.community())
+                .expect("route A binding"),
+            route_b
+                .evidence_binding(tenant_b.community())
+                .expect("route B binding")
+        );
 
-        assert_eq!(url_a, "https://host-a.example/git/owner/repo");
-        assert_eq!(url_b, "https://host-b.example/git/owner/repo");
-        assert_ne!(url_a, url_b);
-
-        let url_a_alt_config = git_expected_url(
+        let upload_uri: axum::http::Uri = format!("/git/{owner}/repo/git-upload-pack")
+            .parse()
+            .expect("fixture URI");
+        let route_a_alt_config = canonical_git_request(
             "wss://different-config.example",
             &tenant_a,
-            "/git/owner/repo/git-upload-pack",
+            &axum::http::Method::POST,
+            &upload_uri,
         )
         .expect("recognized upload-pack path");
-        assert_eq!(url_a_alt_config, "https://host-a.example/git/owner/repo");
-    }
-
-    /// GitAuth host-bind bite: a token signed for community A's repo URL must
-    /// fail when the request Host resolved to community B. If `git_expected_url`
-    /// is changed back to `config.relay_url`'s host, the expected URL below
-    /// becomes A's URL and this wrongly verifies.
-    #[test]
-    fn git_nip98_rejects_token_signed_for_wrong_community_host() {
-        let keys = Keys::generate();
-        let signed_for_a = "https://host-a.example/git/alice/repo";
-        let event_json = git_nip98_event_json(&keys, signed_for_a, "GET");
-        let tenant_b = tenant("host-b.example", 2);
-        let expected_for_b = git_expected_url(
-            "wss://host-a.example",
-            &tenant_b,
-            "/git/alice/repo/info/refs?service=git-upload-pack",
-        )
-        .expect("recognized info/refs path");
-
-        let err = buzz_auth::nip98::verify_nip98_event(&event_json, &expected_for_b, "GET", None)
-            .expect_err("cross-host git NIP-98 token must be rejected");
-        assert!(
-            err.to_string().contains("URL mismatch"),
-            "expected URL-mismatch rejection, got {err}"
+        assert_eq!(route_a_alt_config.owner(), owner);
+        assert_eq!(route_a_alt_config.repository(), "repo");
+        assert_eq!(
+            route_a_alt_config.operation(),
+            GitSmartHttpOperation::UploadPack
         );
     }
 
+    /// GitAuth host-bind bite: a token signed for community A's repo root must
+    /// fail when the request Host resolves to community B.
     #[test]
-    fn git_nip98_accepts_token_signed_for_matching_community_host() {
+    fn git_session_rejects_token_signed_for_wrong_community_host() {
         let keys = Keys::generate();
-        let signed_for_a = "https://host-a.example/git/alice/repo";
-        let event_json = git_nip98_event_json(&keys, signed_for_a, "GET");
+        let owner = "a".repeat(64);
+        let signed_for_a = format!("https://host-a.example/git/{owner}/repo");
+        let event_json = git_nip98_event_json(&keys, &signed_for_a, "GET");
+        let tenant_b = tenant("host-b.example", 2);
+        let uri: axum::http::Uri = format!("/git/{owner}/repo/info/refs?service=git-upload-pack")
+            .parse()
+            .expect("fixture URI");
+        let route_b = canonical_git_request(
+            "wss://host-a.example",
+            &tenant_b,
+            &axum::http::Method::GET,
+            &uri,
+        )
+        .expect("recognized info/refs path");
+
+        buzz_auth::verify_git_smart_http_authorization(
+            &event_json,
+            &route_b,
+            &buzz_auth::SystemEvidenceClock,
+        )
+        .expect_err("cross-host Git session must be rejected");
+    }
+
+    #[test]
+    fn git_session_accepts_matching_host_across_closed_multi_request_route() {
+        let keys = Keys::generate();
+        let owner = "a".repeat(64);
+        let signed_for_a = format!("https://host-a.example/git/{owner}/repo");
+        let event_json = git_nip98_event_json(&keys, &signed_for_a, "GET");
         let tenant_a = tenant("host-a.example", 1);
-        let expected_for_a = git_expected_url(
+        let uri: axum::http::Uri = format!("/git/{owner}/repo/git-upload-pack")
+            .parse()
+            .expect("fixture URI");
+        let route_a = canonical_git_request(
             "wss://different-config.example",
             &tenant_a,
-            "/git/alice/repo/git-upload-pack",
+            &axum::http::Method::POST,
+            &uri,
         )
         .expect("recognized upload-pack path");
 
-        let pubkey =
-            buzz_auth::nip98::verify_nip98_event(&event_json, &expected_for_a, "GET", None)
-                .expect("matching-host git NIP-98 token must verify");
-        assert_eq!(pubkey, keys.public_key());
+        let authorization = buzz_auth::verify_git_smart_http_authorization(
+            &event_json,
+            &route_a,
+            &buzz_auth::SystemEvidenceClock,
+        )
+        .expect("matching-host bounded Git session must verify");
+        assert_eq!(authorization.actor_pubkey(), keys.public_key());
+        assert_eq!(authorization.operation(), GitSmartHttpOperation::UploadPack);
     }
 
     #[test]
@@ -2851,37 +3444,41 @@ mod track_c_tests {
     }
 
     #[test]
-    fn provisional_git_witness_keeps_domain_target_and_digest_joined() {
-        let tenant = TenantContext::resolved(
-            CommunityId::from_uuid(uuid::Uuid::from_u128(9)),
-            "git.example",
-        );
-        let owner = "a".repeat(64);
-        let witness = ProvisionalGitPublicationWitness::from_joined_witness_parts(
-            tenant.clone(),
-            &owner,
-            "project.git",
-            [0x55; 32],
-            CancellationToken::new(),
-        )
-        .expect("joined witness");
-        assert_eq!(witness.tenant, tenant);
-        assert_eq!(witness.owner, owner);
-        assert_eq!(witness.repo, "project");
-        assert_eq!(witness.result_digest, [0x55; 32]);
-        assert_eq!(
-            format!("{witness:?}"),
-            "ProvisionalGitPublicationWitness([REDACTED])"
-        );
+    fn git_delegation_tag_header_rejects_repeated_occurrences() {
+        let event = EventBuilder::new(Kind::HttpAuth, "")
+            .sign_with_keys(&Keys::generate())
+            .expect("sign fixture event");
+        let mut headers = axum::http::HeaderMap::new();
+        headers.append("x-auth-tag", "first".parse().expect("header"));
+        headers.append("x-auth-tag", "second".parse().expect("header"));
 
-        assert!(ProvisionalGitPublicationWitness::from_joined_witness_parts(
-            witness.tenant.clone(),
-            "a".repeat(64),
-            "project",
-            [0; 32],
-            CancellationToken::new(),
-        )
-        .is_none());
+        assert!(exact_git_auth_tag(&event, &headers).is_err());
+    }
+
+    #[test]
+    fn delegated_git_fails_at_pure_preflight_before_tenant_lookup() {
+        let owner = Keys::generate();
+        let agent = Keys::generate();
+        let auth_tag = buzz_sdk::nip_oa::compute_auth_tag(&owner, &agent.public_key(), "kind=9")
+            .expect("valid NIP-OA tag");
+        let event = EventBuilder::new(Kind::HttpAuth, "")
+            .sign_with_keys(&agent)
+            .expect("sign fixture event");
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert("x-auth-tag", auth_tag.parse().expect("auth tag header"));
+
+        let response = preflight_git_delegation(&event, &headers)
+            .expect_err("delegated Git must be unavailable");
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            "x-auth-tag",
+            format!("{auth_tag},{auth_tag}").parse().expect("header"),
+        );
+        let response = preflight_git_delegation(&event, &headers)
+            .expect_err("comma-joined delegation alternatives must be rejected");
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]

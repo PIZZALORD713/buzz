@@ -33,7 +33,7 @@ pub mod policy;
 pub mod store;
 pub mod transport;
 
-pub use transport::git_router;
+pub use transport::{git_router, protected_git_router};
 
 /// Middleware that rejects requests from non-loopback addresses.
 ///
@@ -64,4 +64,14 @@ pub fn git_policy_router(state: Arc<AppState>) -> Router {
         .layer(RequestBodyLimitLayer::new(1024 * 1024)) // 1 MB
         .layer(middleware::from_fn(require_localhost))
         .with_state(state)
+}
+
+#[cfg(test)]
+mod public_seam_tests {
+    use super::*;
+
+    #[test]
+    fn protected_router_is_public_at_root_facing_path() {
+        let _: fn(Arc<AppState>) -> Router = crate::api::git::protected_git_router;
+    }
 }

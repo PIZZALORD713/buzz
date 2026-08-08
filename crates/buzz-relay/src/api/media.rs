@@ -14,34 +14,85 @@ use std::time::{Duration, Instant};
 
 use axum::http::header;
 use axum::{
-    extract::{FromRequestParts, Path, State},
+    extract::{Extension, FromRequestParts, Path, State},
     http::{request::Parts, HeaderMap, StatusCode},
     response::{IntoResponse, Response},
-    Json,
+    routing::{get, put},
+    Json, Router,
 };
 use base64::Engine;
 use buzz_audit::{AuditAction, NewAuditEntry};
+use buzz_auth::{AuthContext, RouteCapability};
 use buzz_core::tenant::TenantContext;
+use buzz_db::authorization_version::{ProtectedPublicationCoordinate, ProtectedPublicationRequest};
 use buzz_media::{BlobDescriptor, MediaError, UploadAttribution, UploadNetworkInfo};
+#[cfg(test)]
 use tokio_util::sync::CancellationToken;
+use tower_http::limit::RequestBodyLimitLayer;
 
+use crate::api::protected_publication::{
+    authorize_media_publication, commit_observe_project_revalidate,
+    verify_media_proxy_direct_evidence, ProtectedPublicationAccess,
+};
+use crate::authorization_runtime::{
+    LiveProtectedPublicationWitness, OperationRestoreRuntime,
+    ProtectedPublicationAuthorizationHandle, ProtectedPublicationObserver,
+};
 use crate::state::AppState;
 
-/// Axum extractor that validates Blossom auth, the BUD-11 hash binding, and
-/// relay membership (NIP-43, when enabled) from headers BEFORE the request
-/// body is read. This prevents unauthenticated clients from forcing the
-/// server to buffer up to 50MB of body data.
+/// Build the DB-authoritative protected media sub-router.
+///
+/// Root composition installs one ready [`ProtectedPublicationAuthorizationHandle`].
+/// The private extractors below own raw Blossom parsing and finalize an exact
+/// route-bound [`ProtectedPublicationAccess`] before observer, body, or storage
+/// I/O. No protected route falls back to the legacy sidecar/pointer path.
+pub fn protected_media_router(state: Arc<AppState>) -> Router {
+    let body_limit = state
+        .config
+        .media
+        .max_image_bytes
+        .max(state.config.media.max_video_bytes) as usize;
+    Router::new()
+        .route("/upload", put(protected_upload_blob))
+        .route("/media/upload", put(protected_upload_blob))
+        .route(
+            "/media/{sha256_ext}",
+            get(protected_get_blob).head(protected_head_blob),
+        )
+        .layer(RequestBodyLimitLayer::new(body_limit))
+        .with_state(state)
+}
+
+/// Axum extractor that validates Blossom auth and the BUD-11 hash binding
+/// from headers before the request body is read. Legacy admission is applied
+/// by the legacy handler; protected admission runs only after finalization.
 ///
 /// Axum processes `FromRequestParts` extractors before `FromRequest` (body)
 /// extractors, so auth rejection happens before any body buffering.
 pub(crate) struct AuthenticatedUpload {
-    auth_event: nostr::Event,
+    authorization: buzz_auth::VerifiedBlossomAuthorization,
+    route: buzz_auth::CanonicalBlossomRequest,
+    auth_tag: Option<String>,
+    identity_proof: crate::corporate_identity::CorporateIdentityProof,
     /// Community resolved from the request host at extraction time (row zero for
     /// this HTTP door), identical to the WS door in `router.rs` and the bridge
     /// door in `bridge.rs`. Server-resolved, never client-supplied.
     tenant: TenantContext,
     route_mode: UploadRouteMode,
-    _upload_permit: UploadPermit,
+}
+
+/// Protected upload material finalized entirely during header extraction.
+struct ProtectedAuthenticatedUpload {
+    auth: AuthenticatedUpload,
+    access: ProtectedPublicationAccess,
+}
+
+/// Protected media read material finalized entirely during header extraction.
+struct ProtectedMediaReadAuth {
+    authorization: buzz_auth::VerifiedBlossomAuthorization,
+    tenant: TenantContext,
+    requested_object: Box<str>,
+    access: ProtectedPublicationAccess,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -60,6 +111,77 @@ fn upload_route_mode(path: &str) -> Result<UploadRouteMode, MediaError> {
         "/upload" => Ok(UploadRouteMode::Upload),
         "/media/upload" => Ok(UploadRouteMode::LegacyMedia),
         _ => Err(MediaError::NotFound),
+    }
+}
+
+fn canonical_blossom_request(
+    configured_relay_url: &str,
+    tenant: &TenantContext,
+    method: &axum::http::Method,
+    path_and_query: &axum::http::uri::PathAndQuery,
+    object_sha256: &str,
+) -> Result<buzz_auth::CanonicalBlossomRequest, MediaError> {
+    let configured_relay_url = configured_relay_url.trim_start();
+    let scheme = if configured_relay_url.starts_with("wss://")
+        || configured_relay_url.starts_with("https://")
+    {
+        axum::http::uri::Scheme::HTTPS
+    } else {
+        axum::http::uri::Scheme::HTTP
+    };
+    let authority = tenant
+        .host()
+        .parse()
+        .map_err(|_| MediaError::InvalidAuthEvent)?;
+    buzz_auth::CanonicalBlossomRequest::from_server_parts(
+        &scheme,
+        &authority,
+        method,
+        path_and_query,
+        object_sha256,
+    )
+    .map_err(|_| MediaError::InvalidAuthEvent)
+}
+
+fn exact_blossom_auth_tag(
+    event: &nostr::Event,
+    headers: &HeaderMap,
+) -> Result<Option<String>, MediaError> {
+    let event_tag = crate::handlers::auth::extract_auth_tag_json(event);
+    let mut header_values = headers.get_all("x-auth-tag").iter();
+    let header_tag = header_values
+        .next()
+        .map(|value| value.to_str().map(str::to_owned))
+        .transpose()
+        .map_err(|_| MediaError::InvalidAuthEvent)?;
+    if header_values.next().is_some()
+        || header_tag
+            .as_deref()
+            .is_some_and(|value| value.is_empty() || value != value.trim())
+        || matches!((&event_tag, &header_tag), (Some(left), Some(right)) if left != right)
+    {
+        return Err(MediaError::InvalidAuthEvent);
+    }
+    Ok(event_tag.or(header_tag))
+}
+
+fn reject_unavailable_blossom_delegation(
+    auth_event: &nostr::Event,
+    auth_tag: Option<&str>,
+) -> Result<(), MediaError> {
+    if let Some(auth_tag) = auth_tag {
+        buzz_sdk::nip_oa::verify_auth_tag(auth_tag, &auth_event.pubkey)
+            .map_err(|_| MediaError::InvalidAuthEvent)?;
+        let _ = buzz_auth::verify_blossom_delegated()
+            .expect_err("delegated Blossom authority is unavailable in V1");
+        return Err(MediaError::Internal);
+    }
+    Ok(())
+}
+
+impl AuthenticatedUpload {
+    fn actor_pubkey(&self) -> nostr::PublicKey {
+        self.authorization.actor_pubkey()
     }
 }
 
@@ -194,6 +316,21 @@ fn acquire_upload_permit(
     })
 }
 
+fn admit_media_upload(
+    state: &AppState,
+    auth: &AuthenticatedUpload,
+) -> Result<UploadPermit, MediaError> {
+    if upload_rate_limited(state, auth.tenant.community(), &auth.actor_pubkey()) {
+        metrics::counter!("buzz_media_upload_rejections_total", "reason" => "rate_limit")
+            .increment(1);
+        return Err(MediaError::UploadRateLimitExceeded);
+    }
+    acquire_upload_permit(state, auth.tenant.community(), &auth.actor_pubkey()).inspect_err(|_| {
+        metrics::counter!("buzz_media_upload_rejections_total", "reason" => "concurrency")
+            .increment(1);
+    })
+}
+
 impl FromRequestParts<Arc<AppState>> for AuthenticatedUpload {
     type Rejection = MediaError;
 
@@ -226,19 +363,16 @@ impl FromRequestParts<Arc<AppState>> for AuthenticatedUpload {
 
         let route_mode = upload_route_mode(parts.uri.path())?;
 
-        // 2. Extract and validate Blossom auth event against the bound host.
+        // 2. Extract the exact Blossom event and claimed immutable target.
         let auth_event = extract_blossom_auth(headers)?;
-        // Use the permissive window (3600s) here because we don't know the
-        // content type yet.  The upload functions re-verify with the correct
-        // per-type window (600s for images, 3600s for video) after the body
-        // has been consumed and the SHA-256 computed.
-        buzz_media::auth::verify_blossom_auth_event(&auth_event, Some(tenant.host()), 3600)?;
 
         // 3. Require X-SHA-256 header (BUD-11: mandatory for PUT /upload)
-        let claimed_hash = headers
-            .get("x-sha-256")
-            .and_then(|v| v.to_str().ok())
-            .ok_or(MediaError::MissingTag("x-sha-256"))?;
+        let claimed_hash = buzz_auth::ExactSingleHttpHeader::from_headers(
+            headers,
+            &axum::http::HeaderName::from_static("x-sha-256"),
+        )
+        .map_err(|_| MediaError::MissingTag("x-sha-256"))?;
+        let claimed_hash = claimed_hash.as_str();
 
         // Validate format: exactly 64 lowercase hex characters
         if claimed_hash.len() != 64
@@ -249,53 +383,106 @@ impl FromRequestParts<Arc<AppState>> for AuthenticatedUpload {
             return Err(MediaError::HashMismatch);
         }
 
-        // 4. Validate X-SHA-256 matches at least one x tag in the auth event
-        let has_matching_x = auth_event
-            .tags
-            .iter()
-            .any(|tag| tag.kind().to_string() == "x" && (tag.content() == Some(claimed_hash)));
-        if !has_matching_x {
-            return Err(MediaError::HashMismatch);
-        }
-
-        // 5. Relay membership gate (NIP-43). Blossom auth proves the signer
-        // authorized this exact upload hash for this server; NIP-43 answers
-        // whether that Nostr key may use this community's media store. This is
-        // the only upload authority: independent of bearer-token / api_tokens
-        // storage and of `require_auth_token` (which governs the REST API, not
-        // media). On open relays (membership disabled) any valid Blossom signer
-        // may upload, matching the WS door's admission policy.
-        let auth_tag = headers.get("x-auth-tag").and_then(|v| v.to_str().ok());
-        let identity_proof =
-            verify_media_corporate_identity(state, &tenant, headers, auth_event.pubkey).await?;
-
-        crate::api::relay_members::enforce_relay_membership(
-            state,
-            tenant.community(),
-            auth_event.pubkey.as_bytes(),
-            auth_tag,
+        // 4. Canonically verify the exact action, object, host, signature, and
+        // exclusive short expiry before any request-body or object-store I/O.
+        let route = canonical_blossom_request(
+            &state.config.relay_url,
+            &tenant,
+            &parts.method,
+            parts
+                .uri
+                .path_and_query()
+                .ok_or(MediaError::InvalidAuthEvent)?,
+            claimed_hash,
+        )?;
+        let authorization = buzz_auth::verify_blossom_authorization(
+            &auth_event,
+            &route,
+            &buzz_auth::SystemEvidenceClock,
         )
-        .await
-        .map_err(|_| MediaError::RelayMembershipRequired)?;
-        if upload_rate_limited(state, tenant.community(), &auth_event.pubkey) {
-            metrics::counter!("buzz_media_upload_rejections_total", "reason" => "rate_limit")
-                .increment(1);
-            return Err(MediaError::UploadRateLimitExceeded);
-        }
-        let upload_permit = acquire_upload_permit(state, tenant.community(), &auth_event.pubkey)
-            .inspect_err(|_| {
-                metrics::counter!("buzz_media_upload_rejections_total", "reason" => "concurrency")
-                    .increment(1);
-            })?;
-        finalize_media_corporate_identity(state, &tenant, auth_event.pubkey, identity_proof)
-            .await?;
+        .map_err(|_| MediaError::InvalidAuthEvent)?;
+        let auth_tag = exact_blossom_auth_tag(&auth_event, headers)?;
+        let identity_proof =
+            verify_media_corporate_identity(state, &tenant, headers, authorization.actor_pubkey())
+                .await?;
 
         Ok(AuthenticatedUpload {
-            auth_event,
+            authorization,
+            route,
+            auth_tag,
+            identity_proof,
             tenant,
             route_mode,
-            _upload_permit: upload_permit,
         })
+    }
+}
+
+async fn admit_media_principal(
+    state: &AppState,
+    tenant: &TenantContext,
+    actor: nostr::PublicKey,
+    auth_tag: Option<&str>,
+    identity_proof: crate::corporate_identity::CorporateIdentityProof,
+) -> Result<(), MediaError> {
+    finalize_media_corporate_identity(state, tenant, actor, identity_proof).await?;
+    crate::api::relay_members::enforce_relay_membership(
+        state,
+        tenant.community(),
+        actor.as_bytes(),
+        auth_tag,
+    )
+    .await
+    .map(|_| ())
+    .map_err(|_| MediaError::RelayMembershipRequired)
+}
+
+impl FromRequestParts<Arc<AppState>> for ProtectedAuthenticatedUpload {
+    type Rejection = MediaError;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &Arc<AppState>,
+    ) -> Result<Self, Self::Rejection> {
+        let preflight_event = extract_blossom_auth(&parts.headers)?;
+        let preflight_auth_tag = exact_blossom_auth_tag(&preflight_event, &parts.headers)?;
+        reject_unavailable_blossom_delegation(&preflight_event, preflight_auth_tag.as_deref())?;
+        let auth = AuthenticatedUpload::from_request_parts(parts, state).await?;
+        let access = crate::api::protected_publication::finalize_before_legacy_admission(
+            || async {
+                let handle = parts
+                    .extensions
+                    .get::<ProtectedPublicationAuthorizationHandle>()
+                    .cloned()
+                    .ok_or(MediaError::Internal)?;
+                let direct = verify_media_proxy_direct_evidence(
+                    handle.trusted_proxy_assertion_verifier().as_ref(),
+                    &parts.headers,
+                    auth.tenant.community(),
+                    &auth.authorization,
+                )
+                .map_err(|_| MediaError::InvalidAuthEvent)?;
+                authorize_media_publication(
+                    &handle,
+                    auth.tenant.community(),
+                    &auth.authorization,
+                    direct,
+                )
+                .await
+                .map_err(|_| MediaError::Internal)
+            },
+            || async {
+                admit_media_principal(
+                    state,
+                    &auth.tenant,
+                    auth.actor_pubkey(),
+                    auth.auth_tag.as_deref(),
+                    auth.identity_proof.clone(),
+                )
+                .await
+            },
+        )
+        .await?;
+        Ok(Self { auth, access })
     }
 }
 
@@ -323,7 +510,7 @@ async fn upload_attribution(
 
     let uploader_name = state
         .db
-        .get_user(auth.tenant.community(), &auth.auth_event.pubkey.to_bytes())
+        .get_user(auth.tenant.community(), &auth.actor_pubkey().to_bytes())
         .await
         .ok()
         .flatten()
@@ -370,6 +557,15 @@ pub async fn upload_blob(
     headers: HeaderMap,
     body: axum::body::Body,
 ) -> Result<Json<BlobDescriptor>, MediaError> {
+    admit_media_principal(
+        &state,
+        &auth.tenant,
+        auth.actor_pubkey(),
+        auth.auth_tag.as_deref(),
+        auth.identity_proof.clone(),
+    )
+    .await?;
+    let _upload_permit = admit_media_upload(&state, &auth)?;
     let attribution = upload_attribution(&state, &auth, &headers).await;
 
     if auth.route_mode == UploadRouteMode::LegacyMedia {
@@ -407,7 +603,7 @@ pub async fn upload_blob(
             &state.media_storage,
             &state.config.media,
             &auth.tenant,
-            &auth.auth_event,
+            &auth.authorization,
             replay,
             content_length,
             attribution,
@@ -438,7 +634,7 @@ pub async fn upload_blob(
                 &state.media_storage,
                 &state.config.media,
                 &auth.tenant,
-                &auth.auth_event,
+                &auth.authorization,
                 bytes,
                 attribution,
             )
@@ -453,7 +649,7 @@ pub async fn upload_blob(
                 &state.media_storage,
                 &state.config.media,
                 &auth.tenant,
-                &auth.auth_event,
+                &auth.authorization,
                 bytes,
                 attribution,
             )
@@ -488,7 +684,7 @@ pub async fn upload_blob(
             .send(NewAuditEntry {
                 community_id: auth.tenant.community(),
                 action: AuditAction::MediaUploaded,
-                actor_pubkey: Some(auth.auth_event.pubkey.to_bytes().to_vec()),
+                actor_pubkey: Some(auth.actor_pubkey().to_bytes().to_vec()),
                 object_id: Some(desc.sha256.clone()),
                 detail: serde_json::json!({
                     "sha256": desc.sha256,
@@ -502,6 +698,207 @@ pub async fn upload_blob(
             metrics::counter!("buzz_audit_send_errors_total").increment(1);
         }
     }
+
+    Ok(Json(descriptor))
+}
+
+/// DB-authoritative protected upload entry point.
+///
+/// [`ProtectedAuthenticatedUpload`] finalizes a target-bound `MediaWrite`
+/// context and server-generated operation identity before Axum exposes the
+/// body. Immutable staging then completes before the publication transaction;
+/// sidecars and upload records remain post-commit caches only.
+async fn protected_upload_blob(
+    State(state): State<Arc<AppState>>,
+    Extension(restore): Extension<OperationRestoreRuntime>,
+    protected: ProtectedAuthenticatedUpload,
+    headers: HeaderMap,
+    body: axum::body::Body,
+) -> Result<Json<BlobDescriptor>, MediaError> {
+    let ProtectedAuthenticatedUpload { auth, access } = protected;
+    if !access.matches_media(
+        auth.tenant.community(),
+        auth.actor_pubkey(),
+        auth.route.requested_path(),
+        auth.route.object_sha256(),
+        buzz_auth::BlossomAction::Upload,
+    ) || access.context().capability() != RouteCapability::MediaWrite
+        || access.operation().is_none()
+    {
+        return Err(media_witness_invalid());
+    }
+
+    let _upload_permit = admit_media_upload(&state, &auth)?;
+    let attribution = upload_attribution(&state, &auth, &headers).await;
+    if auth.route_mode == UploadRouteMode::LegacyMedia {
+        metrics::counter!("buzz_media_legacy_upload_route_total").increment(1);
+    }
+
+    use futures_util::StreamExt;
+    const SNIFF_BYTES: usize = 4096;
+    let mut source = body.into_data_stream();
+    let mut replay_chunks = Vec::new();
+    let mut sniff = Vec::with_capacity(SNIFF_BYTES);
+    while sniff.len() < SNIFF_BYTES {
+        match source.next().await {
+            Some(Ok(chunk)) => {
+                let needed = SNIFF_BYTES - sniff.len();
+                sniff.extend_from_slice(&chunk[..chunk.len().min(needed)]);
+                replay_chunks.push(chunk);
+            }
+            Some(Err(error)) => return Err(MediaError::Io(error.to_string())),
+            None => break,
+        }
+    }
+    let replay = futures_util::stream::iter(replay_chunks.into_iter().map(Ok)).chain(source);
+
+    let staged = if should_stream_as_video(&sniff) {
+        let content_length = headers
+            .get("content-length")
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse::<u64>().ok());
+        buzz_media::stage_video_upload(
+            &state.media_storage,
+            &state.config.media,
+            &auth.tenant,
+            &auth.authorization,
+            replay,
+            content_length,
+            attribution,
+        )
+        .await?
+    } else {
+        let max = state
+            .config
+            .media
+            .max_image_bytes
+            .max(state.config.media.max_file_bytes);
+        let bytes = axum::body::to_bytes(axum::body::Body::from_stream(replay), max as usize)
+            .await
+            .map_err(|_| MediaError::FileTooLarge { size: 0, max })?;
+        let is_image = matches!(
+            infer::get(&bytes).map(|kind| kind.mime_type()),
+            Some("image/jpeg" | "image/png" | "image/gif" | "image/webp")
+        );
+        if is_image {
+            buzz_media::stage_upload(
+                &state.media_storage,
+                &state.config.media,
+                &auth.tenant,
+                &auth.authorization,
+                bytes,
+                attribution,
+            )
+            .await?
+        } else if auth.route_mode == UploadRouteMode::LegacyMedia {
+            let mime = infer::get(&bytes)
+                .map(|kind| kind.mime_type().to_string())
+                .unwrap_or_else(|| "application/octet-stream".to_owned());
+            return Err(MediaError::DisallowedContentType(mime));
+        } else {
+            buzz_media::stage_file_upload(
+                &state.media_storage,
+                &state.config.media,
+                &auth.tenant,
+                &auth.authorization,
+                bytes,
+                attribution,
+            )
+            .await?
+        }
+    };
+
+    let coordinate = ProtectedPublicationCoordinate::media(access.context())
+        .map_err(|_| media_witness_invalid())?;
+    let expected_parent = access
+        .observer()
+        .observe_current(&coordinate)
+        .await
+        .map_err(|_| media_witness_invalid())?
+        .map(|witness| witness.result_digest());
+    let staged_digest = staged.publication().result_digest();
+    let request = ProtectedPublicationRequest::new(
+        access.context(),
+        coordinate,
+        access.operation().ok_or_else(media_witness_invalid)?,
+        staged_digest,
+        expected_parent,
+    )
+    .map_err(|_| media_witness_invalid())?;
+    let audit_descriptor = staged.descriptor().clone();
+    commit_observe_project_revalidate(
+        || async {
+            restore
+                .commit_protected_publication(&request)
+                .await
+                .map_err(|_| media_witness_invalid())
+        },
+        |committed| {
+            if committed.result_digest() == staged_digest {
+                Ok(())
+            } else {
+                Err(media_witness_invalid())
+            }
+        },
+        |committed| async {
+            access
+                .observer()
+                .observe_committed(committed.into_witness())
+                .await
+                .map_err(|_| media_witness_invalid())
+        },
+        || async {
+            staged
+                .publish_post_commit_projections(
+                    &state.media_storage,
+                    &auth.tenant,
+                    &state.config.media.public_base_url,
+                )
+                .await?;
+            if let Some(audit_tx) = &state.audit_tx {
+                if let Err(error) = audit_tx
+                    .send(NewAuditEntry {
+                        community_id: auth.tenant.community(),
+                        action: AuditAction::MediaUploaded,
+                        actor_pubkey: Some(auth.actor_pubkey().to_bytes().to_vec()),
+                        object_id: Some(audit_descriptor.sha256.clone()),
+                        detail: serde_json::json!({
+                            "sha256": audit_descriptor.sha256,
+                            "size": audit_descriptor.size,
+                            "mime": audit_descriptor.mime_type,
+                        }),
+                    })
+                    .await
+                {
+                    tracing::error!("Media audit channel closed — entry lost: {error}");
+                    metrics::counter!("buzz_audit_send_errors_total").increment(1);
+                }
+            }
+            Ok(())
+        },
+        |live| async move { live.revalidate().await.map_err(|_| media_witness_invalid()) },
+    )
+    .await?;
+
+    let mut descriptor = staged.into_descriptor();
+    rewrite_descriptor_urls_for_tenant(
+        &mut descriptor,
+        &state.config.relay_url,
+        auth.tenant.host(),
+    );
+
+    let mime_label = match descriptor.mime_type.as_str() {
+        "image/jpeg" | "image/png" | "image/gif" | "image/webp" | "video/mp4" => {
+            &descriptor.mime_type
+        }
+        _ => "other",
+    };
+    metrics::counter!(
+        "buzz_media_uploads_total",
+        "mime" => mime_label.to_owned(),
+        "community" => auth.tenant.host().to_owned()
+    )
+    .increment(1);
 
     Ok(Json(descriptor))
 }
@@ -548,6 +945,91 @@ async fn bind_media_read_tenant(
         .map_err(|_| MediaError::NotFound)
 }
 
+fn media_object_from_request_path(path: &str) -> Result<(&str, &str), MediaError> {
+    let requested_object = path.strip_prefix("/media/").ok_or(MediaError::NotFound)?;
+    validate_media_path(requested_object)?;
+    let object_sha256 = requested_object
+        .split('.')
+        .next()
+        .ok_or(MediaError::NotFound)?;
+    Ok((requested_object, object_sha256))
+}
+
+impl FromRequestParts<Arc<AppState>> for ProtectedMediaReadAuth {
+    type Rejection = MediaError;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &Arc<AppState>,
+    ) -> Result<Self, Self::Rejection> {
+        let auth_event = extract_blossom_auth(&parts.headers)?;
+        let auth_tag = exact_blossom_auth_tag(&auth_event, &parts.headers)?;
+        reject_unavailable_blossom_delegation(&auth_event, auth_tag.as_deref())?;
+        let tenant = bind_media_read_tenant(state, &parts.headers).await?;
+        let (requested_object, object_sha256) = media_object_from_request_path(parts.uri.path())?;
+        let requested_object = requested_object.to_owned().into_boxed_str();
+        let route = canonical_blossom_request(
+            &state.config.relay_url,
+            &tenant,
+            &parts.method,
+            parts
+                .uri
+                .path_and_query()
+                .ok_or(MediaError::InvalidAuthEvent)?,
+            object_sha256,
+        )?;
+        let authorization = buzz_auth::verify_blossom_authorization(
+            &auth_event,
+            &route,
+            &buzz_auth::SystemEvidenceClock,
+        )
+        .map_err(|_| MediaError::InvalidAuthEvent)?;
+        let identity_proof = verify_media_corporate_identity(
+            state,
+            &tenant,
+            &parts.headers,
+            authorization.actor_pubkey(),
+        )
+        .await?;
+        let access = crate::api::protected_publication::finalize_before_legacy_admission(
+            || async {
+                let handle = parts
+                    .extensions
+                    .get::<ProtectedPublicationAuthorizationHandle>()
+                    .cloned()
+                    .ok_or(MediaError::Internal)?;
+                let direct = verify_media_proxy_direct_evidence(
+                    handle.trusted_proxy_assertion_verifier().as_ref(),
+                    &parts.headers,
+                    tenant.community(),
+                    &authorization,
+                )
+                .map_err(|_| MediaError::InvalidAuthEvent)?;
+                authorize_media_publication(&handle, tenant.community(), &authorization, direct)
+                    .await
+                    .map_err(|_| MediaError::Internal)
+            },
+            || async {
+                admit_media_principal(
+                    state,
+                    &tenant,
+                    authorization.actor_pubkey(),
+                    auth_tag.as_deref(),
+                    identity_proof.clone(),
+                )
+                .await
+            },
+        )
+        .await?;
+        Ok(Self {
+            authorization,
+            tenant,
+            requested_object,
+            access,
+        })
+    }
+}
+
 async fn authenticate_media_read(
     state: &AppState,
     headers: &HeaderMap,
@@ -559,18 +1041,15 @@ async fn authenticate_media_read(
     let sha256 = sha256_ext.split('.').next().unwrap_or(sha256_ext);
     buzz_media::auth::verify_blossom_get_auth(&auth_event, sha256, Some(tenant.host()), 3600)?;
 
-    let auth_tag = headers.get("x-auth-tag").and_then(|v| v.to_str().ok());
-    let identity_proof =
-        verify_media_corporate_identity(state, &tenant, headers, auth_event.pubkey).await?;
+    let auth_tag = exact_blossom_auth_tag(&auth_event, headers)?;
     crate::api::relay_members::enforce_relay_membership(
         state,
         tenant.community(),
         auth_event.pubkey.as_bytes(),
-        auth_tag,
+        auth_tag.as_deref(),
     )
     .await
     .map_err(|_| MediaError::RelayMembershipRequired)?;
-    finalize_media_corporate_identity(state, &tenant, auth_event.pubkey, identity_proof).await?;
 
     Ok(MediaReadAuth { tenant })
 }
@@ -666,6 +1145,38 @@ pub async fn get_blob(
     validate_media_path(&sha256_ext)?;
     let media_auth = authenticate_media_read(&state, &req_headers, &sha256_ext).await?;
     serve_blob_for_tenant(&state, &media_auth.tenant, &sha256_ext, &req_headers).await
+}
+
+/// DB-authoritative protected GET. The immutable manifest and full object are
+/// digest-verified before the live witness is revalidated at the response
+/// boundary; streamed chunks retain the witness and stop on cancellation.
+async fn protected_get_blob(
+    State(state): State<Arc<AppState>>,
+    auth: ProtectedMediaReadAuth,
+    Path(sha256_ext): Path<String>,
+    req_headers: HeaderMap,
+) -> Result<Response, MediaError> {
+    validate_media_path(&sha256_ext)?;
+    if auth.requested_object.as_ref() != sha256_ext
+        || !auth.access.matches_media(
+            auth.tenant.community(),
+            auth.authorization.actor_pubkey(),
+            auth.authorization.request().requested_path(),
+            auth.authorization.request().object_sha256(),
+            buzz_auth::BlossomAction::Get,
+        )
+    {
+        return Err(media_witness_invalid());
+    }
+    let witness = observe_media_publication(
+        auth.access.observer(),
+        auth.access.context(),
+        auth.tenant,
+        &sha256_ext,
+    )
+    .await?
+    .ok_or(MediaError::NotFound)?;
+    serve_witnessed_blob_for_tenant(&state, witness, &req_headers, false).await
 }
 
 /// Serve a validated blob from an already-authorized tenant context.
@@ -811,56 +1322,69 @@ pub(crate) async fn serve_blob_for_tenant(
 /// Serve only bytes named by a sealed PostgreSQL publication witness.
 ///
 /// The immutable manifest and complete object are fetched and hash-verified
-/// first. `final_recheck` is then consumed immediately before response headers
-/// or bytes are constructed. The callback is the provisional boundary for
-/// S5's typed joined-witness recheck; an error fails closed without falling
+/// first. The live witness is then revalidated immediately before response
+/// headers or bytes are constructed. An error fails closed without falling
 /// back to a sidecar or raw object-store pointer.
-struct ProvisionalMediaPublicationWitness {
+struct ProtectedMediaPublicationWitness {
     tenant: TenantContext,
-    result_digest: [u8; 32],
     requested_path: String,
-    cancellation: CancellationToken,
+    live: LiveProtectedPublicationWitness,
 }
 
-#[allow(dead_code)] // Constructed only by the pending S5 joined-witness adapter.
-impl ProvisionalMediaPublicationWitness {
-    fn from_joined_witness_parts(
+impl ProtectedMediaPublicationWitness {
+    fn from_live_witness(
+        context: &AuthContext,
         tenant: TenantContext,
-        result_digest: [u8; 32],
         requested_path: impl Into<String>,
-        cancellation: CancellationToken,
+        live: LiveProtectedPublicationWitness,
     ) -> Result<Self, MediaError> {
         let requested_path = requested_path.into();
-        if result_digest == [0; 32] {
+        if tenant.community() != context.authorization_domain() {
             return Err(media_witness_invalid());
         }
         validate_media_path(&requested_path)?;
         Ok(Self {
             tenant,
-            result_digest,
             requested_path,
-            cancellation,
+            live,
         })
     }
 }
 
-#[allow(dead_code)] // Activated by the pending high-level S5 publication witness.
-async fn serve_witnessed_blob_for_tenant<F, Fut, E>(
+/// Resolve and subscribe to the DB-authoritative publication for a finalized
+/// media route. Root composition supplies both sealed inputs.
+#[allow(dead_code)] // Wired by S5 root composition after observer acceptance.
+async fn observe_media_publication(
+    observer: &ProtectedPublicationObserver,
+    context: &AuthContext,
+    tenant: TenantContext,
+    requested_path: impl Into<String>,
+) -> Result<Option<ProtectedMediaPublicationWitness>, MediaError> {
+    let coordinate =
+        ProtectedPublicationCoordinate::media(context).map_err(|_| media_witness_invalid())?;
+    let Some(live) = observer
+        .observe_current(&coordinate)
+        .await
+        .map_err(|_| media_witness_invalid())?
+    else {
+        return Ok(None);
+    };
+    ProtectedMediaPublicationWitness::from_live_witness(context, tenant, requested_path, live)
+        .map(Some)
+}
+
+#[allow(dead_code)] // Wired by S5 root composition after observer acceptance.
+async fn serve_witnessed_blob_for_tenant(
     state: &AppState,
-    witness: ProvisionalMediaPublicationWitness,
+    witness: ProtectedMediaPublicationWitness,
     req_headers: &HeaderMap,
     head_only: bool,
-    final_recheck: F,
-) -> Result<Response, MediaError>
-where
-    F: FnOnce() -> Fut,
-    Fut: Future<Output = Result<(), E>>,
-{
+) -> Result<Response, MediaError> {
     let object = state
         .media_storage
         .verify_media_object(
             &witness.tenant,
-            witness.result_digest,
+            witness.live.result_digest(),
             &witness.requested_path,
         )
         .await?;
@@ -875,7 +1399,7 @@ where
     };
 
     if head_only {
-        final_media_witness_recheck(&witness.cancellation, final_recheck).await?;
+        final_media_witness_recheck(&witness.live, || witness.live.revalidate()).await?;
         return axum::response::Response::builder()
             .status(StatusCode::OK)
             .header(header::CONTENT_TYPE, content_type)
@@ -894,9 +1418,9 @@ where
         .and_then(|value| value.to_str().ok())
         .filter(|value| !value.contains(','));
     let Some(range) = single_range else {
-        final_media_witness_recheck(&witness.cancellation, final_recheck).await?;
+        final_media_witness_recheck(&witness.live, || witness.live.revalidate()).await?;
         let stream = object.into_stream()?;
-        let stream = CancellationCheckedMediaStream::new(stream, witness.cancellation);
+        let stream = CancellationCheckedMediaStream::new(stream, witness.live);
         return axum::response::Response::builder()
             .status(StatusCode::OK)
             .header(header::CONTENT_TYPE, content_type)
@@ -911,28 +1435,22 @@ where
     };
 
     let Some((start, end)) = parse_byte_range(range, total) else {
-        return witnessed_range_not_satisfiable_response(
-            range,
-            total,
-            &witness.cancellation,
-            final_recheck,
-        )
+        return witnessed_range_not_satisfiable_response(range, total, &witness.live, || {
+            witness.live.revalidate()
+        })
         .await;
     };
     if start >= total {
-        return witnessed_range_not_satisfiable_response(
-            range,
-            total,
-            &witness.cancellation,
-            final_recheck,
-        )
+        return witnessed_range_not_satisfiable_response(range, total, &witness.live, || {
+            witness.live.revalidate()
+        })
         .await;
     }
     let end = end
         .min(start.saturating_add(MAX_RANGE_CHUNK - 1))
         .min(total.saturating_sub(1));
     let bytes = object.read_range(start, end).await?;
-    final_media_witness_recheck(&witness.cancellation, final_recheck).await?;
+    final_media_witness_recheck(&witness.live, || witness.live.revalidate()).await?;
     axum::response::Response::builder()
         .status(StatusCode::PARTIAL_CONTENT)
         .header(header::CONTENT_TYPE, content_type)
@@ -950,20 +1468,21 @@ where
         .map_err(|_| MediaError::Internal)
 }
 
-async fn witnessed_range_not_satisfiable_response<F, Fut, E>(
+async fn witnessed_range_not_satisfiable_response<A, F, Fut, E>(
     range: &str,
     total: u64,
-    cancellation: &CancellationToken,
+    authority: &A,
     final_recheck: F,
 ) -> Result<Response, MediaError>
 where
+    A: PublicationStreamAuthority,
     F: FnOnce() -> Fut,
     Fut: Future<Output = Result<(), E>>,
 {
     if parse_byte_range(range, total).is_some_and(|(start, _)| start < total) {
         return Err(MediaError::Internal);
     }
-    final_media_witness_recheck(cancellation, final_recheck).await?;
+    final_media_witness_recheck(authority, final_recheck).await?;
     axum::response::Response::builder()
         .status(StatusCode::RANGE_NOT_SATISFIABLE)
         .header(header::CONTENT_RANGE, format!("bytes */{total}"))
@@ -971,19 +1490,20 @@ where
         .map_err(|_| MediaError::Internal)
 }
 
-async fn final_media_witness_recheck<F, Fut, E>(
-    cancellation: &CancellationToken,
+async fn final_media_witness_recheck<A, F, Fut, E>(
+    authority: &A,
     final_recheck: F,
 ) -> Result<(), MediaError>
 where
+    A: PublicationStreamAuthority,
     F: FnOnce() -> Fut,
     Fut: Future<Output = Result<(), E>>,
 {
-    if cancellation.is_cancelled() {
+    if authority.is_cancelled() {
         return Err(media_witness_invalid());
     }
     final_recheck().await.map_err(|_| media_witness_invalid())?;
-    if cancellation.is_cancelled() {
+    if authority.is_cancelled() {
         return Err(media_witness_invalid());
     }
     Ok(())
@@ -993,35 +1513,68 @@ fn media_witness_invalid() -> MediaError {
     MediaError::StorageError("protected media witness is no longer current".to_owned())
 }
 
-struct CancellationCheckedMediaStream {
+trait PublicationStreamAuthority: Clone + Send + 'static {
+    fn is_cancelled(&self) -> bool;
+    fn cancelled_future(&self) -> Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
+}
+
+impl PublicationStreamAuthority for LiveProtectedPublicationWitness {
+    fn is_cancelled(&self) -> bool {
+        self.is_cancelled()
+    }
+
+    fn cancelled_future(&self) -> Pin<Box<dyn Future<Output = ()> + Send + 'static>> {
+        let witness = self.clone();
+        Box::pin(async move { witness.cancelled().await })
+    }
+}
+
+#[cfg(test)]
+impl PublicationStreamAuthority for CancellationToken {
+    fn is_cancelled(&self) -> bool {
+        self.is_cancelled()
+    }
+
+    fn cancelled_future(&self) -> Pin<Box<dyn Future<Output = ()> + Send + 'static>> {
+        let cancellation = self.clone();
+        Box::pin(async move { cancellation.cancelled().await })
+    }
+}
+
+struct CancellationCheckedMediaStream<A = LiveProtectedPublicationWitness> {
     inner: buzz_media::ByteStream,
-    cancellation: CancellationToken,
+    authority: A,
+    cancelled: Pin<Box<dyn Future<Output = ()> + Send + 'static>>,
     finished: bool,
 }
 
-impl CancellationCheckedMediaStream {
-    fn new(inner: buzz_media::ByteStream, cancellation: CancellationToken) -> Self {
+impl<A: PublicationStreamAuthority> CancellationCheckedMediaStream<A> {
+    fn new(inner: buzz_media::ByteStream, authority: A) -> Self {
+        let cancelled = authority.cancelled_future();
         Self {
             inner,
-            cancellation,
+            authority,
+            cancelled,
             finished: false,
         }
     }
 }
 
-impl futures_util::Stream for CancellationCheckedMediaStream {
+impl<A: PublicationStreamAuthority + Unpin> futures_util::Stream
+    for CancellationCheckedMediaStream<A>
+{
     type Item = Result<bytes::Bytes, MediaError>;
 
     fn poll_next(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         if self.finished {
             return Poll::Ready(None);
         }
-        if self.cancellation.is_cancelled() {
+        if self.authority.is_cancelled() || self.cancelled.as_mut().poll(context).is_ready() {
             self.finished = true;
             return Poll::Ready(Some(Err(media_witness_invalid())));
         }
         match self.inner.as_mut().poll_next(context) {
-            Poll::Ready(Some(Ok(_bytes))) if self.cancellation.is_cancelled() => {
+            Poll::Ready(Some(Ok(_bytes))) if self.authority.is_cancelled() => {
                 self.finished = true;
                 Poll::Ready(Some(Err(media_witness_invalid())))
             }
@@ -1136,6 +1689,38 @@ pub async fn head_blob(
     }
 }
 
+/// DB-authoritative protected HEAD. The size and content headers are not
+/// constructed until the immutable object is verified and the live witness
+/// passes its final async recheck.
+async fn protected_head_blob(
+    State(state): State<Arc<AppState>>,
+    auth: ProtectedMediaReadAuth,
+    headers: HeaderMap,
+    Path(sha256_ext): Path<String>,
+) -> Result<Response, MediaError> {
+    validate_media_path(&sha256_ext)?;
+    if auth.requested_object.as_ref() != sha256_ext
+        || !auth.access.matches_media(
+            auth.tenant.community(),
+            auth.authorization.actor_pubkey(),
+            auth.authorization.request().requested_path(),
+            auth.authorization.request().object_sha256(),
+            buzz_auth::BlossomAction::Head,
+        )
+    {
+        return Err(media_witness_invalid());
+    }
+    let witness = observe_media_publication(
+        auth.access.observer(),
+        auth.access.context(),
+        auth.tenant,
+        &sha256_ext,
+    )
+    .await?
+    .ok_or(MediaError::NotFound)?;
+    serve_witnessed_blob_for_tenant(&state, witness, &headers, true).await
+}
+
 /// Resolve the S3 key from a URL path segment.
 ///
 /// - `sha256.ext`       → used as-is (already validated by `validate_media_path`)
@@ -1191,7 +1776,10 @@ fn extract_blossom_auth(headers: &HeaderMap) -> Result<nostr::Event, MediaError>
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    };
 
     use axum::{
         body::Body,
@@ -1202,6 +1790,52 @@ mod tests {
     use uuid::Uuid;
 
     const VALID_HASH: &str = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
+
+    #[tokio::test]
+    async fn blocked_audit_invalidation_denies_before_media_response() {
+        let invalidated = Arc::new(AtomicBool::new(false));
+        let response_built = Arc::new(AtomicBool::new(false));
+        let (audit_started_tx, audit_started_rx) = tokio::sync::oneshot::channel();
+        let (audit_release_tx, audit_release_rx) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn({
+            let invalidated = invalidated.clone();
+            let response_built = response_built.clone();
+            async move {
+                let result = commit_observe_project_revalidate(
+                    || async { Ok::<(), &'static str>(()) },
+                    |_| Ok(()),
+                    |_| async { Ok(()) },
+                    || async {
+                        audit_started_tx.send(()).map_err(|_| "audit-start")?;
+                        audit_release_rx.await.map_err(|_| "audit-release")?;
+                        Ok(())
+                    },
+                    |()| async move {
+                        if invalidated.load(Ordering::Acquire) {
+                            Err("stale")
+                        } else {
+                            Ok(())
+                        }
+                    },
+                )
+                .await;
+                if result.is_ok() {
+                    response_built.store(true, Ordering::Release);
+                }
+                result
+            }
+        });
+
+        audit_started_rx.await.expect("audit send reached");
+        invalidated.store(true, Ordering::Release);
+        audit_release_tx.send(()).expect("release blocked audit");
+
+        assert_eq!(task.await.expect("race task"), Err("stale"));
+        assert!(
+            !response_built.load(Ordering::Acquire),
+            "invalidation during the audit await must prevent response construction"
+        );
+    }
 
     #[test]
     fn upload_routes_distinguish_standard_and_legacy_modes() {
@@ -1227,18 +1861,12 @@ mod tests {
     }
 
     async fn test_state() -> Arc<AppState> {
-        test_state_with_corporate_identity(false).await
+        test_state_with_media_get_auth(false).await
     }
 
-    async fn test_state_with_corporate_identity(require_corporate_identity: bool) -> Arc<AppState> {
+    async fn test_state_with_media_get_auth(_require_media_get_auth: bool) -> Arc<AppState> {
         let mut config = crate::config::Config::from_env().expect("default config loads");
         config.require_relay_membership = false;
-        config.corporate_identity.require = require_corporate_identity;
-        if require_corporate_identity {
-            config.corporate_identity.jwks_uri = "http://127.0.0.1:9/jwks".to_string();
-            config.corporate_identity.issuer = "https://idp.example".to_string();
-            config.corporate_identity.audience = "buzz-relay".to_string();
-        }
         config.redis_url = "redis://127.0.0.1:1".to_string();
         config.media_uploads_per_minute = 1;
         config.media_max_concurrent_uploads = 2;
@@ -1280,18 +1908,8 @@ mod tests {
         Arc::new(state)
     }
 
-    async fn media_get_auth_router() -> axum::Router {
-        let state = test_state().await;
-        axum::Router::new()
-            .route(
-                "/media/{sha256_ext}",
-                axum::routing::get(get_blob).head(head_blob),
-            )
-            .with_state(state)
-    }
-
-    async fn media_get_auth_router_with_corporate_identity() -> axum::Router {
-        let state = test_state_with_corporate_identity(true).await;
+    async fn media_get_auth_router(require_media_get_auth: bool) -> axum::Router {
+        let state = test_state_with_media_get_auth(require_media_get_auth).await;
         axum::Router::new()
             .route(
                 "/media/{sha256_ext}",
@@ -1353,6 +1971,36 @@ mod tests {
         assert!(extract_blossom_auth(&exact).is_ok());
     }
 
+    #[test]
+    fn delegated_blossom_fails_at_pure_preflight_before_tenant_lookup() {
+        let owner = Keys::generate();
+        let agent = Keys::generate();
+        let auth_tag = buzz_sdk::nip_oa::compute_auth_tag(&owner, &agent.public_key(), "kind=9")
+            .expect("valid NIP-OA tag");
+        let event = EventBuilder::new(Kind::from(24242), "upload")
+            .sign_with_keys(&agent)
+            .expect("sign fixture event");
+
+        let mut headers = HeaderMap::new();
+        headers.insert("x-auth-tag", auth_tag.parse().expect("auth tag header"));
+        let extracted = exact_blossom_auth_tag(&event, &headers).expect("exact header");
+        assert!(matches!(
+            reject_unavailable_blossom_delegation(&event, extracted.as_deref()),
+            Err(MediaError::Internal)
+        ));
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-auth-tag",
+            format!("{auth_tag},{auth_tag}").parse().expect("header"),
+        );
+        let extracted = exact_blossom_auth_tag(&event, &headers).expect("one header line");
+        assert!(matches!(
+            reject_unavailable_blossom_delegation(&event, extracted.as_deref()),
+            Err(MediaError::InvalidAuthEvent)
+        ));
+    }
+
     fn media_request(method: &str, auth: Option<String>) -> Request<Body> {
         let mut builder = Request::builder()
             .method(method)
@@ -1365,9 +2013,53 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn media_reads_reject_unauthenticated_get_and_head_before_sidecar_gate() {
+    async fn media_read_requires_auth_before_sidecar_gate() {
+        let response = media_get_auth_router(false)
+            .await
+            .oneshot(media_request("GET", None))
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn protected_media_never_falls_back_to_legacy_unauthenticated_read() {
+        let state = test_state_with_media_get_auth(false).await;
+        let response = protected_media_router(state)
+            .oneshot(media_request("GET", None))
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn protected_media_requires_installed_finalizer_before_storage() {
+        let state = test_state_with_media_get_auth(false).await;
+        let keys = Keys::generate();
+        let now = Timestamp::now().as_secs();
+        let expiration = (now + 300).to_string();
+        let auth = media_get_auth_header(
+            &keys,
+            vec![
+                Tag::parse(["t", "get"]).expect("t tag"),
+                Tag::parse(["expiration", expiration.as_str()]).expect("expiration tag"),
+                Tag::parse(["x", VALID_HASH]).expect("x tag"),
+            ],
+        );
+        let response = protected_media_router(state)
+            .oneshot(media_request("GET", Some(auth)))
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[tokio::test]
+    async fn media_get_auth_flag_on_rejects_unauthenticated_get_and_head_before_sidecar_gate() {
         for method in ["GET", "HEAD"] {
-            let response = media_get_auth_router()
+            let response = media_get_auth_router(true)
                 .await
                 .oneshot(media_request(method, None))
                 .await
@@ -1378,10 +2070,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn media_read_with_valid_server_scoped_token_reaches_sidecar_gate() {
+    async fn media_get_auth_flag_on_valid_server_scoped_token_reaches_sidecar_gate() {
         let keys = Keys::generate();
         let auth = media_get_auth_header(&keys, media_get_tags_for("relay.example", None));
-        let response = media_get_auth_router()
+        let response = media_get_auth_router(true)
             .await
             .oneshot(media_request("GET", Some(auth)))
             .await
@@ -1391,24 +2083,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires Postgres"]
-    async fn protected_media_reads_require_corporate_identity_for_get_and_head() {
-        let keys = Keys::generate();
-
-        for method in ["GET", "HEAD"] {
-            let auth = media_get_auth_header(&keys, media_get_tags_for("relay.example", None));
-            let response = media_get_auth_router_with_corporate_identity()
-                .await
-                .oneshot(media_request(method, Some(auth)))
-                .await
-                .expect("response");
-
-            assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{method}");
-        }
-    }
-
-    #[tokio::test]
-    async fn media_read_rejects_upload_verb_wrong_server_and_wrong_x() {
+    async fn media_get_auth_flag_on_rejects_upload_verb_wrong_server_and_wrong_x() {
         let keys = Keys::generate();
         let now = Timestamp::now().as_secs();
         let expiration = (now + 300).to_string();
@@ -1432,7 +2107,7 @@ mod tests {
 
         for tags in cases {
             let auth = media_get_auth_header(&keys, tags);
-            let response = media_get_auth_router()
+            let response = media_get_auth_router(true)
                 .await
                 .oneshot(media_request("GET", Some(auth)))
                 .await
@@ -1449,7 +2124,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn media_read_accepts_range_header_only_after_auth() {
+    async fn media_get_auth_flag_on_accepts_range_header_only_after_auth() {
         let keys = Keys::generate();
         let auth = media_get_auth_header(&keys, media_get_tags_for("relay.example", None));
         let mut request = media_request("GET", Some(auth));
@@ -1457,7 +2132,7 @@ mod tests {
             .headers_mut()
             .insert(header::RANGE, "bytes=0-0".parse().expect("range header"));
 
-        let response = media_get_auth_router()
+        let response = media_get_auth_router(true)
             .await
             .oneshot(request)
             .await
@@ -1659,43 +2334,6 @@ mod tests {
         cancellation.cancel();
         assert!(stream.next().await.expect("closed chunk").is_err());
         assert!(stream.next().await.is_none());
-    }
-
-    #[test]
-    fn provisional_media_witness_keeps_domain_target_and_digest_joined() {
-        let tenant = TenantContext::resolved(
-            buzz_core::CommunityId::from_uuid(Uuid::from_u128(7)),
-            "media.example",
-        );
-        let witness = ProvisionalMediaPublicationWitness::from_joined_witness_parts(
-            tenant.clone(),
-            [0x44; 32],
-            VALID_HASH,
-            CancellationToken::new(),
-        )
-        .expect("joined witness");
-        assert_eq!(witness.tenant, tenant);
-        assert_eq!(witness.result_digest, [0x44; 32]);
-        assert_eq!(witness.requested_path, VALID_HASH);
-
-        assert!(
-            ProvisionalMediaPublicationWitness::from_joined_witness_parts(
-                tenant.clone(),
-                [0; 32],
-                VALID_HASH,
-                CancellationToken::new(),
-            )
-            .is_err()
-        );
-        assert!(
-            ProvisionalMediaPublicationWitness::from_joined_witness_parts(
-                tenant,
-                [0x44; 32],
-                "../other",
-                CancellationToken::new(),
-            )
-            .is_err()
-        );
     }
 
     #[tokio::test]

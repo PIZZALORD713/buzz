@@ -473,6 +473,42 @@ $$;
 
 
 --
+-- Name: authorization_invalidation_floor_guard_v1(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.authorization_invalidation_floor_guard_v1() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+BEGIN
+    IF NEW IS NOT DISTINCT FROM OLD THEN
+        RETURN NEW;
+    END IF;
+    IF NEW.community_id IS DISTINCT FROM OLD.community_id
+        OR NEW.selector_kind IS DISTINCT FROM OLD.selector_kind
+        OR NEW.selector_fingerprint IS DISTINCT FROM OLD.selector_fingerprint
+        OR NEW.floor_generation < OLD.floor_generation
+        OR COALESCE(NEW.binding_version_floor, 0) < COALESCE(OLD.binding_version_floor, 0)
+        OR COALESCE(NEW.relationship_revision_floor, 0)
+            < COALESCE(OLD.relationship_revision_floor, 0)
+        OR (
+            NEW.floor_generation = OLD.floor_generation
+            AND COALESCE(NEW.binding_version_floor, 0)
+                = COALESCE(OLD.binding_version_floor, 0)
+            AND COALESCE(NEW.relationship_revision_floor, 0)
+                = COALESCE(OLD.relationship_revision_floor, 0)
+        )
+        OR NEW.operation_id IS NOT DISTINCT FROM OLD.operation_id
+        OR NEW.updated_at <= OLD.updated_at
+    THEN
+        RAISE EXCEPTION 'authorization invalidation floor cannot move backward'
+            USING ERRCODE = 'check_violation';
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+
+--
 -- Name: authorization_operation_receipt_event_guard_v1(); Type: FUNCTION; Schema: public; Owner: -
 --
 
@@ -548,6 +584,43 @@ BEGIN
             expected_count, history_count
             USING ERRCODE = 'check_violation',
                   CONSTRAINT = 'authorization_operation_receipt_history_cardinality';
+    END IF;
+    RETURN NULL;
+END;
+$$;
+
+
+--
+-- Name: authorization_operation_version_delta_cardinality_guard_v1(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.authorization_operation_version_delta_cardinality_guard_v1() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+DECLARE
+    manifest authorization_operation_version_delta_manifests%ROWTYPE;
+    actual_component_count BIGINT;
+BEGIN
+    IF TG_TABLE_NAME = 'authorization_operation_version_delta_manifests' THEN
+        manifest := NEW;
+    ELSE
+        SELECT * INTO STRICT manifest
+        FROM authorization_operation_version_delta_manifests
+        WHERE community_id = NEW.community_id
+          AND operation_id = NEW.operation_id
+        FOR NO KEY UPDATE;
+    END IF;
+
+    SELECT count(*) INTO actual_component_count
+    FROM authorization_operation_version_deltas
+    WHERE community_id = manifest.community_id
+      AND operation_id = manifest.operation_id;
+
+    IF actual_component_count <> manifest.component_count THEN
+        RAISE EXCEPTION 'operation version manifest declares % components, found %',
+            manifest.component_count, actual_component_count
+            USING ERRCODE = 'check_violation',
+                  CONSTRAINT = 'authorization_operation_version_delta_cardinality';
     END IF;
     RETURN NULL;
 END;
@@ -1633,6 +1706,30 @@ CREATE TABLE public.authorization_invalidation_domains (
 
 
 --
+-- Name: authorization_invalidation_floors; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.authorization_invalidation_floors (
+    community_id uuid NOT NULL,
+    selector_kind smallint NOT NULL,
+    selector_fingerprint bytea NOT NULL,
+    floor_generation bigint NOT NULL,
+    binding_version_floor bigint,
+    relationship_revision_floor bigint,
+    operation_id uuid NOT NULL,
+    request_fingerprint bytea NOT NULL,
+    updated_at timestamp with time zone DEFAULT transaction_timestamp() NOT NULL,
+    CONSTRAINT authorization_invalidation_fl_relationship_revision_floor_check CHECK (((relationship_revision_floor IS NULL) OR (relationship_revision_floor > 0))),
+    CONSTRAINT authorization_invalidation_floors_binding_version_floor_check CHECK (((binding_version_floor IS NULL) OR (binding_version_floor > 0))),
+    CONSTRAINT authorization_invalidation_floors_check CHECK ((((selector_kind = 3) AND (binding_version_floor IS NOT NULL) AND (relationship_revision_floor IS NULL)) OR ((selector_kind = 7) AND (binding_version_floor IS NULL) AND (relationship_revision_floor IS NOT NULL)) OR ((selector_kind <> ALL (ARRAY[3, 7])) AND (binding_version_floor IS NULL) AND (relationship_revision_floor IS NULL)))),
+    CONSTRAINT authorization_invalidation_floors_floor_generation_check CHECK ((floor_generation > 0)),
+    CONSTRAINT authorization_invalidation_floors_request_fingerprint_check CHECK ((octet_length(request_fingerprint) = 32)),
+    CONSTRAINT authorization_invalidation_floors_selector_fingerprint_check CHECK ((octet_length(selector_fingerprint) = 32)),
+    CONSTRAINT authorization_invalidation_floors_selector_kind_check CHECK ((selector_kind = ANY (ARRAY[1, 2, 3, 4, 5, 6, 7])))
+);
+
+
+--
 -- Name: authorization_operation_receipts; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -1651,6 +1748,47 @@ CREATE TABLE public.authorization_operation_receipts (
     CONSTRAINT authorization_operation_receipts_outcome_code_check CHECK ((outcome_code = ANY (ARRAY[1, 2, 3]))),
     CONSTRAINT authorization_operation_receipts_request_fingerprint_check CHECK ((octet_length(request_fingerprint) = 32)),
     CONSTRAINT authorization_operation_receipts_result_digest_check CHECK ((octet_length(result_digest) = 32))
+);
+
+
+--
+-- Name: authorization_operation_version_delta_manifests; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.authorization_operation_version_delta_manifests (
+    community_id uuid NOT NULL,
+    operation_id uuid NOT NULL,
+    request_fingerprint bytea NOT NULL,
+    component_count integer NOT NULL,
+    before_digest bytea NOT NULL,
+    after_digest bytea NOT NULL,
+    manifest_digest bytea NOT NULL,
+    recorded_at timestamp with time zone DEFAULT transaction_timestamp() NOT NULL,
+    CONSTRAINT authorization_operation_version_delta_man_component_count_check CHECK (((component_count >= 0) AND (component_count <= 1024))),
+    CONSTRAINT authorization_operation_version_delta_man_manifest_digest_check CHECK ((octet_length(manifest_digest) = 32)),
+    CONSTRAINT authorization_operation_version_delta_manif_before_digest_check CHECK ((octet_length(before_digest) = 32)),
+    CONSTRAINT authorization_operation_version_delta_manife_after_digest_check CHECK ((octet_length(after_digest) = 32)),
+    CONSTRAINT authorization_operation_version_delta_request_fingerprint_check CHECK ((octet_length(request_fingerprint) = 32))
+);
+
+
+--
+-- Name: authorization_operation_version_deltas; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.authorization_operation_version_deltas (
+    community_id uuid NOT NULL,
+    operation_id uuid NOT NULL,
+    component_kind smallint NOT NULL,
+    component_key bytea NOT NULL,
+    before_version bigint NOT NULL,
+    after_version bigint NOT NULL,
+    component_digest bytea NOT NULL,
+    CONSTRAINT authorization_operation_version_deltas_before_version_check CHECK ((before_version >= 0)),
+    CONSTRAINT authorization_operation_version_deltas_check CHECK ((after_version > before_version)),
+    CONSTRAINT authorization_operation_version_deltas_component_digest_check CHECK ((octet_length(component_digest) = 32)),
+    CONSTRAINT authorization_operation_version_deltas_component_key_check CHECK ((octet_length(component_key) = 32)),
+    CONSTRAINT authorization_operation_version_deltas_component_kind_check CHECK ((component_kind = ANY (ARRAY[1, 2, 3, 4, 5, 6, 7])))
 );
 
 
@@ -1701,6 +1839,43 @@ CREATE TABLE public.channels (
     ttl_seconds integer,
     ttl_deadline timestamp with time zone,
     CONSTRAINT chk_channels_id_not_nil CHECK ((id <> '00000000-0000-0000-0000-000000000000'::uuid))
+);
+
+
+--
+-- Name: client_status_revisions; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.client_status_revisions (
+    community_id uuid NOT NULL,
+    event_author_pubkey bytea NOT NULL,
+    revision bigint NOT NULL,
+    disposition smallint NOT NULL,
+    binding_id uuid,
+    binding_version bigint,
+    policy_revision bigint,
+    invalidation_generation bigint,
+    authority_epoch bigint,
+    fence bytea,
+    observed_at timestamp with time zone,
+    fresh_until timestamp with time zone,
+    supersedes_revision bigint,
+    receipt_digest bytea NOT NULL,
+    operation_id uuid NOT NULL,
+    request_fingerprint bytea NOT NULL,
+    recorded_at timestamp with time zone DEFAULT transaction_timestamp() NOT NULL,
+    CONSTRAINT client_status_revisions_authority_epoch_check CHECK (((authority_epoch IS NULL) OR (authority_epoch > 0))),
+    CONSTRAINT client_status_revisions_binding_version_check CHECK (((binding_version IS NULL) OR (binding_version > 0))),
+    CONSTRAINT client_status_revisions_check CHECK ((((disposition = 1) AND (binding_id IS NOT NULL) AND (binding_version IS NOT NULL) AND (policy_revision IS NOT NULL) AND (invalidation_generation IS NOT NULL) AND (authority_epoch IS NOT NULL) AND (fence IS NOT NULL) AND (observed_at IS NOT NULL) AND (fresh_until IS NOT NULL) AND (supersedes_revision IS NULL) AND (observed_at < fresh_until) AND (fresh_until <= (observed_at + '00:05:00'::interval))) OR ((disposition = 2) AND (binding_id IS NULL) AND (binding_version IS NULL) AND (policy_revision IS NULL) AND (invalidation_generation IS NULL) AND (authority_epoch IS NULL) AND (fence IS NULL) AND (observed_at IS NULL) AND (fresh_until IS NULL) AND (supersedes_revision IS NOT NULL) AND (supersedes_revision < revision)))),
+    CONSTRAINT client_status_revisions_disposition_check CHECK ((disposition = ANY (ARRAY[1, 2]))),
+    CONSTRAINT client_status_revisions_event_author_pubkey_check CHECK ((octet_length(event_author_pubkey) = 32)),
+    CONSTRAINT client_status_revisions_fence_check CHECK (((fence IS NULL) OR ((octet_length(fence) = 32) AND (fence <> decode(repeat('00'::text, 32), 'hex'::text))))),
+    CONSTRAINT client_status_revisions_invalidation_generation_check CHECK (((invalidation_generation IS NULL) OR (invalidation_generation >= 0))),
+    CONSTRAINT client_status_revisions_policy_revision_check CHECK (((policy_revision IS NULL) OR (policy_revision > 0))),
+    CONSTRAINT client_status_revisions_receipt_digest_check CHECK ((octet_length(receipt_digest) = 32)),
+    CONSTRAINT client_status_revisions_request_fingerprint_check CHECK ((octet_length(request_fingerprint) = 32)),
+    CONSTRAINT client_status_revisions_revision_check CHECK ((revision > 0)),
+    CONSTRAINT client_status_revisions_supersedes_revision_check CHECK (((supersedes_revision IS NULL) OR (supersedes_revision > 0)))
 );
 
 
@@ -3132,6 +3307,14 @@ ALTER TABLE ONLY public.authorization_invalidation_domains
 
 
 --
+-- Name: authorization_invalidation_floors authorization_invalidation_floors_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.authorization_invalidation_floors
+    ADD CONSTRAINT authorization_invalidation_floors_pkey PRIMARY KEY (community_id, selector_kind, selector_fingerprint);
+
+
+--
 -- Name: authorization_operation_receipts authorization_operation_recei_community_id_operation_id_re_key1; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -3156,6 +3339,30 @@ ALTER TABLE ONLY public.authorization_operation_receipts
 
 
 --
+-- Name: authorization_operation_version_delta_manifests authorization_operation_versi_community_id_operation_id_req_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.authorization_operation_version_delta_manifests
+    ADD CONSTRAINT authorization_operation_versi_community_id_operation_id_req_key UNIQUE (community_id, operation_id, request_fingerprint);
+
+
+--
+-- Name: authorization_operation_version_delta_manifests authorization_operation_version_delta_manifests_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.authorization_operation_version_delta_manifests
+    ADD CONSTRAINT authorization_operation_version_delta_manifests_pkey PRIMARY KEY (community_id, operation_id);
+
+
+--
+-- Name: authorization_operation_version_deltas authorization_operation_version_deltas_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.authorization_operation_version_deltas
+    ADD CONSTRAINT authorization_operation_version_deltas_pkey PRIMARY KEY (community_id, operation_id, component_kind, component_key);
+
+
+--
 -- Name: channel_members channel_members_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -3169,6 +3376,22 @@ ALTER TABLE ONLY public.channel_members
 
 ALTER TABLE ONLY public.channels
     ADD CONSTRAINT channels_pkey PRIMARY KEY (community_id, id);
+
+
+--
+-- Name: client_status_revisions client_status_revisions_community_id_operation_id_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.client_status_revisions
+    ADD CONSTRAINT client_status_revisions_community_id_operation_id_key UNIQUE (community_id, operation_id);
+
+
+--
+-- Name: client_status_revisions client_status_revisions_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.client_status_revisions
+    ADD CONSTRAINT client_status_revisions_pkey PRIMARY KEY (community_id, event_author_pubkey, revision);
 
 
 --
@@ -3713,6 +3936,13 @@ ALTER TABLE ONLY public.workflow_runs
 
 ALTER TABLE ONLY public.workflows
     ADD CONSTRAINT workflows_pkey PRIMARY KEY (community_id, id);
+
+
+--
+-- Name: client_status_revisions_current_lookup; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX client_status_revisions_current_lookup ON public.client_status_revisions USING btree (community_id, event_author_pubkey, revision DESC);
 
 
 --
@@ -5676,6 +5906,27 @@ CREATE TRIGGER authorization_invalidation_domains_no_truncate BEFORE TRUNCATE ON
 
 
 --
+-- Name: authorization_invalidation_floors authorization_invalidation_floors_monotonic; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER authorization_invalidation_floors_monotonic BEFORE UPDATE ON public.authorization_invalidation_floors FOR EACH ROW EXECUTE FUNCTION public.authorization_invalidation_floor_guard_v1();
+
+
+--
+-- Name: authorization_invalidation_floors authorization_invalidation_floors_no_delete; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER authorization_invalidation_floors_no_delete BEFORE DELETE ON public.authorization_invalidation_floors FOR EACH ROW EXECUTE FUNCTION public.nip_fi_reject_row_mutation_v1();
+
+
+--
+-- Name: authorization_invalidation_floors authorization_invalidation_floors_no_truncate; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER authorization_invalidation_floors_no_truncate BEFORE TRUNCATE ON public.authorization_invalidation_floors FOR EACH STATEMENT EXECUTE FUNCTION public.nip_fi_reject_truncate_v1();
+
+
+--
 -- Name: authorization_operation_receipts authorization_operation_receipt_event_cardinality; Type: TRIGGER; Schema: public; Owner: -
 --
 
@@ -5701,6 +5952,62 @@ CREATE TRIGGER authorization_operation_receipts_immutable BEFORE DELETE OR UPDAT
 --
 
 CREATE TRIGGER authorization_operation_receipts_no_truncate BEFORE TRUNCATE ON public.authorization_operation_receipts FOR EACH STATEMENT EXECUTE FUNCTION public.nip_fi_reject_truncate_v1();
+
+
+--
+-- Name: authorization_operation_version_deltas authorization_operation_version_delta_component_cardinality; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE CONSTRAINT TRIGGER authorization_operation_version_delta_component_cardinality AFTER INSERT ON public.authorization_operation_version_deltas DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION public.authorization_operation_version_delta_cardinality_guard_v1();
+
+
+--
+-- Name: authorization_operation_version_delta_manifests authorization_operation_version_delta_manifest_cardinality; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE CONSTRAINT TRIGGER authorization_operation_version_delta_manifest_cardinality AFTER INSERT ON public.authorization_operation_version_delta_manifests DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION public.authorization_operation_version_delta_cardinality_guard_v1();
+
+
+--
+-- Name: authorization_operation_version_delta_manifests authorization_operation_version_delta_manifests_immutable; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER authorization_operation_version_delta_manifests_immutable BEFORE DELETE OR UPDATE ON public.authorization_operation_version_delta_manifests FOR EACH ROW EXECUTE FUNCTION public.nip_fi_reject_row_mutation_v1();
+
+
+--
+-- Name: authorization_operation_version_delta_manifests authorization_operation_version_delta_manifests_no_truncate; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER authorization_operation_version_delta_manifests_no_truncate BEFORE TRUNCATE ON public.authorization_operation_version_delta_manifests FOR EACH STATEMENT EXECUTE FUNCTION public.nip_fi_reject_truncate_v1();
+
+
+--
+-- Name: authorization_operation_version_deltas authorization_operation_version_deltas_immutable; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER authorization_operation_version_deltas_immutable BEFORE DELETE OR UPDATE ON public.authorization_operation_version_deltas FOR EACH ROW EXECUTE FUNCTION public.nip_fi_reject_row_mutation_v1();
+
+
+--
+-- Name: authorization_operation_version_deltas authorization_operation_version_deltas_no_truncate; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER authorization_operation_version_deltas_no_truncate BEFORE TRUNCATE ON public.authorization_operation_version_deltas FOR EACH STATEMENT EXECUTE FUNCTION public.nip_fi_reject_truncate_v1();
+
+
+--
+-- Name: client_status_revisions client_status_revisions_immutable; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER client_status_revisions_immutable BEFORE DELETE OR UPDATE ON public.client_status_revisions FOR EACH ROW EXECUTE FUNCTION public.nip_fi_reject_row_mutation_v1();
+
+
+--
+-- Name: client_status_revisions client_status_revisions_no_truncate; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER client_status_revisions_no_truncate BEFORE TRUNCATE ON public.client_status_revisions FOR EACH STATEMENT EXECUTE FUNCTION public.nip_fi_reject_truncate_v1();
 
 
 --
@@ -6029,11 +6336,59 @@ ALTER TABLE ONLY public.authorization_invalidation_domains
 
 
 --
+-- Name: authorization_invalidation_floors authorization_invalidation_fl_community_id_operation_id_re_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.authorization_invalidation_floors
+    ADD CONSTRAINT authorization_invalidation_fl_community_id_operation_id_re_fkey FOREIGN KEY (community_id, operation_id, request_fingerprint) REFERENCES public.authorization_operation_receipts(community_id, operation_id, request_fingerprint) DEFERRABLE INITIALLY DEFERRED;
+
+
+--
+-- Name: authorization_invalidation_floors authorization_invalidation_floors_community_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.authorization_invalidation_floors
+    ADD CONSTRAINT authorization_invalidation_floors_community_id_fkey FOREIGN KEY (community_id) REFERENCES public.communities(id);
+
+
+--
 -- Name: authorization_operation_receipts authorization_operation_receipts_community_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
 ALTER TABLE ONLY public.authorization_operation_receipts
     ADD CONSTRAINT authorization_operation_receipts_community_id_fkey FOREIGN KEY (community_id) REFERENCES public.communities(id);
+
+
+--
+-- Name: authorization_operation_version_delta_manifests authorization_operation_versi_community_id_operation_id_re_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.authorization_operation_version_delta_manifests
+    ADD CONSTRAINT authorization_operation_versi_community_id_operation_id_re_fkey FOREIGN KEY (community_id, operation_id, request_fingerprint) REFERENCES public.authorization_operation_receipts(community_id, operation_id, request_fingerprint) DEFERRABLE INITIALLY DEFERRED;
+
+
+--
+-- Name: authorization_operation_version_deltas authorization_operation_version__community_id_operation_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.authorization_operation_version_deltas
+    ADD CONSTRAINT authorization_operation_version__community_id_operation_id_fkey FOREIGN KEY (community_id, operation_id) REFERENCES public.authorization_operation_version_delta_manifests(community_id, operation_id);
+
+
+--
+-- Name: authorization_operation_version_delta_manifests authorization_operation_version_delta_manifes_community_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.authorization_operation_version_delta_manifests
+    ADD CONSTRAINT authorization_operation_version_delta_manifes_community_id_fkey FOREIGN KEY (community_id) REFERENCES public.communities(id);
+
+
+--
+-- Name: authorization_operation_version_deltas authorization_operation_version_deltas_community_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.authorization_operation_version_deltas
+    ADD CONSTRAINT authorization_operation_version_deltas_community_id_fkey FOREIGN KEY (community_id) REFERENCES public.communities(id);
 
 
 --
@@ -6058,6 +6413,38 @@ ALTER TABLE ONLY public.channel_members
 
 ALTER TABLE ONLY public.channels
     ADD CONSTRAINT channels_community_id_fkey FOREIGN KEY (community_id) REFERENCES public.communities(id);
+
+
+--
+-- Name: client_status_revisions client_status_revisions_community_id_binding_id_binding_ve_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.client_status_revisions
+    ADD CONSTRAINT client_status_revisions_community_id_binding_id_binding_ve_fkey FOREIGN KEY (community_id, binding_id, binding_version) REFERENCES public.identity_bindings(community_id, binding_id, binding_version) DEFERRABLE INITIALLY DEFERRED;
+
+
+--
+-- Name: client_status_revisions client_status_revisions_community_id_event_author_pubkey_s_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.client_status_revisions
+    ADD CONSTRAINT client_status_revisions_community_id_event_author_pubkey_s_fkey FOREIGN KEY (community_id, event_author_pubkey, supersedes_revision) REFERENCES public.client_status_revisions(community_id, event_author_pubkey, revision) DEFERRABLE INITIALLY DEFERRED;
+
+
+--
+-- Name: client_status_revisions client_status_revisions_community_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.client_status_revisions
+    ADD CONSTRAINT client_status_revisions_community_id_fkey FOREIGN KEY (community_id) REFERENCES public.communities(id);
+
+
+--
+-- Name: client_status_revisions client_status_revisions_community_id_operation_id_request__fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.client_status_revisions
+    ADD CONSTRAINT client_status_revisions_community_id_operation_id_request__fkey FOREIGN KEY (community_id, operation_id, request_fingerprint) REFERENCES public.authorization_operation_receipts(community_id, operation_id, request_fingerprint) DEFERRABLE INITIALLY DEFERRED;
 
 
 --

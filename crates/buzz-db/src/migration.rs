@@ -565,7 +565,7 @@ mod tests {
         let mut migrations: Vec<_> = MIGRATOR.iter().collect();
         migrations.sort_by_key(|migration| migration.version);
 
-        assert_eq!(migrations.len(), 32);
+        assert_eq!(migrations.len(), 33);
         assert_eq!(migrations[0].version, 1);
         assert_eq!(&*migrations[0].description, "initial schema");
         assert!(migrations[0]
@@ -1011,6 +1011,23 @@ mod tests {
             .sql
             .as_str()
             .contains("CREATE TABLE protected_object_authority"));
+        assert_eq!(migrations[32].version, 33);
+        assert_eq!(
+            &*migrations[32].description,
+            "nip fi invalidation restore status"
+        );
+        assert!(migrations[32]
+            .sql
+            .as_str()
+            .contains("CREATE TABLE authorization_invalidation_floors"));
+        assert!(migrations[32]
+            .sql
+            .as_str()
+            .contains("CREATE TABLE authorization_operation_version_delta_manifests"));
+        assert!(migrations[32]
+            .sql
+            .as_str()
+            .contains("CREATE TABLE client_status_revisions"));
     }
 
     #[test]
@@ -1028,7 +1045,7 @@ mod tests {
         }
         assert_eq!(
             migrations.last().map(|migration| migration.version),
-            Some(32)
+            Some(33)
         );
     }
 

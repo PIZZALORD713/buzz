@@ -4,6 +4,9 @@
 
 mod admission;
 
+/// Provider-free authorization finalization and publication observation.
+pub mod authorization_runtime;
+
 /// REST API route handlers.
 pub mod api;
 /// WebSocket audio relay for huddle voice channels.

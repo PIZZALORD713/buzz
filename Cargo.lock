@@ -1010,9 +1010,13 @@ dependencies = [
 name = "buzz-db"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
+ "axum",
  "buzz-auth",
  "buzz-core",
+ "buzz-media",
  "chrono",
+ "dashmap",
  "hex",
  "http",
  "jsonwebtoken",
@@ -1020,6 +1024,7 @@ dependencies = [
  "metrics-util",
  "nostr",
  "rand 0.10.1",
+ "rust-s3",
  "serde",
  "serde_json",
  "sha2 0.11.0",
@@ -1065,6 +1070,7 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "blurhash",
+ "buzz-auth",
  "buzz-core",
  "bytes",
  "chrono",

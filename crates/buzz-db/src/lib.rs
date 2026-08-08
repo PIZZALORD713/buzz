@@ -17,8 +17,16 @@ pub mod api_token;
 pub mod archived_identities;
 /// Canonical authorization receipt and immutable event persistence.
 pub mod authorization_events;
+/// Durable authorization invalidation generations and selector floors.
+pub mod authorization_invalidation;
 /// Canonical identity enrollment-policy selection.
 pub mod authorization_policy;
+/// PostgreSQL-backed provider-free local binding resolution.
+pub mod authorization_resolver;
+/// Operation-bound external restore witnessing for canonical authorization writes.
+pub mod authorization_restore;
+/// Exact per-operation authorization version attribution.
+pub mod authorization_version;
 /// Channel and membership persistence.
 pub mod channel;
 /// Direct message channel persistence.

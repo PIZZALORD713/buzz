@@ -1,4 +1,12 @@
-//! Blossom kind:24242 auth verification (BUD-11 compliant).
+//! Blossom kind:24242 compatibility wrappers over the canonical verifier.
+
+use axum::http::{
+    uri::{Authority, Scheme},
+    Method,
+};
+use buzz_auth::{
+    verify_blossom_authorization, CanonicalBlossomRequest, EvidenceError, SystemEvidenceClock,
+};
 
 use crate::error::MediaError;
 
@@ -7,15 +15,6 @@ use crate::error::MediaError;
 pub enum BlossomVerb {
     Upload,
     Get,
-}
-
-impl BlossomVerb {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Upload => "upload",
-            Self::Get => "get",
-        }
-    }
 }
 
 /// Verify common kind:24242 Blossom auth event validity:
@@ -34,110 +33,16 @@ pub fn verify_blossom_auth_event_for_verb(
     server_domain: Option<&str>,
     max_age_secs: u64,
 ) -> Result<(), MediaError> {
-    // 1. Verify Schnorr signature
-    auth_event
-        .verify()
-        .map_err(|_| MediaError::InvalidSignature)?;
-
-    // 2. Kind must be 24242
-    if auth_event.kind.as_u16() != 24242 {
-        return Err(MediaError::InvalidAuthKind);
-    }
-
-    // 2b. Content must be non-empty (BUD-11: "human readable string")
-    if auth_event.content.trim().is_empty() {
-        return Err(MediaError::InvalidAuthEvent);
-    }
-
-    let mut found_t = false;
-    let mut found_exp = false;
-    let mut server_tags: Vec<&str> = Vec::new();
-    let mut exp_value: u64 = 0;
-
-    for tag in auth_event.tags.iter() {
-        let kind = tag.kind().to_string();
-        match kind.as_str() {
-            "t" => {
-                if let Some(v) = tag.content() {
-                    if v != verb.as_str() {
-                        return Err(MediaError::InvalidAuthVerb);
-                    }
-                    found_t = true;
-                }
-            }
-            "expiration" => {
-                if let Some(v) = tag.content() {
-                    exp_value = v.parse().unwrap_or(0);
-                    found_exp = true;
-                }
-            }
-            "server" => {
-                if let Some(v) = tag.content() {
-                    server_tags.push(v);
-                }
-            }
-            _ => {}
-        }
-    }
-
-    // 3. t tag required
-    if !found_t {
-        return Err(MediaError::MissingTag("t"));
-    }
-
-    // 4. Expiration must exist and be in the future
-    if !found_exp {
-        return Err(MediaError::MissingTag("expiration"));
-    }
-    let now = nostr::Timestamp::now().as_secs();
-    if exp_value <= now {
-        return Err(MediaError::TokenExpired);
-    }
-
-    // 5. created_at must be recent: not in the future (5s tolerance) and not
-    //    older than 10 minutes. This bounds the replay window — even if the
-    //    expiration tag allows a longer lifetime, the token must have been
-    //    freshly minted.
-    let created = auth_event.created_at.as_secs();
-    if created > now + 5 {
-        return Err(MediaError::TimestampOutOfWindow);
-    }
-    if now > created + max_age_secs {
-        return Err(MediaError::TimestampOutOfWindow);
-    }
-
-    // 6. Server tag enforcement (BUD-11 §5): if server tags present, our host must appear.
-    //
-    // `server_domain` is the host this request was bound to — the per-request
-    // tenant host (`TenantContext::host()`), NOT a single process-global domain.
-    // A relay process serves many tenant hosts; validating against one global
-    // host would 401 every non-primary tenant's server-tagged client (the stock
-    // CLI always tags its configured relay host). Comparison is done under the
-    // shared [`normalize_host`] rule so a tag and the bound host agree by
-    // construction across case, trailing dot, default ports, and an optional
-    // URL scheme/path — exactly as every other host seam resolves tenants.
-    //
-    // Fail closed: if the bound host is unknown, reject tokens that carry server
-    // tags rather than silently accepting them.
-    if !server_tags.is_empty() {
-        match server_domain {
-            Some(domain) => {
-                let want = normalize_server_host(domain);
-                let matches = server_tags
-                    .iter()
-                    .any(|tag| normalize_server_host(tag) == want);
-                if !matches {
-                    return Err(MediaError::ServerMismatch);
-                }
-            }
-            None => {
-                // Server tags present but we don't know our own host — reject.
-                return Err(MediaError::ServerMismatch);
-            }
-        }
-    }
-
-    Ok(())
+    let object = match (verb, exact_optional_object_scope(auth_event)?) {
+        (_, Some(object)) => object,
+        (BlossomVerb::Get, None) => "0".repeat(64),
+        (BlossomVerb::Upload, None) => return Err(MediaError::MissingTag("x")),
+    };
+    let method = match verb {
+        BlossomVerb::Upload => Method::PUT,
+        BlossomVerb::Get => Method::GET,
+    };
+    verify_canonical(auth_event, method, server_domain, &object, max_age_secs)
 }
 
 /// Verify common upload auth event validity.
@@ -160,12 +65,72 @@ pub fn verify_blossom_auth_event(
 /// scheme and path down to the authority, then apply the one shared
 /// [`buzz_core::tenant::normalize_host`] rule so the comparison agrees with how
 /// the WS/HTTP/git doors resolve tenants.
-fn normalize_server_host(value: &str) -> String {
-    let authority = match value.split_once("://") {
-        Some((_scheme, rest)) => rest.split('/').next().unwrap_or(rest),
-        None => value.split('/').next().unwrap_or(value),
+fn canonical_authority(server_domain: Option<&str>) -> Result<Authority, MediaError> {
+    let normalized = server_domain
+        .map(buzz_core::tenant::normalize_host)
+        .unwrap_or_else(|| "localhost".to_owned());
+    normalized.parse().map_err(|_| MediaError::ServerMismatch)
+}
+
+fn exact_object_scope(auth_event: &nostr::Event) -> Result<String, MediaError> {
+    exact_optional_object_scope(auth_event)?.ok_or(MediaError::MissingTag("x"))
+}
+
+fn exact_optional_object_scope(auth_event: &nostr::Event) -> Result<Option<String>, MediaError> {
+    let mut scopes = auth_event
+        .tags
+        .iter()
+        .filter(|tag| tag.kind().to_string() == "x");
+    let first = scopes.next().map(|tag| {
+        tag.content()
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned)
+            .ok_or(MediaError::InvalidAuthEvent)
+    });
+    if scopes.next().is_some() {
+        return Err(MediaError::InvalidAuthEvent);
+    }
+    first.transpose()
+}
+
+fn verify_canonical(
+    auth_event: &nostr::Event,
+    method: Method,
+    server_domain: Option<&str>,
+    sha256: &str,
+    maximum_age_seconds: u64,
+) -> Result<(), MediaError> {
+    let now = nostr::Timestamp::now().as_secs();
+    let created = auth_event.created_at.as_secs();
+    if maximum_age_seconds == 0
+        || created > now.saturating_add(5)
+        || now > created.saturating_add(maximum_age_seconds)
+    {
+        return Err(MediaError::TimestampOutOfWindow);
+    }
+    let path = if method == Method::PUT {
+        "/upload".to_owned()
+    } else {
+        format!("/media/{sha256}")
     };
-    buzz_core::tenant::normalize_host(authority)
+    let request = CanonicalBlossomRequest::from_server_parts(
+        &Scheme::HTTPS,
+        &canonical_authority(server_domain)?,
+        &method,
+        &path.parse().map_err(|_| MediaError::InvalidAuthEvent)?,
+        sha256,
+    )
+    .map_err(map_evidence_error)?;
+    verify_blossom_authorization(auth_event, &request, &SystemEvidenceClock)
+        .map(|_| ())
+        .map_err(map_evidence_error)
+}
+
+fn map_evidence_error(error: EvidenceError) -> MediaError {
+    match error {
+        EvidenceError::Expired => MediaError::TokenExpired,
+        _ => MediaError::InvalidAuthEvent,
+    }
 }
 
 /// Verify a kind:24242 Blossom upload auth event, including the x tag hash check.
@@ -178,24 +143,10 @@ pub fn verify_blossom_upload_auth(
     server_domain: Option<&str>,
     max_age_secs: u64,
 ) -> Result<(), MediaError> {
-    verify_blossom_auth_event_for_verb(
-        auth_event,
-        BlossomVerb::Upload,
-        server_domain,
-        max_age_secs,
-    )?;
-
-    // At least one x tag must match the body sha256 (BUD-11 §6)
-    let has_matching_x = auth_event
-        .tags
-        .iter()
-        .any(|tag| tag.kind().to_string() == "x" && (tag.content() == Some(sha256)));
-
-    if !has_matching_x {
+    if exact_object_scope(auth_event)? != sha256 {
         return Err(MediaError::HashMismatch);
     }
-
-    Ok(())
+    verify_canonical(auth_event, Method::PUT, server_domain, sha256, max_age_secs)
 }
 
 /// Verify a kind:24242 Blossom get auth event for one requested blob.
@@ -210,32 +161,7 @@ pub fn verify_blossom_get_auth(
     server_domain: Option<&str>,
     max_age_secs: u64,
 ) -> Result<(), MediaError> {
-    verify_blossom_auth_event_for_verb(auth_event, BlossomVerb::Get, server_domain, max_age_secs)?;
-
-    let has_matching_x = auth_event
-        .tags
-        .iter()
-        .any(|tag| tag.kind().to_string() == "x" && (tag.content() == Some(sha256)));
-
-    let has_matching_server = match server_domain {
-        Some(domain) => {
-            let want = normalize_server_host(domain);
-            auth_event.tags.iter().any(|tag| {
-                tag.kind().to_string() == "server"
-                    && tag
-                        .content()
-                        .map(|value| normalize_server_host(value) == want)
-                        .unwrap_or(false)
-            })
-        }
-        None => false,
-    };
-
-    if !has_matching_x && !has_matching_server {
-        return Err(MediaError::InsufficientScope);
-    }
-
-    Ok(())
+    verify_canonical(auth_event, Method::GET, server_domain, sha256, max_age_secs)
 }
 
 #[cfg(test)]
@@ -314,6 +240,40 @@ mod tests {
         );
 
         assert!(verify_blossom_get_auth(&event, &sha256, Some("relay.example"), 600).is_ok());
+        assert!(verify_blossom_auth_event_for_verb(
+            &event,
+            BlossomVerb::Get,
+            Some("relay.example"),
+            600,
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn compatibility_maximum_age_can_only_shorten_the_canonical_bound() {
+        let keys = Keys::generate();
+        let sha256 = "a".repeat(64);
+        let now = Timestamp::now().as_secs();
+        let expiration = (now + 300).to_string();
+        let event = EventBuilder::new(Kind::from(24242), "Upload buzz-media")
+            .tags([
+                Tag::parse(["t", "upload"]).unwrap(),
+                Tag::parse(["x", sha256.as_str()]).unwrap(),
+                Tag::parse(["expiration", expiration.as_str()]).unwrap(),
+            ])
+            .custom_created_at(Timestamp::from(now.saturating_sub(2)))
+            .sign_with_keys(&keys)
+            .unwrap();
+
+        assert!(verify_blossom_upload_auth(&event, &sha256, None, 10).is_ok());
+        assert!(matches!(
+            verify_blossom_upload_auth(&event, &sha256, None, 1),
+            Err(MediaError::TimestampOutOfWindow)
+        ));
+        assert!(matches!(
+            verify_blossom_upload_auth(&event, &sha256, None, 0),
+            Err(MediaError::TimestampOutOfWindow)
+        ));
     }
 
     #[test]
@@ -324,7 +284,7 @@ mod tests {
 
         assert!(matches!(
             verify_blossom_get_auth(&event, &sha256, Some("relay.example"), 600),
-            Err(MediaError::InvalidAuthVerb)
+            Err(MediaError::InvalidAuthEvent)
         ));
     }
 
@@ -346,7 +306,7 @@ mod tests {
 
         assert!(matches!(
             verify_blossom_get_auth(&event, &sha256, Some("relay.example"), 600),
-            Err(MediaError::InsufficientScope)
+            Err(MediaError::InvalidAuthEvent)
         ));
     }
 
@@ -367,7 +327,7 @@ mod tests {
 
         assert!(matches!(
             verify_blossom_get_auth(&event, &sha256, Some("relay.example"), 600),
-            Err(MediaError::ServerMismatch)
+            Err(MediaError::InvalidAuthEvent)
         ));
     }
 
@@ -400,7 +360,7 @@ mod tests {
             .unwrap();
         assert!(matches!(
             verify_blossom_upload_auth(&event, &sha256, None, 600),
-            Err(MediaError::InvalidAuthKind)
+            Err(MediaError::InvalidAuthEvent)
         ));
     }
 
@@ -421,8 +381,11 @@ mod tests {
             .tags(tags)
             .sign_with_keys(&keys)
             .unwrap();
-        // Should pass because at least one x tag matches
-        assert!(verify_blossom_upload_auth(&event, &sha256, None, 600).is_ok());
+        // Ambiguous object scopes fail closed, including when one value matches.
+        assert!(matches!(
+            verify_blossom_upload_auth(&event, &sha256, None, 600),
+            Err(MediaError::InvalidAuthEvent)
+        ));
     }
 
     #[test]
@@ -444,7 +407,7 @@ mod tests {
         // Should fail — server tag present but doesn't match our domain
         assert!(matches!(
             verify_blossom_upload_auth(&event, &sha256, Some("buzz.example.com"), 600),
-            Err(MediaError::ServerMismatch)
+            Err(MediaError::InvalidAuthEvent)
         ));
         // Should pass when our domain matches
         assert!(
@@ -453,7 +416,7 @@ mod tests {
         // Should fail when server_domain is None — fail closed
         assert!(matches!(
             verify_blossom_upload_auth(&event, &sha256, None, 600),
-            Err(MediaError::ServerMismatch)
+            Err(MediaError::InvalidAuthEvent)
         ));
     }
 
@@ -524,7 +487,7 @@ mod tests {
                 Some("127.0.0.1:3200"),
                 600
             ),
-            Err(MediaError::ServerMismatch)
+            Err(MediaError::InvalidAuthEvent)
         ));
     }
 

@@ -1,12 +1,12 @@
 //! Upload pipeline — validate and stage immutable blobs and manifests.
 
+use buzz_auth::VerifiedBlossomAuthorization;
 use buzz_core::tenant::TenantContext;
 use bytes::Bytes;
 use sha2::{Digest, Sha256};
 use std::fmt;
 use tokio::io::AsyncWriteExt;
 
-use crate::auth::verify_blossom_upload_auth;
 use crate::config::MediaConfig;
 use crate::error::MediaError;
 use crate::publication::{MediaPublicationManifest, StagedMediaPublication};
@@ -44,7 +44,7 @@ struct BufferedUploadInput<'a> {
     storage: &'a MediaStorage,
     config: &'a MediaConfig,
     ctx: &'a TenantContext,
-    auth_event: &'a nostr::Event,
+    authorization: &'a VerifiedBlossomAuthorization,
     body: Bytes,
     attribution: Option<UploadAttribution>,
 }
@@ -135,24 +135,23 @@ where
         storage,
         config,
         ctx,
-        auth_event,
+        authorization,
         body,
         attribution,
     } = input;
 
-    // CPU-bound: validate content, compute hash, verify auth.
-    let auth = auth_event.clone();
+    // CPU-bound: validate content and join the body hash to the already
+    // origin-verified Blossom target. Signature/tag verification happened in
+    // the pre-body extractor and is never repeated after body I/O begins.
+    let expected_sha256 = authorization.object_sha256().to_owned();
     let bytes = body.clone();
     let cfg = config.clone();
-    // Validate the Blossom `server` tag against the host this request was bound
-    // to (the per-request tenant), not a process-global domain — a relay serves
-    // many tenant hosts.
-    let bound_host = ctx.host().to_string();
     let (mime, sha256, ext) = tokio::task::spawn_blocking(move || -> Result<_, MediaError> {
         let (mime, ext) = validate(&bytes, &cfg)?;
         let sha256 = hex::encode(Sha256::digest(&bytes));
-        // Buffered uploads (image + file): 10-minute auth window is plenty.
-        verify_blossom_upload_auth(&auth, &sha256, Some(bound_host.as_str()), 600)?;
+        if sha256 != expected_sha256 {
+            return Err(MediaError::HashMismatch);
+        }
         Ok((mime, sha256, ext))
     })
     .await
@@ -191,7 +190,7 @@ where
     let publication = storage.stage_media_publication(manifest).await?;
     let descriptor = publication.manifest().descriptor(&config.public_base_url)?;
     let upload_record = attribution.map(|attribution| StagedUploadRecord {
-        uploader: auth_event.pubkey,
+        uploader: authorization.actor_pubkey(),
         attribution,
         sha256,
         ext,
@@ -226,7 +225,7 @@ pub async fn stage_upload(
     storage: &MediaStorage,
     config: &MediaConfig,
     ctx: &TenantContext,
-    auth_event: &nostr::Event,
+    authorization: &VerifiedBlossomAuthorization,
     body: Bytes,
     attribution: Option<UploadAttribution>,
 ) -> Result<StagedMediaUpload, MediaError> {
@@ -235,7 +234,7 @@ pub async fn stage_upload(
             storage,
             config,
             ctx,
-            auth_event,
+            authorization,
             body,
             attribution,
         },
@@ -258,11 +257,11 @@ pub async fn process_upload(
     storage: &MediaStorage,
     config: &MediaConfig,
     ctx: &TenantContext,
-    auth_event: &nostr::Event,
+    authorization: &VerifiedBlossomAuthorization,
     body: Bytes,
     attribution: Option<UploadAttribution>,
 ) -> Result<BlobDescriptor, MediaError> {
-    let staged = stage_upload(storage, config, ctx, auth_event, body, attribution).await?;
+    let staged = stage_upload(storage, config, ctx, authorization, body, attribution).await?;
     staged
         .publish_post_commit_projections(storage, ctx, &config.public_base_url)
         .await?;
@@ -284,7 +283,7 @@ pub async fn stage_file_upload(
     storage: &MediaStorage,
     config: &MediaConfig,
     ctx: &TenantContext,
-    auth_event: &nostr::Event,
+    authorization: &VerifiedBlossomAuthorization,
     body: Bytes,
     attribution: Option<UploadAttribution>,
 ) -> Result<StagedMediaUpload, MediaError> {
@@ -293,7 +292,7 @@ pub async fn stage_file_upload(
             storage,
             config,
             ctx,
-            auth_event,
+            authorization,
             body,
             attribution,
         },
@@ -322,11 +321,11 @@ pub async fn process_file_upload(
     storage: &MediaStorage,
     config: &MediaConfig,
     ctx: &TenantContext,
-    auth_event: &nostr::Event,
+    authorization: &VerifiedBlossomAuthorization,
     body: Bytes,
     attribution: Option<UploadAttribution>,
 ) -> Result<BlobDescriptor, MediaError> {
-    let staged = stage_file_upload(storage, config, ctx, auth_event, body, attribution).await?;
+    let staged = stage_file_upload(storage, config, ctx, authorization, body, attribution).await?;
     staged
         .publish_post_commit_projections(storage, ctx, &config.public_base_url)
         .await?;
@@ -348,7 +347,7 @@ pub async fn stage_video_upload(
     storage: &MediaStorage,
     config: &MediaConfig,
     ctx: &TenantContext,
-    auth_event: &nostr::Event,
+    authorization: &VerifiedBlossomAuthorization,
     body_stream: impl futures_core::Stream<Item = Result<Bytes, axum::Error>> + Send + 'static,
     content_length: Option<u64>,
     attribution: Option<UploadAttribution>,
@@ -456,18 +455,10 @@ pub async fn stage_video_upload(
     }
     let mime = "video/mp4".to_string();
 
-    // --- 3. Verify Blossom auth: x tag must match computed SHA-256 ---
-    let auth = auth_event.clone();
-    let sha256_for_auth = sha256_hex.clone();
-    // Validate the Blossom `server` tag against the bound tenant host (not a
-    // process-global domain) — a relay serves many tenant hosts.
-    let bound_host = ctx.host().to_string();
-    tokio::task::spawn_blocking(move || {
-        // Videos: 1-hour window — large uploads on slow connections need headroom.
-        verify_blossom_upload_auth(&auth, &sha256_for_auth, Some(bound_host.as_str()), 3600)
-    })
-    .await
-    .map_err(|_| MediaError::Internal)??;
+    // --- 3. Join the streamed body to the pre-body verified target ---
+    if sha256_hex != authorization.object_sha256() {
+        return Err(MediaError::HashMismatch);
+    }
 
     // --- 4. Full MP4 validation on the temp file ---
     let tmp_path_clone = tmp_path.clone();
@@ -502,7 +493,7 @@ pub async fn stage_video_upload(
     let publication = storage.stage_media_publication(manifest).await?;
     let descriptor = publication.manifest().descriptor(&config.public_base_url)?;
     let upload_record = attribution.map(|attribution| StagedUploadRecord {
-        uploader: auth_event.pubkey,
+        uploader: authorization.actor_pubkey(),
         attribution,
         sha256: sha256_hex,
         ext: ext.to_owned(),
@@ -522,7 +513,7 @@ pub async fn process_video_upload(
     storage: &MediaStorage,
     config: &MediaConfig,
     ctx: &TenantContext,
-    auth_event: &nostr::Event,
+    authorization: &VerifiedBlossomAuthorization,
     body_stream: impl futures_core::Stream<Item = Result<Bytes, axum::Error>> + Send + 'static,
     content_length: Option<u64>,
     attribution: Option<UploadAttribution>,
@@ -531,7 +522,7 @@ pub async fn process_video_upload(
         storage,
         config,
         ctx,
-        auth_event,
+        authorization,
         body_stream,
         content_length,
         attribution,
