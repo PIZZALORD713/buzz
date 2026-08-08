@@ -144,7 +144,16 @@ mod lifecycle_tests {
     }
 
     #[derive(Default)]
-    struct SeenOnceReplayGuard(Mutex<HashSet<(String, [u8; 32])>>);
+    struct SeenOnceReplayGuard {
+        seen: Mutex<HashSet<(String, [u8; 32])>>,
+        claims: AtomicUsize,
+    }
+
+    impl SeenOnceReplayGuard {
+        fn claims(&self) -> usize {
+            self.claims.load(Ordering::SeqCst)
+        }
+    }
 
     impl Nip98ReplayGuard for SeenOnceReplayGuard {
         fn try_mark_in_scope<'a>(
@@ -156,7 +165,8 @@ mod lifecycle_tests {
             Box<dyn std::future::Future<Output = Result<bool, buzz_auth::AuthError>> + Send + 'a>,
         > {
             Box::pin(async move {
-                let mut seen = self.0.lock().expect("replay set");
+                self.claims.fetch_add(1, Ordering::SeqCst);
+                let mut seen = self.seen.lock().expect("replay set");
                 Ok(seen.insert((scope.to_owned(), event_id.to_bytes())))
             })
         }
@@ -170,6 +180,7 @@ mod lifecycle_tests {
             Box<dyn std::future::Future<Output = Result<bool, buzz_auth::AuthError>> + Send + 'a>,
         > {
             Box::pin(async move {
+                self.claims.fetch_add(1, Ordering::SeqCst);
                 if !(1..=3).contains(&event_ids.len())
                     || event_ids
                         .iter()
@@ -184,7 +195,7 @@ mod lifecycle_tests {
                     .iter()
                     .map(|event_id| (scope.to_owned(), event_id.to_bytes()))
                     .collect::<Vec<_>>();
-                let mut seen = self.0.lock().expect("replay set");
+                let mut seen = self.seen.lock().expect("replay set");
                 if keys.iter().any(|key| seen.contains(key)) {
                     return Ok(false);
                 }
@@ -363,8 +374,13 @@ mod lifecycle_tests {
         (runtime, signer, approver, executor)
     }
 
-    fn replay_protected_runtime() -> (Arc<OperatorLifecycleRuntime>, Keys, Keys, Arc<TestExecutor>)
-    {
+    fn replay_protected_runtime() -> (
+        Arc<OperatorLifecycleRuntime>,
+        Keys,
+        Keys,
+        Arc<TestExecutor>,
+        Arc<SeenOnceReplayGuard>,
+    ) {
         let signer = Keys::generate();
         let approver = Keys::generate();
         let verifier = OperatorLifecycleVerifier::requiring_independent_approval(vec![
@@ -372,9 +388,9 @@ mod lifecycle_tests {
             approver.public_key(),
         ])
         .expect("verifier");
-        let (runtime, executor) =
-            runtime_with_verifier_and_replay(verifier, Arc::new(SeenOnceReplayGuard::default()));
-        (runtime, signer, approver, executor)
+        let replay_guard = Arc::new(SeenOnceReplayGuard::default());
+        let (runtime, executor) = runtime_with_verifier_and_replay(verifier, replay_guard.clone());
+        (runtime, signer, approver, executor, replay_guard)
     }
 
     fn operation(operation_id: Uuid) -> Value {
@@ -1361,7 +1377,7 @@ mod lifecycle_tests {
 
     #[tokio::test]
     async fn lifecycle_replay_flood_releases_actor_reservations() {
-        let (runtime, signer, approver, executor) = replay_protected_runtime();
+        let (runtime, signer, approver, executor, replay_guard) = replay_protected_runtime();
         let app = app(runtime);
         let domain = CommunityId::from_uuid(Uuid::new_v4());
         let replay_body = body("retire", Uuid::new_v4());
@@ -1406,18 +1422,40 @@ mod lifecycle_tests {
                 StatusCode::UNAUTHORIZED
             );
         }
+        assert_eq!(replay_guard.claims(), 61);
+        assert_eq!(executor.denials.load(Ordering::SeqCst), 60);
+        assert_eq!(executor.calls.load(Ordering::SeqCst), 1);
         assert_eq!(
-            app.oneshot(signed_request(
+            app.clone()
+                .oneshot(replay_request())
+                .await
+                .expect("rate-limited replay response")
+                .status(),
+            StatusCode::TOO_MANY_REQUESTS
+        );
+        assert_eq!(
+            replay_guard.claims(),
+            61,
+            "request 61 must not claim replay"
+        );
+        assert_eq!(executor.denials.load(Ordering::SeqCst), 60);
+        assert_eq!(executor.calls.load(Ordering::SeqCst), 1);
+        let fresh_request = with_peer(
+            signed_request(
                 "retire",
                 *domain.as_uuid(),
                 body("retire", Uuid::new_v4()),
                 &signer,
                 Some(&approver),
                 None,
-            ))
-            .await
-            .expect("fresh response")
-            .status(),
+            ),
+            [192, 0, 2, 90],
+        );
+        assert_eq!(
+            app.oneshot(fresh_request)
+                .await
+                .expect("fresh response")
+                .status(),
             StatusCode::OK,
             "rejected replays must not consume actor capacity"
         );
@@ -1427,7 +1465,7 @@ mod lifecycle_tests {
 
     #[tokio::test]
     async fn provision_replay_flood_releases_actor_reservations() {
-        let (runtime, signer, approver, executor) = replay_protected_runtime();
+        let (runtime, signer, approver, executor, replay_guard) = replay_protected_runtime();
         let app = app(runtime);
         let domain = CommunityId::from_uuid(Uuid::new_v4());
         let operation_id = Uuid::new_v4();
@@ -1486,17 +1524,39 @@ mod lifecycle_tests {
                 StatusCode::UNAUTHORIZED
             );
         }
+        assert_eq!(replay_guard.claims(), 61);
+        assert_eq!(executor.denials.load(Ordering::SeqCst), 60);
+        assert_eq!(executor.provisions.load(Ordering::SeqCst), 1);
         assert_eq!(
-            app.oneshot(signed_provision_request(
+            app.clone()
+                .oneshot(replay_request())
+                .await
+                .expect("rate-limited provision replay response")
+                .status(),
+            StatusCode::TOO_MANY_REQUESTS
+        );
+        assert_eq!(
+            replay_guard.claims(),
+            61,
+            "request 61 must not claim replay"
+        );
+        assert_eq!(executor.denials.load(Ordering::SeqCst), 60);
+        assert_eq!(executor.provisions.load(Ordering::SeqCst), 1);
+        let fresh_request = with_peer(
+            signed_provision_request(
                 domain,
                 Uuid::new_v4(),
                 &Keys::generate(),
                 &signer,
                 Some(&approver),
-            ))
-            .await
-            .expect("fresh provision response")
-            .status(),
+            ),
+            [192, 0, 2, 90],
+        );
+        assert_eq!(
+            app.oneshot(fresh_request)
+                .await
+                .expect("fresh provision response")
+                .status(),
             StatusCode::OK,
             "rejected provision replays must not consume actor capacity"
         );

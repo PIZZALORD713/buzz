@@ -206,6 +206,7 @@ pub struct OperatorLifecycleRuntime {
     audit_healthy: AtomicBool,
     actor_rate_limit: OperatorRateLimit<OperatorActorRateKey>,
     peer_rate_limit: OperatorRateLimit<OperatorPeerRateKey>,
+    replay_failure_rate_limit: OperatorRateLimit<OperatorReplayFailureRateKey>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -222,6 +223,13 @@ struct OperatorActorRateKey {
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 struct OperatorPeerRateKey {
     domain: buzz_core::CommunityId,
+    peer: IpAddr,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+struct OperatorReplayFailureRateKey {
+    domain: buzz_core::CommunityId,
+    actor: [u8; 32],
     peer: IpAddr,
 }
 
@@ -465,6 +473,7 @@ impl OperatorLifecycleRuntime {
             audit_healthy: AtomicBool::new(true),
             actor_rate_limit: OperatorRateLimit::new(),
             peer_rate_limit: OperatorRateLimit::new(),
+            replay_failure_rate_limit: OperatorRateLimit::new(),
         })
     }
 
@@ -520,8 +529,17 @@ impl OperatorLifecycleRuntime {
                 actor: candidate.signer_attribution(),
             })
             .ok_or(OperatorInvocationError::RateLimited)?;
+        let replay_failure_reservation = self
+            .replay_failure_rate_limit
+            .reserve(OperatorReplayFailureRateKey {
+                domain: candidate.authorization_domain(),
+                actor: candidate.signer_attribution(),
+                peer: canonical_peer_ip(peer),
+            })
+            .ok_or(OperatorInvocationError::RateLimited)?;
         let grant = match candidate.claim_replay(self.replay_guard.as_ref()).await {
             Ok(grant) => {
+                drop(replay_failure_reservation);
                 if !reservation.commit() {
                     self.audit_healthy.store(false, Ordering::SeqCst);
                     return Err(OperatorInvocationError::Failed);
@@ -530,6 +548,10 @@ impl OperatorLifecycleRuntime {
             }
             Err(error) => {
                 drop(reservation);
+                if !replay_failure_reservation.commit() {
+                    self.audit_healthy.store(false, Ordering::SeqCst);
+                    return Err(OperatorInvocationError::Failed);
+                }
                 if let Some(reason) = verifier_denial_reason(&error) {
                     let _ = self.persist_preauth_denial(intent, reason).await;
                 }
@@ -679,8 +701,17 @@ impl OperatorLifecycleRuntime {
                 actor: candidate.signer_attribution(),
             })
             .ok_or(OperatorInvocationError::RateLimited)?;
+        let replay_failure_reservation = self
+            .replay_failure_rate_limit
+            .reserve(OperatorReplayFailureRateKey {
+                domain: candidate.authorization_domain(),
+                actor: candidate.signer_attribution(),
+                peer: canonical_peer_ip(peer),
+            })
+            .ok_or(OperatorInvocationError::RateLimited)?;
         let intent = match candidate.claim_replay(self.replay_guard.as_ref()).await {
             Ok(intent) => {
+                drop(replay_failure_reservation);
                 if !reservation.commit() {
                     self.audit_healthy.store(false, Ordering::SeqCst);
                     return Err(OperatorInvocationError::Failed);
@@ -689,6 +720,10 @@ impl OperatorLifecycleRuntime {
             }
             Err(error) => {
                 drop(reservation);
+                if !replay_failure_reservation.commit() {
+                    self.audit_healthy.store(false, Ordering::SeqCst);
+                    return Err(OperatorInvocationError::Failed);
+                }
                 if let Some(reason) = verifier_denial_reason(&error) {
                     let _ = self
                         .persist_provision_preauth_denial(authorization_domain, body, reason)
