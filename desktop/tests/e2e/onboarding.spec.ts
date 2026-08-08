@@ -2187,11 +2187,33 @@ test("connected first-community profile keeps Back bottom-left and balances the 
   await expect(computerCameraButton).toHaveAttribute("aria-pressed", "true");
   const captureButton = page.getByTestId("community-avatar-animated-record");
   await expect(captureButton).toHaveText("Capture 3 sec video");
+  const captureButtonStyles = await captureButton.evaluate((element) => {
+    const styles = window.getComputedStyle(element);
+    return {
+      backgroundColor: styles.backgroundColor,
+      borderRadius: Number.parseFloat(styles.borderRadius),
+      color: styles.color,
+      height: styles.height,
+    };
+  });
+  expect(captureButtonStyles).toMatchObject({
+    backgroundColor: "rgb(23, 23, 23)",
+    color: "rgb(240, 240, 205)",
+    height: "38px",
+  });
+  expect(captureButtonStyles.borderRadius).toBeGreaterThan(1_000);
   await captureButton.click();
   await expect(
     page.getByTestId("community-avatar-animated-sections"),
   ).toBeVisible({ timeout: 60_000 });
   await expect(saveButton).toBeVisible();
+  await saveButton.click();
+  await expect(avatarDialog).toHaveCount(0, { timeout: 30_000 });
+  await expect(
+    page.getByTestId("community-avatar-circle-image"),
+  ).toHaveAttribute("src", /^blob:/);
+  await avatarButton.click();
+  await expect(avatarDialog).toBeVisible();
   await page.getByRole("tab", { name: "Emoji" }).click();
   await selectFirstEmojiFromPicker(page);
   const liveEmoji = page.getByTestId("community-avatar-live-preview-emoji");
