@@ -286,6 +286,20 @@ pub(crate) struct UsageTracker {
     /// notification that carries A after an unproven/absent one must NOT
     /// resurrect the identity). Reset to `None` in `begin_turn()` and `take()`.
     pending_identity: Option<Option<buzz_core::agent_turn_metric::PricingIdentity>>,
+    /// Per-in-flight-turn fold accumulator for input-field absence.
+    ///
+    /// Set to `true` the first time any in-flight `record()` call for the
+    /// current turn observes `accumulated_input_tokens: None`. Monotonically
+    /// grows (never cleared mid-turn); reset to `false` by `begin_turn()`.
+    /// At `take()` this value is OR-ed into the session's `input_ever_poisoned`
+    /// flag, creating or updating the session entry as needed. This ensures
+    /// the poison is captured even for un-baselined sessions (the
+    /// attach-to-existing path that skips `seed_zero_baseline` and therefore
+    /// starts with no entry in `self.sessions`).
+    input_absence_observed: bool,
+    /// Per-in-flight-turn fold accumulator for output-field absence.
+    /// Symmetric contract to `input_absence_observed`.
+    output_absence_observed: bool,
 }
 
 impl UsageTracker {
@@ -299,6 +313,8 @@ impl UsageTracker {
         self.in_flight_session = Some(session_id.to_string());
         self.pending = None;
         self.pending_identity = None;
+        self.input_absence_observed = false;
+        self.output_absence_observed = false;
     }
 
     /// Process a `usage_update` notification payload.
@@ -338,90 +354,98 @@ impl UsageTracker {
         // setup notifications (no in-flight turn) still advance the baseline.
         let is_in_flight = self.in_flight_session.as_deref() == Some(session_id);
 
-        // Latch poison at observation time — even mid-turn, even for the
-        // in-flight session.  Without this, a second `record()` call in the
-        // same turn would re-read the unchanged session entry (whose
-        // `input_ever_poisoned` is still false), see `prev.last_input = Some(…)`,
-        // and allow the reintroduced value to heal `delta_reliable`.
-        // Writing here is safe: the baseline counters (`last_input` etc.) are
-        // NOT updated — only the monotonic poison flags, which can only grow.
-        // Case 3 (in-flight for another session) is intentionally excluded: we
-        // drop that notification entirely and leave the other session's state
-        // untouched to avoid undercounting its next published delta.
-        let this_in_flight_for_another = self.in_flight_session.is_some() && !is_in_flight;
-        if !this_in_flight_for_another {
-            if let Some(state) = self.sessions.get_mut(session_id) {
-                if current_input.is_none() {
-                    state.input_ever_poisoned = true;
-                }
-                if current_output.is_none() {
-                    state.output_ever_poisoned = true;
-                }
+        // For in-flight notifications, fold the absence of each field into the
+        // per-turn accumulators BEFORE computing the delta.  This ensures the
+        // second `record()` call in a turn sees the absence observed by the first,
+        // even when no session entry exists yet (un-baselined path) and even when
+        // the second notification reintroduces the field.  The fold is monotonic
+        // (OR — never cleared mid-turn); it is reset by `begin_turn()` and
+        // committed to the session's sticky flags in `take()`.
+        //
+        // Case 3 (in-flight for another session) is intentionally excluded:
+        // that notification is dropped entirely; leaving the other session's state
+        // untouched avoids undercounting its next published delta.
+        if is_in_flight {
+            if current_input.is_none() {
+                self.input_absence_observed = true;
+            }
+            if current_output.is_none() {
+                self.output_absence_observed = true;
             }
         }
 
-        let (delta_reliable, turn_input, turn_output, turn_cost, turn_seq) =
-            match self.sessions.get(session_id) {
-                None => {
-                    // First notification for this session — no baseline yet.
-                    (false, None, None, None, 1u64)
-                }
-                Some(prev) => {
-                    // turn_seq for this pending record is one above the last
-                    // *published* seq — constant for all notifications in this
-                    // turn, advanced only on publish.
-                    let seq = prev.published_seq + 1;
-                    // Sticky-poison check: if ACP ever observed an absent input
-                    // or output snapshot for this session, delta_reliable is
-                    // permanently false.  A later reintroduced value must NOT
-                    // heal the reliability — ACP cannot trust the producer's
-                    // permanence guarantee; the prefix delta is irrecoverably
-                    // unknown.
-                    let this_input_absent = current_input.is_none();
-                    let this_output_absent = current_output.is_none();
-                    let input_poisoned = prev.input_ever_poisoned || this_input_absent;
-                    let output_poisoned = prev.output_ever_poisoned || this_output_absent;
-                    if input_poisoned || output_poisoned {
-                        (false, None, None, None, seq)
-                    } else {
-                        match (
-                            current_input,
-                            current_output,
-                            prev.last_input,
-                            prev.last_output,
-                        ) {
-                            (Some(ci), Some(co), Some(pi), Some(po)) => {
-                                // Token counter decrease → unreliable delta.
-                                if ci < pi || co < po {
-                                    (false, None, None, None, seq)
-                                } else {
-                                    let di = ci - pi;
-                                    let dout = co - po;
-                                    // Cost delta: only when both snapshots have cost.
-                                    // A cost *decrease* is also unreliable (NIP-AM: negative
-                                    // delta ⇒ delta_reliable false, null all turn fields).
-                                    let (dc, cost_reliable) = match (current_cost, prev.last_cost) {
-                                        (Some(c), Some(p)) if c >= p => (Some(c - p), true),
-                                        (Some(_), Some(_)) => {
-                                            // Both present but current < prev — counter decreased.
-                                            (None, false)
-                                        }
-                                        _ => (None, true), // absent on either side: null cost, reliable tokens
-                                    };
-                                    if cost_reliable {
-                                        (true, Some(di), Some(dout), dc, seq)
-                                    } else {
-                                        // Cost decrease overrides the whole record to unreliable.
-                                        (false, None, None, None, seq)
+        let (delta_reliable, turn_input, turn_output, turn_cost, turn_seq) = match self
+            .sessions
+            .get(session_id)
+        {
+            None => {
+                // First notification for this session — no baseline yet.
+                (false, None, None, None, 1u64)
+            }
+            Some(prev) => {
+                // turn_seq for this pending record is one above the last
+                // *published* seq — constant for all notifications in this
+                // turn, advanced only on publish.
+                let seq = prev.published_seq + 1;
+                // Sticky-poison check: if ACP ever observed an absent input
+                // or output snapshot for this session, delta_reliable is
+                // permanently false.  A later reintroduced value must NOT
+                // heal the reliability — ACP cannot trust the producer's
+                // permanence guarantee; the prefix delta is irrecoverably
+                // unknown.
+                //
+                // Three sources of poison — all monotonic (OR):
+                //   1. The session's committed flag from prior turns.
+                //   2. The per-turn fold accumulator (captures absences seen
+                //      earlier in THIS turn before take() commits them).
+                //   3. Whether THIS notification is itself absent.
+                let this_input_absent = current_input.is_none();
+                let this_output_absent = current_output.is_none();
+                let input_poisoned =
+                    prev.input_ever_poisoned || self.input_absence_observed || this_input_absent;
+                let output_poisoned =
+                    prev.output_ever_poisoned || self.output_absence_observed || this_output_absent;
+                if input_poisoned || output_poisoned {
+                    (false, None, None, None, seq)
+                } else {
+                    match (
+                        current_input,
+                        current_output,
+                        prev.last_input,
+                        prev.last_output,
+                    ) {
+                        (Some(ci), Some(co), Some(pi), Some(po)) => {
+                            // Token counter decrease → unreliable delta.
+                            if ci < pi || co < po {
+                                (false, None, None, None, seq)
+                            } else {
+                                let di = ci - pi;
+                                let dout = co - po;
+                                // Cost delta: only when both snapshots have cost.
+                                // A cost *decrease* is also unreliable (NIP-AM: negative
+                                // delta ⇒ delta_reliable false, null all turn fields).
+                                let (dc, cost_reliable) = match (current_cost, prev.last_cost) {
+                                    (Some(c), Some(p)) if c >= p => (Some(c - p), true),
+                                    (Some(_), Some(_)) => {
+                                        // Both present but current < prev — counter decreased.
+                                        (None, false)
                                     }
+                                    _ => (None, true), // absent on either side: null cost, reliable tokens
+                                };
+                                if cost_reliable {
+                                    (true, Some(di), Some(dout), dc, seq)
+                                } else {
+                                    // Cost decrease overrides the whole record to unreliable.
+                                    (false, None, None, None, seq)
                                 }
                             }
-                            // One or both sides absent (no prior baseline) → unreliable.
-                            _ => (false, None, None, None, seq),
                         }
+                        // One or both sides absent (no prior baseline) → unreliable.
+                        _ => (false, None, None, None, seq),
                     }
                 }
-            };
+            }
+        };
 
         // Total-token delta: field-local — never affects `delta_reliable` or
         // the input/output deltas. Null when: no baseline exists, either
@@ -597,16 +621,32 @@ impl UsageTracker {
         // every in-flight notification carried the same one; emit `None` when
         // any notification was absent/unproven or they disagreed.
         let folded_identity = self.pending_identity.take().and_then(|inner| inner);
+        // Consume and reset the per-turn fold accumulators before returning.
+        // These must be reset even on the None path (no pending record) so a
+        // subsequent begin_turn/take cycle starts clean.
+        let input_absence_this_turn = std::mem::replace(&mut self.input_absence_observed, false);
+        let output_absence_this_turn = std::mem::replace(&mut self.output_absence_observed, false);
         let mut record = self.pending.take()?;
         record.pricing_identity = folded_identity;
         // Advance the committed baseline to this published record so the
         // *next* turn measures its delta from here.
-        // Propagate the sticky-poison flags from the existing state: once
-        // poisoned, always poisoned — a resumed emission cannot heal the gap.
+        //
+        // Compute sticky-poison flags by combining three sources — all monotonic:
+        //   1. Any prior session-level flag (from a previous turn).
+        //   2. `input_absence_this_turn` / `output_absence_this_turn` — whether any
+        //      in-flight notification this turn observed an absent field.  This is
+        //      the fold accumulator that closes the un-baselined escape: for sessions
+        //      on the attach-to-existing path (no `seed_zero_baseline`), no session
+        //      entry exists yet, so a `get_mut`-based latch would be a no-op — the
+        //      fold captures the absence regardless and commits it here.
+        //   3. Whether the final published record's cumulative field is None (the
+        //      last-notification check that was already present).
         let existing = self.sessions.get(&record.session_id);
         let input_ever_poisoned = existing.is_some_and(|s| s.input_ever_poisoned)
+            || input_absence_this_turn
             || record.cumulative_input_tokens.is_none();
         let output_ever_poisoned = existing.is_some_and(|s| s.output_ever_poisoned)
+            || output_absence_this_turn
             || record.cumulative_output_tokens.is_none();
         self.sessions.insert(
             record.session_id.clone(),
@@ -2602,6 +2642,54 @@ mod tests {
         assert!(
             !t2.delta_reliable,
             "poison must persist to next turn (output)"
+        );
+    }
+
+    /// Un-baselined session (attach-to-existing path, no seed_zero_baseline):
+    /// an absent input snapshot observed mid-turn must poison the session even
+    /// though no session entry exists yet — a later reintroduced value must not
+    /// heal delta_reliable in the next turn.
+    ///
+    /// This is Paul's probe that FAILED at eb24590e2e — the get_mut latch was a
+    /// no-op for un-baselined sessions.  The fold accumulator on UsageTracker
+    /// captures the absence and commits it at take() regardless of whether a
+    /// session entry already exists.
+    #[test]
+    fn unbaselined_within_turn_input_absence_poisons_next_turn() {
+        let mut t = UsageTracker::default();
+        // NO seed_zero_baseline — attach-to-existing path
+        t.begin_turn("s");
+        t.record("s", &payload_opt(None, Some(10))); // poisoned snapshot
+        t.record("s", &payload_opt(Some(100), Some(20))); // reintroduced same turn
+        let t1 = t.take().expect("t1");
+        assert!(!t1.delta_reliable, "t1: no baseline — must be unreliable");
+        t.begin_turn("s");
+        t.record("s", &payload_opt(Some(150), Some(30)));
+        let t2 = t.take().expect("t2");
+        assert!(
+            !t2.delta_reliable,
+            "t2: absence was observed in t1 — sticky poison must hold"
+        );
+    }
+
+    /// Symmetric output-field case for the un-baselined escape:
+    /// absent output snapshot mid-turn must poison the session and persist to
+    /// the next turn, even when no session entry existed at record() time.
+    #[test]
+    fn unbaselined_within_turn_output_absence_poisons_next_turn() {
+        let mut t = UsageTracker::default();
+        // NO seed_zero_baseline — attach-to-existing path
+        t.begin_turn("s");
+        t.record("s", &payload_opt(Some(10), None)); // poisoned snapshot: output absent
+        t.record("s", &payload_opt(Some(100), Some(20))); // reintroduced same turn
+        let t1 = t.take().expect("t1");
+        assert!(!t1.delta_reliable, "t1: no baseline — must be unreliable");
+        t.begin_turn("s");
+        t.record("s", &payload_opt(Some(150), Some(30)));
+        let t2 = t.take().expect("t2");
+        assert!(
+            !t2.delta_reliable,
+            "t2: absence was observed in t1 — sticky poison must hold"
         );
     }
 }
