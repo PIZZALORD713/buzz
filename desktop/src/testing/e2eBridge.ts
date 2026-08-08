@@ -12751,6 +12751,7 @@ export function maybeInstallE2eTauriMocks() {
           ]),
         );
       case "plugin:websocket|connect":
+      case "plugin:websocket|connect_with_status":
         if (isRelayMode(activeConfig)) {
           return connectRealSocket(
             payload as Parameters<typeof connectRealSocket>[0],

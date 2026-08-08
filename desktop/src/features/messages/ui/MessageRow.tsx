@@ -7,8 +7,10 @@ import {
   reactionsEqual,
   tagsEqual,
 } from "@/features/messages/lib/messageRowEquality";
+import { hasCurrentRelayBindingForAuthor } from "@/features/messages/lib/currentRelayBinding";
 import type { TimelineMessage } from "@/features/messages/types";
 import { useKnownAgentPubkeys } from "@/features/agents/useKnownAgentPubkeys";
+import { useCurrentProjection } from "@/features/binding-status/currentProjectionStore";
 import { HuddleAttachment } from "@/features/huddle/components/HuddleAttachment";
 import { MessageReactions } from "@/features/messages/ui/MessageReactions";
 import { useReactionHandler } from "@/features/messages/ui/useReactionHandler";
@@ -53,6 +55,7 @@ import { hasLinkPreviewSuppression } from "@/features/messages/lib/formatTimelin
 import { toast } from "sonner";
 import { MessageAgentOwner } from "./MessageAgentOwner";
 import { MessageAuthorText, MessageHeaderRow } from "./MessageHeader";
+import { CurrentRelayBindingBadge } from "./CurrentRelayBindingBadge";
 import { MessageTimestamp } from "./MessageTimestamp";
 import { WaveMessageAttachment } from "./WaveMessageAttachment";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/shared/ui/tooltip";
@@ -189,6 +192,7 @@ export const MessageRow = React.memo(
     const [badgeBurstEmoji, setBadgeBurstEmoji] = React.useState<string | null>(
       null,
     );
+    const currentProjection = useCurrentProjection();
     const handleEntranceAnimationEnd = React.useCallback(
       (event: React.AnimationEvent<HTMLElement>) => {
         if (
@@ -537,6 +541,10 @@ export const MessageRow = React.memo(
     ) : (
       <MessageAuthorText as="h3">{message.author}</MessageAuthorText>
     );
+    const showCurrentRelayBinding = hasCurrentRelayBindingForAuthor(
+      currentProjection,
+      message.signerPubkey,
+    );
     const verifiedName = message.pubkey
       ? resolveUserVerification({ pubkey: message.pubkey, profiles })
       : null;
@@ -648,6 +656,7 @@ export const MessageRow = React.memo(
             }
           />
         ) : null}
+        {showCurrentRelayBinding ? <CurrentRelayBindingBadge /> : null}
         {agentOwnerNode}
         {inlineMetadataNode}
         {message.personaDisplayName &&
