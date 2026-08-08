@@ -2,6 +2,7 @@
 
 use std::path::Path;
 use std::pin::Pin;
+use std::sync::Arc;
 
 use buzz_core::tenant::{CommunityId, TenantContext};
 
@@ -12,12 +13,16 @@ use s3::creds::Credentials;
 use s3::{Bucket, Region};
 use serde::{Deserialize, Serialize};
 
+/// Bound full-object verification disk and object-store amplification per process.
+const DEFAULT_MEDIA_VERIFICATION_CONCURRENCY: usize = 2;
+
 /// A stream of byte chunks from S3, usable with `axum::body::Body::from_stream()`.
 pub type ByteStream = Pin<Box<dyn futures_core::Stream<Item = Result<Bytes, MediaError>> + Send>>;
 
 /// S3-compatible object storage client.
 pub struct MediaStorage {
     bucket: Box<Bucket>,
+    pub(crate) verification_slots: Arc<tokio::sync::Semaphore>,
 }
 
 impl MediaStorage {
@@ -66,7 +71,12 @@ impl MediaStorage {
             S3AddressingStyle::Path => bucket.with_path_style(),
             S3AddressingStyle::Virtual => bucket,
         };
-        Ok(Self { bucket })
+        Ok(Self {
+            bucket,
+            verification_slots: Arc::new(tokio::sync::Semaphore::new(
+                DEFAULT_MEDIA_VERIFICATION_CONCURRENCY,
+            )),
+        })
     }
 
     /// Store an object from a byte slice.
@@ -410,6 +420,9 @@ pub struct BlobMeta {
     pub blurhash: String,
     /// Full URL to thumbnail.
     pub thumb_url: String,
+    /// SHA-256 of the exact thumbnail bytes, when a thumbnail exists.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thumbnail_sha256: Option<String>,
     /// File extension (e.g. "jpg").
     pub ext: String,
     /// MIME type (e.g. "image/jpeg").

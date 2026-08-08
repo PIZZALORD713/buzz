@@ -31,10 +31,11 @@
 //! The moderation pipeline triggers on `ObjectCreated` events under the
 //! `_uploads/` prefix and parses this record instead of HEADing blobs:
 //!
-//! - For fresh uploads, the record is written after the blob and derived
-//!   artifacts but before the sidecar serve gate. Record existence therefore
-//!   implies the scan inputs are readable, while record failure cannot leave
-//!   unscanned media publicly servable.
+//! - For fresh uploads, the record is written after immutable blob staging and
+//!   the canonical PostgreSQL publication commit, but before cache projections.
+//!   Record existence therefore implies the scan inputs are readable. A record
+//!   failure leaves the DB-witnessed object authoritative but unprojected for
+//!   moderation retry; a sidecar never grants canonical visibility.
 //! - `ext`, `mime_type`, and `size` are always present so the consumer can
 //!   derive the blob key (`{sha256}.{ext}`) and scan eligibility without
 //!   extra round-trips.
@@ -131,11 +132,10 @@ pub struct UploadEventFacts<'a> {
 
 /// Build and store the per-event record for one accepted upload.
 ///
-/// Called after blob and derived-artifact durability but before the sidecar
-/// publish gate on fresh uploads; called on the existing published state for
-/// idempotent re-uploads. A write failure propagates and fails the upload. The
-/// record's `ObjectCreated` event is the moderation pipeline's only scan
-/// trigger, so no newly published media may exist without a record.
+/// Protected publication callers invoke this only after the canonical DB
+/// witness commits; immutable staging alone must not claim acceptance. The
+/// cache-only sidecar is refreshed afterward. A write failure propagates and
+/// leaves the DB-witnessed immutable object authoritative but unprojected.
 pub async fn record_upload_event(
     storage: &crate::storage::MediaStorage,
     ctx: &TenantContext,
