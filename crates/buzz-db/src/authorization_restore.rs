@@ -27,9 +27,18 @@ use crate::{
         AllocatedClientStatusRevision, ClientStatusAllocationRequest, ClientStatusRestoreIdentity,
         ClientStatusRevisionError, ClientStatusWithdrawalRequest,
     },
+    identity_lifecycle::{
+        IdentityBindingEvidence, IdentityLifecycleDenial, IdentityLifecycleObservation,
+        IdentityLifecycleTransition, PersistedIdentityLifecycleOutcome,
+        PreparedDirectEnrollmentRejection, PreparedDirectEnrollmentWriteFailure,
+        PreparedOperatorLifecycleRejection, PreparedOperatorLifecycleWriteFailure,
+        PreparedProvisionBinding,
+    },
+    operator_lifecycle::{OperatorLifecycleError, OperatorLifecycleIntent},
     Db, DbError,
 };
 use async_trait::async_trait;
+use buzz_auth::{OperatorLifecycleAction, VerifiedOperatorLifecycleGrant};
 use buzz_core::CommunityId;
 use dashmap::DashSet;
 use s3::{creds::Credentials, error::S3Error, Bucket, Region};
@@ -246,6 +255,115 @@ pub enum RestoredClientStatusError {
     /// The canonical status transaction denied or failed.
     #[error(transparent)]
     Revision(#[from] ClientStatusRevisionError),
+    /// The external operation witness failed.
+    #[error(transparent)]
+    Restore(#[from] OperationRestoreError),
+}
+
+/// Canonical provision result returned only after PostgreSQL and its witness resolve.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProvisionBindingExecution {
+    /// A separately approved binding was created.
+    Applied {
+        /// Exact immutable binding generation.
+        binding: IdentityBindingEvidence,
+    },
+    /// The selected key was already active and the no-op was witnessed.
+    NoOp {
+        /// Exact already-active binding generation.
+        binding: IdentityBindingEvidence,
+    },
+    /// Canonical provisioning was durably denied.
+    Denied {
+        /// Closed lifecycle denial reason.
+        reason: IdentityLifecycleDenial,
+    },
+    /// The exact prior canonical result and restore witness were replayed.
+    ExactReplay {
+        /// Original persisted lifecycle outcome.
+        original_outcome: PersistedIdentityLifecycleOutcome,
+        /// Original binding generation when the prior outcome succeeded.
+        binding: Option<IdentityBindingEvidence>,
+    },
+}
+
+impl TryFrom<IdentityLifecycleObservation> for ProvisionBindingExecution {
+    type Error = RestoredProvisionBindingError;
+
+    fn try_from(observation: IdentityLifecycleObservation) -> Result<Self, Self::Error> {
+        match observation {
+            IdentityLifecycleObservation::Applied {
+                transition: IdentityLifecycleTransition::Provision,
+                binding: Some(binding),
+            } => Ok(Self::Applied { binding }),
+            IdentityLifecycleObservation::NoOp {
+                transition: IdentityLifecycleTransition::Provision,
+                binding: Some(binding),
+            } => Ok(Self::NoOp { binding }),
+            IdentityLifecycleObservation::Denied {
+                transition: IdentityLifecycleTransition::Provision,
+                reason,
+            } => Ok(Self::Denied { reason }),
+            IdentityLifecycleObservation::ExactReplay {
+                transition: IdentityLifecycleTransition::Provision,
+                original_outcome,
+                binding,
+            } => Ok(Self::ExactReplay {
+                original_outcome,
+                binding,
+            }),
+            _ => Err(RestoredProvisionBindingError::CorruptStoredResult),
+        }
+    }
+}
+
+/// Fail-closed combined lifecycle/database/restore result for provisioning.
+#[derive(Debug, Error)]
+pub enum RestoredProvisionBindingError {
+    /// The sealed command failed canonical validation.
+    #[error("provision-binding request is invalid")]
+    InvalidRequest,
+    /// The operation ID is bound to different canonical semantics.
+    #[error("provision-binding operation intent conflicts")]
+    IntentConflict,
+    /// Canonical authorization evidence could not be durably appended.
+    #[error("provision-binding audit unavailable")]
+    AuditUnavailable,
+    /// Stored canonical lifecycle attribution was inconsistent.
+    #[error("provision-binding canonical result is corrupt")]
+    CorruptStoredResult,
+    /// PostgreSQL failed before commit and rollback completed.
+    #[error("provision-binding database operation failed")]
+    Database(#[source] DbError),
+    /// Commit or rollback failed, leaving the outcome indeterminate.
+    #[error("provision-binding outcome is unknown")]
+    OutcomeUnknown(#[source] DbError),
+    /// The external operation witness failed.
+    #[error(transparent)]
+    Restore(#[from] OperationRestoreError),
+}
+
+/// Fail-closed combined lifecycle/database/restore result for operator transitions.
+#[derive(Debug, Error)]
+pub enum RestoredOperatorLifecycleError {
+    /// The sealed grant and canonical intent do not describe one operation.
+    #[error("operator lifecycle request is invalid")]
+    InvalidRequest,
+    /// The operation ID is bound to different canonical semantics.
+    #[error("operator lifecycle operation intent conflicts")]
+    IntentConflict,
+    /// The canonical denial event could not be durably appended.
+    #[error("operator lifecycle audit unavailable")]
+    AuditUnavailable,
+    /// Stored canonical lifecycle attribution was inconsistent.
+    #[error("operator lifecycle canonical result is corrupt")]
+    CorruptStoredResult,
+    /// PostgreSQL failed before commit and rollback completed.
+    #[error("operator lifecycle database operation failed")]
+    Database(#[source] DbError),
+    /// Commit or rollback failed, leaving the outcome indeterminate.
+    #[error("operator lifecycle outcome is unknown")]
+    OutcomeUnknown(#[source] DbError),
     /// The external operation witness failed.
     #[error(transparent)]
     Restore(#[from] OperationRestoreError),
@@ -1399,6 +1517,207 @@ impl OperationRestoreRuntime {
             Err(error @ ProtectedPublicationError::Database(_)) => {
                 self.abandon_ambiguous(fenced);
                 Err(error.into())
+            }
+        }
+    }
+
+    /// Execute one verifier-sealed provision binding behind its external Pending intent.
+    pub async fn execute_provision_binding(
+        &self,
+        request: &PreparedProvisionBinding,
+    ) -> Result<ProvisionBindingExecution, RestoredProvisionBindingError> {
+        let mut fenced = self
+            .begin_fenced(OperationIdentity {
+                domain: request.authorization_domain(),
+                operation_id: request.operation_id(),
+                request_fingerprint: request.request_fingerprint(),
+            })
+            .await?;
+        let result = self
+            .0
+            .writer_db
+            .execute_prepared_provision_binding_fenced(fenced.capability_mut()?, request)
+            .await;
+        self.finish_provision_binding_write(fenced, result).await
+    }
+
+    async fn finish_provision_binding_write(
+        &self,
+        fenced: FencedRestoreIntent,
+        result: Result<IdentityLifecycleObservation, PreparedDirectEnrollmentWriteFailure>,
+    ) -> Result<ProvisionBindingExecution, RestoredProvisionBindingError> {
+        let external_replay_mismatch = fenced.replay.is_some()
+            && !matches!(
+                &result,
+                Ok(IdentityLifecycleObservation::ExactReplay {
+                    transition: IdentityLifecycleTransition::Provision,
+                    ..
+                }) | Err(PreparedDirectEnrollmentWriteFailure::OutcomeUnknown(_))
+            );
+        if external_replay_mismatch {
+            let _ = self.abort_fenced(fenced).await;
+            self.latch_unhealthy();
+            return Err(RestoredProvisionBindingError::Restore(
+                OperationRestoreError::InvalidAttribution,
+            ));
+        }
+        match result {
+            Ok(observation) => {
+                let execution = match ProvisionBindingExecution::try_from(observation) {
+                    Ok(execution) => execution,
+                    Err(error) => {
+                        let abort = self.abort_fenced(fenced).await;
+                        self.latch_unhealthy();
+                        abort?;
+                        return Err(error);
+                    }
+                };
+                self.commit_fenced(fenced).await?;
+                Ok(execution)
+            }
+            Err(PreparedDirectEnrollmentWriteFailure::AuditUnavailable) => {
+                self.abort_fenced(fenced).await?;
+                Err(RestoredProvisionBindingError::AuditUnavailable)
+            }
+            Err(PreparedDirectEnrollmentWriteFailure::Rejected(rejection)) => {
+                self.abort_fenced(fenced).await?;
+                Err(match rejection {
+                    PreparedDirectEnrollmentRejection::InvalidRequest => {
+                        RestoredProvisionBindingError::InvalidRequest
+                    }
+                    PreparedDirectEnrollmentRejection::IntentConflict => {
+                        RestoredProvisionBindingError::IntentConflict
+                    }
+                })
+            }
+            Err(PreparedDirectEnrollmentWriteFailure::CorruptStoredResult) => {
+                let abort = self.abort_fenced(fenced).await;
+                self.latch_unhealthy();
+                abort?;
+                Err(RestoredProvisionBindingError::CorruptStoredResult)
+            }
+            Err(PreparedDirectEnrollmentWriteFailure::Database(error)) => {
+                let abort = self.abort_fenced(fenced).await;
+                self.latch_unhealthy();
+                abort?;
+                Err(RestoredProvisionBindingError::Database(error))
+            }
+            Err(PreparedDirectEnrollmentWriteFailure::OutcomeUnknown(error)) => {
+                self.abandon_ambiguous(fenced);
+                Err(RestoredProvisionBindingError::OutcomeUnknown(error))
+            }
+        }
+    }
+
+    /// Execute one verifier-sealed operator lifecycle intent on the fenced writer.
+    pub async fn execute_operator_lifecycle(
+        &self,
+        grant: &VerifiedOperatorLifecycleGrant,
+        intent: &OperatorLifecycleIntent,
+    ) -> Result<IdentityLifecycleObservation, RestoredOperatorLifecycleError> {
+        let prepared =
+            crate::identity_lifecycle::prepare_verified_operator_transition(grant, intent)
+                .map_err(|error| match error {
+                    OperatorLifecycleError::InvalidRequest => {
+                        RestoredOperatorLifecycleError::InvalidRequest
+                    }
+                    OperatorLifecycleError::IntentConflict => {
+                        RestoredOperatorLifecycleError::IntentConflict
+                    }
+                    OperatorLifecycleError::AuditUnavailable => {
+                        RestoredOperatorLifecycleError::AuditUnavailable
+                    }
+                    OperatorLifecycleError::CorruptStoredResult => {
+                        RestoredOperatorLifecycleError::CorruptStoredResult
+                    }
+                    OperatorLifecycleError::Storage(error) => {
+                        RestoredOperatorLifecycleError::Database(error)
+                    }
+                })?;
+        let mut fenced = self
+            .begin_fenced(OperationIdentity {
+                domain: prepared.authorization_domain(),
+                operation_id: prepared.operation_id(),
+                request_fingerprint: prepared.request_fingerprint(),
+            })
+            .await?;
+        let result = self
+            .0
+            .writer_db
+            .execute_prepared_operator_transition_fenced(fenced.capability_mut()?, &prepared)
+            .await;
+        self.finish_operator_lifecycle_write(fenced, result, intent.action())
+            .await
+    }
+
+    async fn finish_operator_lifecycle_write(
+        &self,
+        fenced: FencedRestoreIntent,
+        result: Result<IdentityLifecycleObservation, PreparedOperatorLifecycleWriteFailure>,
+        action: OperatorLifecycleAction,
+    ) -> Result<IdentityLifecycleObservation, RestoredOperatorLifecycleError> {
+        let expected_transition = operator_lifecycle_transition(action);
+        let exact_database_replay = matches!(
+            &result,
+            Ok(IdentityLifecycleObservation::ExactReplay { transition, .. })
+                if *transition == expected_transition
+        );
+        if fenced.replay.is_some()
+            && !exact_database_replay
+            && !matches!(
+                &result,
+                Err(PreparedOperatorLifecycleWriteFailure::OutcomeUnknown(_))
+            )
+        {
+            let _ = self.abort_fenced(fenced).await;
+            self.latch_unhealthy();
+            return Err(RestoredOperatorLifecycleError::Restore(
+                OperationRestoreError::InvalidAttribution,
+            ));
+        }
+        match result {
+            Ok(observation) if operator_observation_matches(&observation, expected_transition) => {
+                self.commit_fenced(fenced).await?;
+                Ok(observation)
+            }
+            Ok(_) => {
+                let abort = self.abort_fenced(fenced).await;
+                self.latch_unhealthy();
+                abort?;
+                Err(RestoredOperatorLifecycleError::CorruptStoredResult)
+            }
+            Err(PreparedOperatorLifecycleWriteFailure::AuditUnavailable) => {
+                let abort = self.abort_fenced(fenced).await;
+                self.latch_unhealthy();
+                abort?;
+                Err(RestoredOperatorLifecycleError::AuditUnavailable)
+            }
+            Err(PreparedOperatorLifecycleWriteFailure::Rejected(rejection)) => {
+                self.abort_fenced(fenced).await?;
+                Err(match rejection {
+                    PreparedOperatorLifecycleRejection::InvalidRequest => {
+                        RestoredOperatorLifecycleError::InvalidRequest
+                    }
+                    PreparedOperatorLifecycleRejection::IntentConflict => {
+                        RestoredOperatorLifecycleError::IntentConflict
+                    }
+                })
+            }
+            Err(PreparedOperatorLifecycleWriteFailure::CorruptStoredResult) => {
+                let abort = self.abort_fenced(fenced).await;
+                self.latch_unhealthy();
+                abort?;
+                Err(RestoredOperatorLifecycleError::CorruptStoredResult)
+            }
+            Err(PreparedOperatorLifecycleWriteFailure::Database(error)) => {
+                let abort = self.abort_fenced(fenced).await;
+                self.latch_unhealthy();
+                abort?;
+                Err(RestoredOperatorLifecycleError::Database(error))
+            }
+            Err(PreparedOperatorLifecycleWriteFailure::OutcomeUnknown(error)) => {
+                self.abandon_ambiguous(fenced);
+                Err(RestoredOperatorLifecycleError::OutcomeUnknown(error))
             }
         }
     }
@@ -2654,6 +2973,31 @@ impl OperationRestoreRuntime {
 
     fn latch_unhealthy(&self) {
         self.0.healthy.store(false, Ordering::Release);
+    }
+}
+
+const fn operator_lifecycle_transition(
+    action: OperatorLifecycleAction,
+) -> IdentityLifecycleTransition {
+    match action {
+        OperatorLifecycleAction::Retire => IdentityLifecycleTransition::Retire,
+        OperatorLifecycleAction::Disable => IdentityLifecycleTransition::Disable,
+        OperatorLifecycleAction::Revoke => IdentityLifecycleTransition::Revoke,
+        OperatorLifecycleAction::Rotate => IdentityLifecycleTransition::Rotate,
+        OperatorLifecycleAction::Recover => IdentityLifecycleTransition::Recover,
+        OperatorLifecycleAction::Enable => IdentityLifecycleTransition::Enable,
+    }
+}
+
+fn operator_observation_matches(
+    observation: &IdentityLifecycleObservation,
+    expected: IdentityLifecycleTransition,
+) -> bool {
+    match observation {
+        IdentityLifecycleObservation::Applied { transition, .. }
+        | IdentityLifecycleObservation::NoOp { transition, .. }
+        | IdentityLifecycleObservation::Denied { transition, .. }
+        | IdentityLifecycleObservation::ExactReplay { transition, .. } => *transition == expected,
     }
 }
 

@@ -4,6 +4,14 @@
 //! Identity evidence can select an already-installed attested-key policy but
 //! can never mint policy bytes or silently adopt migration-bootstrap limits.
 
+mod provider_free;
+
+pub use provider_free::{
+    AuthorizationEnrollmentMode, AuthorizationEnrollmentPolicy,
+    AuthorizationEnrollmentPolicySemantics, AuthorizationPolicyReconciliation,
+    RISK_LABELLED_TOFU_ACKNOWLEDGEMENT_V1,
+};
+
 use buzz_auth::AuthorizationEventCapacityPolicy;
 use buzz_core::CommunityId;
 use sqlx::{Postgres, Row, Transaction};

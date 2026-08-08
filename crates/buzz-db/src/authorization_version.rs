@@ -28,6 +28,7 @@ use uuid::Uuid;
 
 use crate::{
     authorization_events::{AuthorizationAuthorityLossTarget, AuthorizationEventActor},
+    identity_lifecycle::RetiringBindingAuthority,
     Db, DbError, Result,
 };
 
@@ -656,6 +657,49 @@ pub(crate) async fn advance_admission_loss_authority_tx(
             "authorization authority advance lacks a rechecked loss cause".to_owned(),
         )
     })?;
+    advance_authority_target_tx(
+        transaction,
+        community_id,
+        operation_id,
+        request_fingerprint,
+        target,
+    )
+    .await
+}
+
+/// Refence every protected object owned by one exact retiring binding.
+pub(crate) async fn advance_retiring_binding_authority_tx(
+    transaction: &mut Transaction<'_, Postgres>,
+    authority: &RetiringBindingAuthority,
+) -> Result<AuthorizationAuthorityEpochAdvance> {
+    let (binding_id, binding_version) = authority.binding();
+    if authority.community_id().as_uuid().is_nil()
+        || authority.operation_id().is_nil()
+        || authority.request_fingerprint() == [0; 32]
+        || binding_id.is_nil()
+        || binding_version == 0
+    {
+        return Err(DbError::InvalidData(
+            "retiring binding authority is invalid".to_owned(),
+        ));
+    }
+    advance_authority_target_tx(
+        transaction,
+        authority.community_id(),
+        authority.operation_id(),
+        authority.request_fingerprint(),
+        AuthorizationAuthorityLossTarget::Binding(binding_id, binding_version),
+    )
+    .await
+}
+
+async fn advance_authority_target_tx(
+    transaction: &mut Transaction<'_, Postgres>,
+    community_id: CommunityId,
+    operation_id: Uuid,
+    request_fingerprint: [u8; 32],
+    target: AuthorizationAuthorityLossTarget,
+) -> Result<AuthorizationAuthorityEpochAdvance> {
     let (
         target_kind,
         binding_id,
@@ -693,6 +737,34 @@ pub(crate) async fn advance_admission_loss_authority_tx(
         ),
     };
 
+    let protected_count: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM ( \
+           SELECT 1 FROM protected_object_authority protected \
+           WHERE protected.community_id=$1 \
+             AND (($2=1 AND protected.binding_id=$3 AND protected.binding_version=$4) \
+               OR ($2=2 AND protected.policy_revision=$5) \
+               OR ($2=3 AND protected.delegated_relationship_id=$6 \
+                         AND protected.delegated_relationship_revision=$7)) \
+           LIMIT 1025) matching",
+    )
+    .bind(community_id.as_uuid())
+    .bind(target_kind)
+    .bind(binding_id)
+    .bind(binding_version)
+    .bind(policy_revision)
+    .bind(relationship_id)
+    .bind(relationship_revision)
+    .fetch_one(&mut **transaction)
+    .await?;
+    let protected_count = usize::try_from(protected_count).map_err(|_| {
+        DbError::InvalidData("authorization protected authority count is invalid".to_owned())
+    })?;
+    if protected_count > MAX_COMPONENTS {
+        return Err(DbError::InvalidData(
+            "authorization authority advance exceeds manifest capacity".to_owned(),
+        ));
+    }
+
     let rows = sqlx::query(
         "SELECT epoch.object_kind,epoch.object_key,epoch.authority_epoch,epoch.fence \
          FROM authorization_authority_epochs epoch \
@@ -718,6 +790,11 @@ pub(crate) async fn advance_admission_loss_authority_tx(
     if rows.len() > MAX_COMPONENTS {
         return Err(DbError::InvalidData(
             "authorization authority advance exceeds manifest capacity".to_owned(),
+        ));
+    }
+    if rows.len() != protected_count {
+        return Err(DbError::InvalidData(
+            "authorization protected authority is missing its epoch coordinate".to_owned(),
         ));
     }
 

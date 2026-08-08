@@ -47,6 +47,7 @@ pub mod identity_lifecycle;
 pub mod migration;
 /// Community moderation: reports, bans/timeouts, audit actions.
 pub mod moderation;
+pub mod operator_lifecycle;
 /// Monthly table partition management.
 pub mod partition;
 /// Buzz product-feedback sidecar persistence.

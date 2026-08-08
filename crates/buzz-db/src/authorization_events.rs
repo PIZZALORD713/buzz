@@ -5,9 +5,12 @@
 //! per-domain budget; exhaustion aborts the surrounding authorization
 //! transaction and is latched unhealthy by the caller.
 
-use std::fmt;
+use std::{collections::HashSet, fmt};
 
-use buzz_auth::{AuthContext, AuthorizationEventCapacityPolicy};
+use buzz_auth::{
+    AuthContext, AuthorizationEventCapacityPolicy, ProofTransport, VerifiedFederatedAssertion,
+    VerifiedNostrProof, VerifiedOperatorLifecycleGrant, VerifiedProvisionBindingIntent,
+};
 use buzz_core::{CanonicalCurrentBindingEvidence, CommunityId};
 use chrono::{DateTime, Utc};
 use serde::Serialize;
@@ -338,6 +341,119 @@ pub(crate) struct AuthorizationEventActor {
 }
 
 impl AuthorizationEventActor {
+    /// Derive operator attribution only from one origin-sealed lifecycle grant.
+    pub(crate) fn from_verified_operator_grant(
+        grant: &VerifiedOperatorLifecycleGrant,
+    ) -> Result<Self> {
+        if grant.authorization_domain().as_uuid().is_nil()
+            || grant.operation_id().is_nil()
+            || grant.intent_digest() == [0; 32]
+            || grant.expected_revision() == 0
+            || grant.approval_policy_digest() == [0; 32]
+            || grant.signer_attribution() == [0; 32]
+            || grant.approval_attribution() == Some([0; 32])
+            || grant.request_attribution() == [0; 32]
+            || grant.issued_at().timestamp_micros() <= 0
+            || grant.expires_at() <= grant.issued_at()
+        {
+            return Err(DbError::InvalidData(
+                "verified operator grant is invalid".to_owned(),
+            ));
+        }
+        let action = (grant.action() as i16).to_be_bytes();
+        let expected_revision = grant.expected_revision().to_be_bytes();
+        Ok(local_actor(
+            AuthorizationActorKind::Operator,
+            grant.authorization_domain(),
+            &[
+                &action,
+                grant.operation_id().as_bytes(),
+                &grant.intent_digest(),
+                &expected_revision,
+                &grant.approval_policy_digest(),
+                &grant.signer_attribution(),
+                &grant.approval_attribution().unwrap_or([0; 32]),
+                &grant.request_attribution(),
+            ],
+            None,
+        ))
+    }
+
+    /// Derive provisioning attribution only from one verifier-sealed intent.
+    pub(crate) fn from_verified_provision_intent(
+        intent: &VerifiedProvisionBindingIntent,
+    ) -> Result<Self> {
+        if intent.authorization_domain().as_uuid().is_nil()
+            || intent.operation_id().is_nil()
+            || intent.policy_revision() == 0
+            || intent.policy_digest() == [0; 32]
+            || intent.selected_event_author_pubkey() == [0; 32]
+            || intent.intent_digest() == [0; 32]
+            || intent.approval_policy_digest() == [0; 32]
+            || intent.signer_attribution() == [0; 32]
+            || intent.approval_attribution() == Some([0; 32])
+            || intent.request_attribution() == [0; 32]
+            || intent.issued_at().timestamp_micros() <= 0
+            || intent.expires_at() <= intent.issued_at()
+        {
+            return Err(DbError::InvalidData(
+                "verified provision intent is invalid".to_owned(),
+            ));
+        }
+        let policy_revision = intent.policy_revision().to_be_bytes();
+        Ok(local_actor(
+            AuthorizationActorKind::Operator,
+            intent.authorization_domain(),
+            &[
+                intent.operation_id().as_bytes(),
+                &policy_revision,
+                &intent.policy_digest(),
+                &intent.selected_event_author_pubkey(),
+                &intent.intent_digest(),
+                &intent.approval_policy_digest(),
+                &intent.signer_attribution(),
+                &intent.approval_attribution().unwrap_or([0; 32]),
+                &intent.request_attribution(),
+            ],
+            None,
+        ))
+    }
+
+    /// Derive enrollment attribution only from an origin-sealed direct pair.
+    pub(crate) fn from_verified_direct_enrollment(
+        assertion: &VerifiedFederatedAssertion,
+        proof: &VerifiedNostrProof,
+    ) -> Result<Self> {
+        let principal = assertion.principal_storage_key();
+        let assertion_fingerprint = proof.bound_assertion_fingerprint().ok_or_else(|| {
+            DbError::InvalidData("direct enrollment proof is not bound to an assertion".to_owned())
+        })?;
+        if assertion.authorization_domain() != proof.authorization_domain()
+            || proof.delegation_conditions_fingerprint().is_some()
+            || assertion_fingerprint == &[0; 32]
+        {
+            return Err(DbError::InvalidData(
+                "direct enrollment evidence coordinates do not match".to_owned(),
+            ));
+        }
+        let transport = proof_transport_code(proof.transport());
+        Ok(local_actor(
+            AuthorizationActorKind::Direct,
+            assertion.authorization_domain(),
+            &[
+                principal.issuer().as_bytes(),
+                principal.subject().as_bytes(),
+                &proof.actor_pubkey().to_bytes(),
+                assertion_fingerprint,
+                proof.request_fingerprint(),
+                proof.target_fingerprint(),
+                proof.transport_context_fingerprint(),
+                &transport.to_be_bytes(),
+            ],
+            None,
+        ))
+    }
+
     /// Derive direct/delegated attribution from the complete sealed route.
     #[allow(dead_code)] // Consumed by the S5 protected-route child.
     pub(crate) fn from_auth_context(context: &AuthContext) -> Result<Self> {
@@ -406,6 +522,15 @@ impl AuthorizationEventActor {
             &[b"test"],
             None,
         )
+    }
+}
+
+const fn proof_transport_code(transport: ProofTransport) -> i16 {
+    match transport {
+        ProofTransport::Nip42 => 1,
+        ProofTransport::Nip98 => 2,
+        ProofTransport::GitSmartHttpSession => 3,
+        ProofTransport::Blossom => 4,
     }
 }
 
@@ -1261,7 +1386,97 @@ pub(crate) async fn event_capacity_is_configured_tx(
     Ok(configured.unwrap_or(false))
 }
 
+pub(crate) fn validate_authorization_event_capacities(
+    capacities: &[(CommunityId, AuthorizationEventCapacityPolicy)],
+) -> Result<()> {
+    let mut domains = HashSet::with_capacity(capacities.len());
+    for (community_id, _) in capacities {
+        if community_id.as_uuid().is_nil() || !domains.insert(*community_id) {
+            return Err(DbError::InvalidData(
+                "authorization event capacity domain set is invalid".to_owned(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+pub(crate) async fn reconcile_authorization_event_capacities_tx(
+    transaction: &mut Transaction<'_, Postgres>,
+    capacities: &[(CommunityId, AuthorizationEventCapacityPolicy)],
+) -> Result<()> {
+    for (community_id, policy) in capacities {
+        install_authorization_event_capacity_tx(transaction, *community_id, *policy).await?;
+        let max_events = i64::try_from(policy.max_events_per_domain()).map_err(|_| {
+            DbError::InvalidData("authorization event capacity is out of range".to_owned())
+        })?;
+        let max_bytes = i64::try_from(policy.max_bytes_per_domain()).map_err(|_| {
+            DbError::InvalidData("authorization byte capacity is out of range".to_owned())
+        })?;
+        let max_envelope = i32::try_from(policy.max_envelope_bytes()).map_err(|_| {
+            DbError::InvalidData("authorization envelope capacity is out of range".to_owned())
+        })?;
+
+        sqlx::query(
+            "INSERT INTO authorization_operator_preauth_denial_capacity \
+             (community_id,max_events_per_domain,max_bytes_per_domain,max_envelope_bytes) \
+             VALUES ($1,$2,$3,$4) ON CONFLICT (community_id) DO NOTHING",
+        )
+        .bind(community_id.as_uuid())
+        .bind(max_events)
+        .bind(max_bytes)
+        .bind(max_envelope)
+        .execute(&mut **transaction)
+        .await?;
+
+        let preauth = sqlx::query(
+            "SELECT max_events_per_domain,max_bytes_per_domain,max_envelope_bytes, \
+                    retained_event_count,retained_envelope_bytes \
+             FROM authorization_operator_preauth_denial_capacity \
+             WHERE community_id=$1 FOR UPDATE",
+        )
+        .bind(community_id.as_uuid())
+        .fetch_one(&mut **transaction)
+        .await?;
+        let exact = preauth.try_get::<i64, _>("max_events_per_domain")? == max_events
+            && preauth.try_get::<i64, _>("max_bytes_per_domain")? == max_bytes
+            && preauth.try_get::<i32, _>("max_envelope_bytes")? == max_envelope;
+        let retained_events: i64 = preauth.try_get("retained_event_count")?;
+        let retained_bytes: i64 = preauth.try_get("retained_envelope_bytes")?;
+        if !exact
+            || retained_events < 0
+            || retained_events > max_events
+            || retained_bytes < 0
+            || retained_bytes > max_bytes
+        {
+            return Err(DbError::InvalidData(
+                "operator pre-auth denial capacity conflicts with installed policy".to_owned(),
+            ));
+        }
+    }
+    Ok(())
+}
+
 impl Db {
+    /// Atomically install and reconcile the complete enabled-domain capacity set.
+    pub async fn reconcile_authorization_event_capacities(
+        &self,
+        capacities: &[(CommunityId, AuthorizationEventCapacityPolicy)],
+    ) -> Result<()> {
+        validate_authorization_event_capacities(capacities)?;
+        if capacities.is_empty() {
+            return Ok(());
+        }
+        let mut transaction = self.pool.begin().await?;
+        if let Err(error) =
+            reconcile_authorization_event_capacities_tx(&mut transaction, capacities).await
+        {
+            transaction.rollback().await?;
+            return Err(error);
+        }
+        transaction.commit().await?;
+        Ok(())
+    }
+
     /// Install the immutable capacity policy for one enabled domain.
     ///
     /// Exact replay is accepted; changed limits require offline migration.
@@ -1270,12 +1485,8 @@ impl Db {
         community_id: CommunityId,
         policy: AuthorizationEventCapacityPolicy,
     ) -> Result<()> {
-        crate::authorization_events::install_authorization_event_capacity(
-            self,
-            community_id,
-            policy,
-        )
-        .await
+        self.reconcile_authorization_event_capacities(&[(community_id, policy)])
+            .await
     }
 
     /// Permanently latch one domain's audit capacity unhealthy.
@@ -1392,7 +1603,10 @@ fn is_capacity_constraint(error: &sqlx::Error) -> bool {
     })
 }
 
-fn canonical_event_envelope(event: &NewAuthorizationEvent, occurred_at: DateTime<Utc>) -> Vec<u8> {
+pub(crate) fn canonical_event_envelope(
+    event: &NewAuthorizationEvent,
+    occurred_at: DateTime<Utc>,
+) -> Vec<u8> {
     let actor = (event.actor_fingerprint != [0; 32]).then(|| hex::encode(event.actor_fingerprint));
     let subject =
         (event.subject_fingerprint != [0; 32]).then(|| hex::encode(event.subject_fingerprint));

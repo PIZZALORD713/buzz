@@ -6,6 +6,21 @@
 //! immutable lifecycle history, binding generation, and authorization event in
 //! one transaction under the migration-owned P/X/Y/Q lock order.
 
+mod operator;
+
+pub(crate) use operator::{
+    identity_principal_fingerprint, prepare_admission_loss, prepare_provision_binding,
+    prepare_verified_operator_transition, AdmissionLossOperationIdentity,
+    AuthenticatedLifecycleActor, ExactAdmissionLossTarget, PreparedDirectEnrollmentRejection,
+    PreparedDirectEnrollmentWriteFailure, PreparedOperatorLifecycleRejection,
+    PreparedOperatorLifecycleWriteFailure, RetiringBindingAuthority, TrustedAdmissionLossCause,
+};
+pub use operator::{
+    IdentityBindingEvidence, IdentityBindingProvenance, IdentityLifecycleDenial,
+    IdentityLifecycleFailure, IdentityLifecycleObservation, IdentityLifecycleTransition,
+    PersistedIdentityLifecycleOutcome, PreparedAdmissionLoss, PreparedDirectEnrollment,
+    PreparedProvisionBinding,
+};
 use std::fmt;
 
 use buzz_auth::VerifiedIdentityBindingEvidence;

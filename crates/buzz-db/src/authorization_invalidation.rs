@@ -25,6 +25,7 @@ use crate::{
         NewAuthorizationEvent,
     },
     authorization_version::{
+        advance_retiring_binding_authority_tx,
         authorization_version_delegated_relationship_component_key,
         authorization_version_invalidation_generation_component_key, load_manifest_connection,
         record_authorization_operation_version_delta_tx, AuthorizationAuthorityEpochAdvance,
@@ -32,6 +33,7 @@ use crate::{
         AuthorizationOperationVersionDeltaManifest, AuthorizationProtectedObjectKind,
         AuthorizationVersionComponentKind, ProtectedPublicationDependency,
     },
+    identity_lifecycle::RetiringBindingAuthority,
     Db, DbError, Result,
 };
 
@@ -509,6 +511,47 @@ impl fmt::Debug for AuthorizationInvalidationAdvance {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str("AuthorizationInvalidationAdvance([REDACTED])")
     }
+}
+
+/// Opaque complete authority/invalidation advance owned by one lifecycle transaction.
+pub(crate) struct OpaqueLifecycleAuthorityAdvance {
+    deltas: Vec<AuthorizationOperationVersionDelta>,
+}
+
+impl OpaqueLifecycleAuthorityAdvance {
+    pub(crate) fn into_deltas(self) -> Vec<AuthorizationOperationVersionDelta> {
+        self.deltas
+    }
+}
+
+impl fmt::Debug for OpaqueLifecycleAuthorityAdvance {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("OpaqueLifecycleAuthorityAdvance([REDACTED])")
+    }
+}
+
+pub(crate) async fn apply_retiring_binding_authority_tx(
+    transaction: &mut Transaction<'_, Postgres>,
+    authority: RetiringBindingAuthority,
+) -> Result<OpaqueLifecycleAuthorityAdvance> {
+    let community_id = authority.community_id();
+    let operation_id = authority.operation_id();
+    let request_fingerprint = authority.request_fingerprint();
+    let (binding_id, binding_version) = authority.binding();
+    let selector = AuthorizationInvalidationSelector::binding(binding_id, binding_version)?;
+    let authority_advance = advance_retiring_binding_authority_tx(transaction, &authority).await?;
+    let advance = apply_admission_loss_invalidation_tx(
+        transaction,
+        community_id,
+        operation_id,
+        request_fingerprint,
+        &[selector],
+        authority_advance,
+    )
+    .await?;
+    Ok(OpaqueLifecycleAuthorityAdvance {
+        deltas: advance.into_deltas(),
+    })
 }
 
 /// Advance invalidation for one exact local admission loss inside the

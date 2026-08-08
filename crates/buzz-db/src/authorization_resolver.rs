@@ -6,9 +6,9 @@
 use std::fmt;
 
 use buzz_auth::{
-    ActiveLocalBinding, BindingResolutionRequest, CurrentBindingStatusEvidenceRequest,
+    ActiveLocalBinding, AuthContext, BindingResolutionRequest, CurrentBindingStatusEvidenceRequest,
     LocalAuthorizationPolicy, LocalBindingResolution, LocalBindingResolver,
-    LocalBindingResolverCapability,
+    LocalBindingResolverCapability, VerifiedProvisionBindingIntent,
 };
 use buzz_core::{AuthorizationLeaseFence, CanonicalCurrentBindingEvidence, CommunityId};
 use chrono::{DateTime, Utc};
@@ -18,7 +18,20 @@ use sqlx::Row;
 use thiserror::Error;
 
 use crate::{
+    authorization_events::{resolve_local_admission_loss_actor_tx, LocalAdmissionLossCause},
+    authorization_policy::AuthorizationEnrollmentMode,
     authorization_version::{protected_object_key, AuthorizationProtectedObjectKind},
+    identity_lifecycle::{
+        identity_principal_fingerprint, prepare_admission_loss, prepare_provision_binding,
+        AdmissionLossOperationIdentity, AuthenticatedLifecycleActor, ExactAdmissionLossTarget,
+        IdentityLifecycleFailure, PreparedAdmissionLoss, PreparedProvisionBinding,
+        TrustedAdmissionLossCause,
+    },
+    operator_lifecycle::{
+        OperatorAuthenticationDenialReason, OperatorLifecycleIntent,
+        OperatorPreauthDenialPersistenceError, OperatorPreauthDenialWrite,
+        OperatorProvisionAuthenticationAttempt, PreparedOperatorAuthenticationDenial,
+    },
     Db, DbError,
 };
 
@@ -69,6 +82,224 @@ pub enum AuthorizationResolverError {
     /// The exact local policy or protected authority snapshot is unavailable.
     #[error("local authorization policy is unavailable")]
     PolicyUnavailable,
+}
+/// Fail-closed direct enrollment preparation failures.
+#[derive(Debug, Error)]
+pub enum ProviderFreeEnrollmentError {
+    /// Origin-sealed evidence coordinates did not form a direct request.
+    #[error("direct enrollment evidence is invalid")]
+    InvalidEvidence,
+    /// The configured posture requires separate provisioning authority.
+    #[error("direct enrollment is unavailable under provisioned mode")]
+    ProvisioningRequired,
+    /// The active policy row is missing, expired, or malformed.
+    #[error("direct enrollment policy is unavailable")]
+    PolicyUnavailable,
+    /// Canonical lifecycle preparation failed closed.
+    #[error(transparent)]
+    Lifecycle(#[from] IdentityLifecycleFailure),
+    /// PostgreSQL failed or returned malformed authoritative state.
+    #[error(transparent)]
+    Database(#[from] DbError),
+}
+
+/// Concrete provider-free enrollment and local authority-loss preparer.
+#[derive(Clone)]
+pub struct ProviderFreeEnrollmentRuntime {
+    db: Db,
+}
+
+impl ProviderFreeEnrollmentRuntime {
+    /// Install against the same authoritative database used by finalization
+    /// and operation restore.
+    pub fn new(db: Db) -> Self {
+        Self { db }
+    }
+
+    /// Seal one separately approved Provisioned binding after matching the
+    /// exact current policy row to the verifier-owned intent.
+    pub async fn prepare_provision_binding(
+        &self,
+        intent: &VerifiedProvisionBindingIntent,
+    ) -> Result<PreparedProvisionBinding, ProviderFreeEnrollmentError> {
+        let policy =
+            read_current_enrollment_policy(&self.db, intent.authorization_domain()).await?;
+        if policy.mode != AuthorizationEnrollmentMode::Provisioned
+            || policy.revision != intent.policy_revision()
+            || policy.digest != intent.policy_digest()
+        {
+            return Err(ProviderFreeEnrollmentError::PolicyUnavailable);
+        }
+        prepare_provision_binding(intent).map_err(Into::into)
+    }
+
+    /// Durably record a credential-free lifecycle denial without occupying
+    /// the intent's canonical operation receipt.
+    pub async fn record_operator_authentication_denial(
+        &self,
+        intent: &OperatorLifecycleIntent,
+        reason: OperatorAuthenticationDenialReason,
+    ) -> Result<OperatorPreauthDenialWrite, OperatorPreauthDenialPersistenceError> {
+        let prepared = PreparedOperatorAuthenticationDenial::from_lifecycle_intent(intent)
+            .map_err(|_| OperatorPreauthDenialPersistenceError::CorruptStoredResult)?;
+        self.db
+            .record_operator_authentication_denial(&prepared, reason)
+            .await
+    }
+
+    /// Seal every bounded Provision body into a redaction-safe authentication
+    /// attempt. Malformed or incomplete bodies remain durably auditable; raw
+    /// bytes and principal coordinates are not retained in the result.
+    pub fn prepare_operator_provision_authentication_attempt(
+        &self,
+        authorization_domain: CommunityId,
+        bounded_request_body: &[u8],
+    ) -> OperatorProvisionAuthenticationAttempt {
+        OperatorProvisionAuthenticationAttempt::from_bounded_body(
+            self.db.clone(),
+            authorization_domain,
+            bounded_request_body,
+        )
+    }
+
+    /// Prepare one exact current-binding authority loss from an origin-sealed
+    /// finalized route and a same-snapshot authoritative binding recheck.
+    /// Callers cannot supply target coordinates, cause labels, or actor data.
+    pub async fn prepare_admission_loss(
+        &self,
+        context: &AuthContext,
+    ) -> Result<PreparedAdmissionLoss, ProviderFreeEnrollmentError> {
+        let domain = context.authorization_domain();
+        let (binding_id, binding_version) = context.binding();
+        let event_author = context.actor_pubkey().to_bytes();
+        let mut transaction = self.db.pool.begin().await.map_err(DbError::from)?;
+        sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
+            .execute(&mut *transaction)
+            .await
+            .map_err(DbError::from)?;
+        let row = sqlx::query(
+            "SELECT issuer,subject,principal_fingerprint,event_author_pubkey,lifecycle_revision \
+             FROM identity_bindings WHERE community_id=$1 AND binding_id=$2 \
+               AND binding_version=$3 AND binding_state=1 \
+               AND event_author_pubkey=$4 \
+               AND (expires_at IS NULL OR expires_at > clock_timestamp())",
+        )
+        .bind(domain.as_uuid())
+        .bind(binding_id)
+        .bind(
+            i64::try_from(binding_version)
+                .map_err(|_| ProviderFreeEnrollmentError::InvalidEvidence)?,
+        )
+        .bind(event_author.as_slice())
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(DbError::from)?
+        .ok_or(ProviderFreeEnrollmentError::InvalidEvidence)?;
+        let principal_fingerprint = bytes32(
+            row.try_get("principal_fingerprint")
+                .map_err(DbError::from)?,
+            "admission-loss principal fingerprint",
+        )?;
+        let issuer: String = row.try_get("issuer").map_err(DbError::from)?;
+        let subject: String = row.try_get("subject").map_err(DbError::from)?;
+        if principal_fingerprint != identity_principal_fingerprint(domain, &issuer, &subject) {
+            return Err(ProviderFreeEnrollmentError::Database(DbError::InvalidData(
+                "admission-loss principal fingerprint is inconsistent".to_owned(),
+            )));
+        }
+        let stored_author = bytes32(
+            row.try_get("event_author_pubkey").map_err(DbError::from)?,
+            "admission-loss event author",
+        )?;
+        let lifecycle_revision = database_u64(
+            row.try_get("lifecycle_revision").map_err(DbError::from)?,
+            "lifecycle revision",
+        )?;
+        let canonical_actor = resolve_local_admission_loss_actor_tx(
+            &mut transaction,
+            domain,
+            LocalAdmissionLossCause::Binding {
+                binding_id,
+                binding_version,
+            },
+        )
+        .await?;
+        transaction.commit().await.map_err(DbError::from)?;
+        let actor = AuthenticatedLifecycleActor::from_sealed_event_actor(
+            *context.request_fingerprint(),
+            canonical_actor,
+        )?;
+        prepare_admission_loss(
+            AdmissionLossOperationIdentity::new(
+                domain,
+                uuid::Uuid::new_v4(),
+                uuid::Uuid::new_v4(),
+                uuid::Uuid::new_v4(),
+            )?,
+            ExactAdmissionLossTarget::from_authoritative_binding(
+                binding_id,
+                binding_version,
+                lifecycle_revision,
+                principal_fingerprint,
+                stored_author,
+            )?,
+            TrustedAdmissionLossCause::LocalBinding,
+            actor,
+        )
+        .map_err(Into::into)
+    }
+}
+
+impl fmt::Debug for ProviderFreeEnrollmentRuntime {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("ProviderFreeEnrollmentRuntime([REDACTED])")
+    }
+}
+
+struct CurrentEnrollmentPolicy {
+    revision: u64,
+    mode: AuthorizationEnrollmentMode,
+    digest: [u8; 32],
+}
+
+async fn read_current_enrollment_policy(
+    db: &Db,
+    domain: CommunityId,
+) -> Result<CurrentEnrollmentPolicy, ProviderFreeEnrollmentError> {
+    let row = sqlx::query(
+        "SELECT policy_revision,enrollment_mode,policy_digest \
+         FROM identity_enrollment_policies WHERE community_id=$1 \
+           AND effective_at <= clock_timestamp() \
+           AND (expires_at IS NULL OR expires_at > clock_timestamp()) \
+         ORDER BY policy_revision DESC LIMIT 1",
+    )
+    .bind(domain.as_uuid())
+    .fetch_optional(&db.pool)
+    .await
+    .map_err(DbError::from)?
+    .ok_or(ProviderFreeEnrollmentError::PolicyUnavailable)?;
+    let revision = database_u64(
+        row.try_get("policy_revision").map_err(DbError::from)?,
+        "enrollment policy revision",
+    )?;
+    let mode = match row
+        .try_get::<i16, _>("enrollment_mode")
+        .map_err(DbError::from)?
+    {
+        1 => AuthorizationEnrollmentMode::AttestedKey,
+        2 => AuthorizationEnrollmentMode::Provisioned,
+        3 => AuthorizationEnrollmentMode::RiskLabelledTofu,
+        _ => return Err(ProviderFreeEnrollmentError::PolicyUnavailable),
+    };
+    let digest = bytes32(
+        row.try_get("policy_digest").map_err(DbError::from)?,
+        "enrollment policy digest",
+    )?;
+    Ok(CurrentEnrollmentPolicy {
+        revision,
+        mode,
+        digest,
+    })
 }
 
 impl PostgresLocalBindingResolver {
