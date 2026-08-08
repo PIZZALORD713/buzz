@@ -1388,6 +1388,38 @@ impl Db {
         owner_pubkey: Option<&str>,
         identity_configuration: Option<AttestedIdentityConfiguration>,
     ) -> Result<EnsuredCommunityRecord> {
+        self.ensure_community_with_attested_identity(
+            normalized_host,
+            owner_pubkey,
+            identity_configuration,
+            false,
+        )
+        .await
+    }
+
+    /// Ensure the deployment community after atomically importing legacy members.
+    pub async fn ensure_deployment_community_with_attested_identity(
+        &self,
+        normalized_host: &str,
+        owner_pubkey: Option<&str>,
+        identity_configuration: Option<AttestedIdentityConfiguration>,
+    ) -> Result<EnsuredCommunityRecord> {
+        self.ensure_community_with_attested_identity(
+            normalized_host,
+            owner_pubkey,
+            identity_configuration,
+            true,
+        )
+        .await
+    }
+
+    async fn ensure_community_with_attested_identity(
+        &self,
+        normalized_host: &str,
+        owner_pubkey: Option<&str>,
+        identity_configuration: Option<AttestedIdentityConfiguration>,
+        import_legacy_allowlist: bool,
+    ) -> Result<EnsuredCommunityRecord> {
         let mut transaction = self.pool.begin().await?;
         let row = sqlx::query(
             r#"
@@ -1414,6 +1446,9 @@ impl Db {
                 configuration.event_capacity(),
             )
             .await?;
+        }
+        if import_legacy_allowlist {
+            relay_members::backfill_from_allowlist_tx(&mut transaction, community_id).await?;
         }
         if let Some(owner_pubkey) = owner_pubkey {
             relay_members::bootstrap_owner_tx(&mut transaction, community_id, owner_pubkey).await?;

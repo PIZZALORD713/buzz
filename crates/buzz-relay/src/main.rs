@@ -270,11 +270,12 @@ async fn main() -> anyhow::Result<()> {
     // (`relay_url_authority` → `normalize_host`), so the bootstrapped owner lands
     // in exactly the community that live requests for this host will resolve to.
     //
-    // `ensure_configured_community` is idempotent, so this is safe to run every
-    // startup. An empty authority (unparseable `relay_url`)
+    // The deployment-specific ensure is idempotent and atomically orders legacy
+    // allowlist backfill before configured-owner bootstrap, so this is safe to
+    // run every startup. An empty authority (unparseable `relay_url`)
     // is a misconfiguration — fail fast when membership is enforced rather than
     // seeding an empty-host community that no request can ever resolve to.
-    let deployment_community = {
+    {
         let host = buzz_relay::tenant::relay_url_authority(&config.relay_url);
         if host.is_empty() {
             if config.require_relay_membership {
@@ -287,10 +288,9 @@ async fn main() -> anyhow::Result<()> {
                 relay_url = %config.relay_url,
                 "Could not derive a community host from relay_url; skipping membership backfill/bootstrap (non-fatal, membership not required)"
             );
-            None
         } else {
             match db
-                .ensure_configured_community_with_attested_identity(
+                .ensure_deployment_community_with_attested_identity(
                     &host,
                     config.relay_owner_pubkey.as_deref(),
                     identity_configuration,
@@ -299,7 +299,6 @@ async fn main() -> anyhow::Result<()> {
             {
                 Ok(record) => {
                     info!(host = %record.host, community = %record.id, "Deployment community ensured");
-                    Some(record.id)
                 }
                 Err(e) => {
                     if config.require_relay_membership {
@@ -309,55 +308,6 @@ async fn main() -> anyhow::Result<()> {
                         ));
                     }
                     error!("Failed to ensure deployment community (non-fatal, membership not required): {e}");
-                    None
-                }
-            }
-        }
-    };
-
-    // NIP-43: migrate any existing pubkey_allowlist entries to relay_members.
-    // Idempotent — safe to run every startup. Must run before bootstrap_owner
-    // so that existing allowlist users become relay members before the owner
-    // is promoted (otherwise enabling membership locks everyone out).
-    if let Some(community) = deployment_community {
-        match db.backfill_from_allowlist(community).await {
-            Ok(0) => {}
-            Ok(n) => info!("Backfilled {n} pubkey_allowlist entries into relay_members"),
-            Err(e) => {
-                if config.require_relay_membership {
-                    error!(
-                        "Fatal: failed to backfill allowlist with membership enforcement enabled: {e}"
-                    );
-                    return Err(anyhow::anyhow!(
-                        "Failed to backfill pubkey_allowlist (required when BUZZ_REQUIRE_RELAY_MEMBERSHIP=true): {e}"
-                    ));
-                } else {
-                    error!("Failed to backfill pubkey_allowlist (non-fatal): {e}");
-                }
-            }
-        }
-    }
-
-    // NIP-43: ensure the configured relay owner always holds the owner role
-    // within the deployment community.
-    if let (Some(community), Some(owner_pubkey)) =
-        (deployment_community, config.relay_owner_pubkey.as_ref())
-    {
-        match db.bootstrap_owner(community, owner_pubkey).await {
-            Ok(()) => info!(pubkey = %owner_pubkey, "Relay owner bootstrapped"),
-            Err(e) => {
-                if config.require_relay_membership {
-                    // Membership enforcement is on — a missing owner means no one
-                    // can administer the relay. Fail fast rather than silently start
-                    // in a broken state.
-                    error!("Fatal: failed to bootstrap relay owner with membership enforcement enabled: {e}");
-                    return Err(anyhow::anyhow!(
-                        "Failed to bootstrap relay owner (required when BUZZ_REQUIRE_RELAY_MEMBERSHIP=true): {e}"
-                    ));
-                } else {
-                    error!(
-                        "Failed to bootstrap relay owner (non-fatal, membership not required): {e}"
-                    );
                 }
             }
         }

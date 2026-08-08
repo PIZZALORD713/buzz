@@ -616,7 +616,7 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires an isolated Postgres database migrated through 0031"]
-    async fn postgres_configured_community_owner_policy_is_one_atomic_outcome() {
+    async fn postgres_configured_community_owner_policy_and_legacy_backfill_are_atomic() {
         let (db, pool) = isolated_database("identity_policy_provision").await;
         let explicit_capacity = capacity(10_000, 16 * 1024 * 1024, 16 * 1024);
         let configuration = AttestedIdentityConfiguration::new([21_u8; 32], explicit_capacity)
@@ -684,6 +684,128 @@ mod tests {
         .await
         .expect("read atomically ensured configuration");
         assert_eq!(ensured_joined, (1, 1, 1));
+
+        let upgraded_host = format!("legacy-upgrade-{}.example", Uuid::new_v4().simple());
+        let upgraded_id: Uuid =
+            sqlx::query_scalar("INSERT INTO communities (host) VALUES ($1) RETURNING id")
+                .bind(&upgraded_host)
+                .fetch_one(&pool)
+                .await
+                .expect("insert legacy deployment community");
+        for legacy_pubkey in [[31_u8; 32], [32_u8; 32]] {
+            sqlx::query(
+                "INSERT INTO pubkey_allowlist (community_id,pubkey,note) \
+                 VALUES ($1,$2,'legacy deployment member')",
+            )
+            .bind(upgraded_id)
+            .bind(legacy_pubkey.as_slice())
+            .execute(&pool)
+            .await
+            .expect("insert legacy allowlisted member");
+        }
+        let upgraded = db
+            .ensure_deployment_community_with_attested_identity(
+                &upgraded_host,
+                Some(owner),
+                Some(configuration),
+            )
+            .await
+            .expect("atomically upgrade legacy members before owner");
+        assert_eq!(*upgraded.id.as_uuid(), upgraded_id);
+        let upgraded_retry = db
+            .ensure_deployment_community_with_attested_identity(
+                &upgraded_host,
+                Some(owner),
+                Some(configuration),
+            )
+            .await
+            .expect("exact legacy deployment retry");
+        assert_eq!(upgraded_retry.id, upgraded.id);
+        let upgraded_members: Vec<(String, String)> = sqlx::query_as(
+            "SELECT pubkey,role FROM relay_members WHERE community_id=$1 ORDER BY pubkey",
+        )
+        .bind(upgraded_id)
+        .fetch_all(&pool)
+        .await
+        .expect("read upgraded legacy membership");
+        assert_eq!(
+            upgraded_members,
+            vec![
+                (hex::encode([31_u8; 32]), "member".to_owned()),
+                (hex::encode([32_u8; 32]), "member".to_owned()),
+                (owner.to_owned(), "owner".to_owned()),
+            ]
+        );
+        let upgraded_configuration: (i64, i64) = sqlx::query_as(
+            "SELECT \
+             (SELECT count(*) FROM authorization_event_capacity WHERE community_id=$1),\
+             (SELECT count(*) FROM identity_enrollment_policies WHERE community_id=$1)",
+        )
+        .bind(upgraded_id)
+        .fetch_one(&pool)
+        .await
+        .expect("read exact upgraded configuration");
+        assert_eq!(upgraded_configuration, (1, 1));
+
+        let failed_host = format!("legacy-upgrade-failure-{}.example", Uuid::new_v4().simple());
+        let failed_id: Uuid =
+            sqlx::query_scalar("INSERT INTO communities (host) VALUES ($1) RETURNING id")
+                .bind(&failed_host)
+                .fetch_one(&pool)
+                .await
+                .expect("insert failing legacy deployment community");
+        sqlx::query(
+            "INSERT INTO pubkey_allowlist (community_id,pubkey,note) \
+             VALUES ($1,$2,'rollback legacy member')",
+        )
+        .bind(failed_id)
+        .bind([41_u8; 32].as_slice())
+        .execute(&pool)
+        .await
+        .expect("insert rollback allowlisted member");
+        sqlx::query(
+            "CREATE FUNCTION reject_fixture_owner_v1() RETURNS trigger AS $$ \
+             BEGIN \
+               IF NEW.pubkey = 'dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd' \
+                  AND NEW.role = 'owner' THEN \
+                 RAISE EXCEPTION 'fixture owner rejection'; \
+               END IF; \
+               RETURN NEW; \
+             END; $$ LANGUAGE plpgsql",
+        )
+        .execute(&pool)
+        .await
+        .expect("install owner failure function");
+        sqlx::query(
+            "CREATE TRIGGER reject_fixture_owner \
+             BEFORE INSERT OR UPDATE ON relay_members \
+             FOR EACH ROW EXECUTE FUNCTION reject_fixture_owner_v1()",
+        )
+        .execute(&pool)
+        .await
+        .expect("install owner failure trigger");
+        let failed_owner = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
+        assert!(
+            db.ensure_deployment_community_with_attested_identity(
+                &failed_host,
+                Some(failed_owner),
+                Some(configuration),
+            )
+            .await
+            .is_err(),
+            "owner failure must abort legacy backfill and configuration",
+        );
+        let failed_residue: (i64, i64, i64) = sqlx::query_as(
+            "SELECT \
+             (SELECT count(*) FROM relay_members WHERE community_id=$1),\
+             (SELECT count(*) FROM authorization_event_capacity WHERE community_id=$1),\
+             (SELECT count(*) FROM identity_enrollment_policies WHERE community_id=$1)",
+        )
+        .bind(failed_id)
+        .fetch_one(&pool)
+        .await
+        .expect("read rolled-back deployment upgrade");
+        assert_eq!(failed_residue, (0, 0, 0));
 
         let off_host = format!("identity-off-{}.example", Uuid::new_v4().simple());
         let off = db

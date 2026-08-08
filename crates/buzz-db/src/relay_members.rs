@@ -638,12 +638,22 @@ pub async fn transfer_ownership(
 /// The empty-table guard prevents re-adding members that were intentionally
 /// removed by an admin after the initial backfill.
 pub async fn backfill_from_allowlist(pool: &PgPool, community: CommunityId) -> Result<u64> {
+    let mut transaction = pool.begin().await?;
+    let inserted = backfill_from_allowlist_tx(&mut transaction, community).await?;
+    transaction.commit().await?;
+    Ok(inserted)
+}
+
+pub(crate) async fn backfill_from_allowlist_tx(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    community: CommunityId,
+) -> Result<u64> {
     // Check if pubkey_allowlist table exists.
     let exists: bool = sqlx::query_scalar(
         "SELECT EXISTS (SELECT 1 FROM information_schema.tables \
          WHERE table_schema = 'public' AND table_name = 'pubkey_allowlist')",
     )
-    .fetch_one(pool)
+    .fetch_one(&mut **transaction)
     .await?;
 
     if !exists {
@@ -656,7 +666,7 @@ pub async fn backfill_from_allowlist(pool: &PgPool, community: CommunityId) -> R
     let has_members: bool =
         sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM relay_members WHERE community_id = $1)")
             .bind(community.as_uuid())
-            .fetch_one(pool)
+            .fetch_one(&mut **transaction)
             .await?;
 
     if has_members {
@@ -671,7 +681,7 @@ pub async fn backfill_from_allowlist(pool: &PgPool, community: CommunityId) -> R
          ON CONFLICT (community_id, pubkey) DO NOTHING",
     )
     .bind(community.as_uuid())
-    .execute(pool)
+    .execute(&mut **transaction)
     .await?;
 
     Ok(result.rows_affected())
