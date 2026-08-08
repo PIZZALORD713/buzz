@@ -100,7 +100,7 @@ mod tests {
     use super::*;
     use std::collections::BTreeSet;
 
-    const TEST_DB_URL: &str = "postgres://buzz:buzz_dev@localhost:5432/buzz";
+    const TEST_DB_URL: &str = "postgres://buzz:buzz_dev@localhost:5432/buzz"; // sadscan:disable np.postgres.1
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     enum ConstraintKind {
@@ -561,7 +561,7 @@ mod tests {
         let mut migrations: Vec<_> = MIGRATOR.iter().collect();
         migrations.sort_by_key(|migration| migration.version);
 
-        assert_eq!(migrations.len(), 28);
+        assert_eq!(migrations.len(), 30);
         assert_eq!(migrations[0].version, 1);
         assert_eq!(&*migrations[0].description, "initial schema");
         assert!(migrations[0]
@@ -916,40 +916,67 @@ mod tests {
         assert!(heartbeat.contains("epoch"));
         assert!(heartbeat.contains("INSERT INTO replica_heartbeat (id) VALUES (1)"));
         assert!(heartbeat.contains("_operator_global_tables"));
+        // Channel-id lookup index (0027): serves the tenant-independent
+        // `channels` lookups that carry no community_id predicate, which no
+        // community_id-leading index can satisfy. Covering + partial so the
+        // planner can go index-only; asserted NOT UNIQUE because `id` alone is
+        // not unique in this table (the same channel id may exist under more
+        // than one community), so a unique index would encode a false
+        // constraint and fail to build on such a database.
+        assert_eq!(migrations[26].version, 27);
+        let channel_id_index = migrations[26].sql.as_str();
+        assert!(channel_id_index.contains("idx_channels_id_live"));
+        assert!(channel_id_index.contains("INCLUDE (community_id)"));
+        assert!(channel_id_index.contains("WHERE deleted_at IS NULL"));
+        assert!(
+            !channel_id_index.contains("CREATE UNIQUE INDEX"),
+            "channels.id is not unique across communities — index must not be UNIQUE",
+        );
+        assert!(
+            desired_schema.contains("idx_channels_id_live"),
+            "desired-state schema must carry the channel-id lookup index",
+        );
+
+        assert_eq!(migrations[27].version, 28);
+        let long_reactions = migrations[27].sql.as_str();
+        assert!(
+            long_reactions.contains("ALTER TABLE reactions ALTER COLUMN emoji TYPE VARCHAR(66)")
+        );
+        assert!(desired_schema.contains("emoji               VARCHAR(66) NOT NULL"));
 
         // Relay-verified identity bindings are additive and community-scoped.
-        assert_eq!(migrations[26].version, 27);
-        assert!(migrations[26]
+        assert_eq!(migrations[28].version, 29);
+        assert!(migrations[28]
             .sql
             .as_str()
             .contains("CREATE TABLE identity_bindings"));
-        assert!(migrations[26]
+        assert!(migrations[28]
             .sql
             .as_str()
             .contains("idx_identity_bindings_active_principal"));
-        assert_eq!(migrations[27].version, 28);
-        assert!(migrations[27].sql.as_str().contains("revocation_scope"));
-        assert!(migrations[27]
+        assert_eq!(migrations[29].version, 30);
+        assert!(migrations[29].sql.as_str().contains("revocation_scope"));
+        assert!(migrations[29]
             .sql
             .as_str()
             .contains("idx_identity_bindings_revoked_principal"));
-        assert!(migrations[27]
+        assert!(migrations[29]
             .sql
             .as_str()
             .contains("CREATE TABLE identity_principals"));
-        assert!(migrations[27]
+        assert!(migrations[29]
             .sql
             .as_str()
             .contains("INSERT INTO identity_principals"));
-        assert!(migrations[27]
+        assert!(migrations[29]
             .sql
             .as_str()
             .contains("INSERT INTO identity_revoked_keys"));
-        assert!(migrations[27]
+        assert!(migrations[29]
             .sql
             .as_str()
             .contains("rotation_completed_at"));
-        assert!(migrations[27]
+        assert!(migrations[29]
             .sql
             .as_str()
             .contains("CREATE TABLE identity_revoked_keys"));
@@ -1195,7 +1222,7 @@ mod tests {
         run_migrations(&pool)
             .await
             .expect("retry succeeds after operator repair");
-        assert_eq!(applied_versions(&pool).await.last().copied(), Some(28));
+        assert_eq!(applied_versions(&pool).await.last().copied(), Some(30));
     }
 
     #[tokio::test]

@@ -5,7 +5,6 @@ import type {
 } from "@tanstack/react-query";
 import * as React from "react";
 import {
-  keepPreviousData,
   useInfiniteQuery,
   useMutation,
   useQuery,
@@ -41,6 +40,10 @@ import {
   shouldFetchAvatar,
   resolveAvatarDataUrl,
 } from "@/features/profile/lib/selfProfileStorage";
+import {
+  resolveUserLabelPlaceholderData,
+  writeCachedUserLabels,
+} from "@/features/profile/lib/userLabelStorage";
 import { useCommunities } from "@/features/communities/useCommunities";
 import { updateCachedChannelMemberDisplayName } from "@/features/channels/channelMemberProfileCache";
 import { useVerifiedIdentityExpiryRevision } from "@/shared/hooks/useVerifiedIdentityExpiry";
@@ -386,6 +389,8 @@ export function useUsersBatchQuery(
   },
 ) {
   const queryClient = useQueryClient();
+  const { activeCommunity } = useCommunities();
+  const relayUrl = activeCommunity?.relayUrl ?? "";
   const normalizedPubkeys = [
     ...new Set(pubkeys.map((pubkey) => pubkey.toLowerCase())),
   ]
@@ -421,6 +426,9 @@ export function useUsersBatchQuery(
       }
       if (toFetch.length > 0) {
         const fresh = await getUsersBatch(toFetch);
+        if (relayUrl) {
+          writeCachedUserLabels(relayUrl, fresh.profiles, fresh.missing);
+        }
         for (const pubkey of toFetch) {
           const summary = fresh.profiles[pubkey] ?? null;
           queryClient.setQueryData<UsersBatchEntry>(
@@ -436,7 +444,12 @@ export function useUsersBatchQuery(
     // Loading older messages grows the pubkey set, which changes this query's
     // key entirely. Without this, already-resolved authors would flash back
     // to their raw pubkey while the larger batch refetches.
-    placeholderData: keepPreviousData,
+    placeholderData: (previousData) =>
+      resolveUserLabelPlaceholderData(
+        previousData,
+        relayUrl,
+        normalizedPubkeys,
+      ),
     staleTime: 60_000,
     gcTime: 5 * 60 * 1_000,
   });
@@ -444,6 +457,9 @@ export function useUsersBatchQuery(
   // Seed individual "user-profile" cache entries so avatar clicks are instant
   // cache hits instead of fresh network requests.
   React.useEffect(() => {
+    // Persisted labels are intentionally presentation-only. Wait for a relay
+    // result before seeding profile-detail caches that also carry ownership.
+    if (query.dataUpdatedAt === 0) return;
     const profiles = query.data?.profiles;
     if (!profiles) return;
     for (const [pubkey, summary] of Object.entries(profiles)) {
@@ -460,7 +476,7 @@ export function useUsersBatchQuery(
           },
       );
     }
-  }, [query.data, queryClient]);
+  }, [query.data, query.dataUpdatedAt, queryClient]);
 
   const profiles = useCurrentVerifiedIdentityRecord(query.data?.profiles);
   return profiles === query.data?.profiles
