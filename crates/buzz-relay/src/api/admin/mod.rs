@@ -4339,9 +4339,10 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires Postgres — 9044 adapter against processing report fails cleanly"]
     async fn community_9044_through_actual_adapter_against_processing_report() {
-        // Drive through `handle_resolve` — the actual 9044 command handler that
-        // routes through `resolve_report_decision_only` — against a report already
-        // in 'processing'. The CAS must fail cleanly — no orphan audit row.
+        // Drive through `handle_moderation_command` — the production dispatch boundary
+        // that performs ban checks, freshness checks, kind routing, and actor derivation —
+        // against a report already in 'processing'. The CAS must fail cleanly —
+        // no orphan audit row.
         use nostr::{EventBuilder, Kind, Tag};
 
         let pool = e2e_pool().await;
@@ -4364,10 +4365,6 @@ mod tests {
         .execute(&pool)
         .await
         .expect("insert owner");
-
-        // Also insert the actor as a community_bans row (required by ensure_actor_not_banned
-        // via moderation_restriction_state check in handle_moderation_command — but we call
-        // handle_resolve directly so this is not needed; kept here for clarity).
 
         // Create a report with a known report_event_id (needed for the `report` tag).
         let uid = uuid::Uuid::new_v4();
@@ -4413,9 +4410,11 @@ mod tests {
         .await
         .expect("enforcement claim");
 
-        // Community 9044 path — drive through handle_resolve, which calls
-        // resolve_report_decision_only → resolve_report_decision_atomic.
-        // Construct a kind-9044 event with the required tags.
+        // Community 9044 path — drive through handle_moderation_command, which
+        // performs ban checks, freshness validation, kind dispatch, actor derivation,
+        // and ultimately resolves via resolve_report_decision_only →
+        // resolve_report_decision_atomic. Construct a kind-9044 event signed with
+        // current time so the freshness check passes (±120 s window).
         let event = EventBuilder::new(Kind::Custom(9044), "")
             .tags([
                 Tag::parse(["report", &report_event_id_hex]).unwrap(),
@@ -4425,11 +4424,8 @@ mod tests {
             .sign_with_keys(&actor_keys)
             .expect("sign 9044 event");
 
-        let result = crate::handlers::moderation_commands::handle_resolve(
-            &tenant,
-            &state,
-            &event,
-            &actor_pubkey,
+        let result = crate::handlers::moderation_commands::handle_moderation_command(
+            &tenant, &state, &event,
         )
         .await;
 
@@ -4807,7 +4803,10 @@ mod tests {
         //
         // The failure is induced AFTER tenant resolution, inside `emit_system_message`'s
         // `insert_event` call, by:
-        //  1. Setting the `buzz.created_at_floor` replica-fence GUC at DB level.
+        //  1. Building a dedicated test pool whose `after_connect` sets the
+        //     `buzz.created_at_floor` GUC session-locally (not database-globally).
+        //     Every connection from that pool inherits the floor; no other pool or
+        //     test is affected, and there is no cleanup race on panic.
         //  2. Backdating the outbox row's `created_at` beyond that floor.
         //  `emit_system_message` derives the Nostr event's `created_at` from
         //  `row.created_at` (the idempotency timestamp). With the floor active, the
@@ -4927,20 +4926,33 @@ mod tests {
         .await
         .expect("backdate outbox created_at");
 
-        // Arm the replica-fence GUC at DB level so new connections from the pool
-        // inherit it. A floor of 5 s means any event with created_at > 5 s ago
-        // is rejected. Our event's created_at will be ~10 s ago → trigger fires.
-        sqlx::query("ALTER DATABASE buzz SET \"buzz.created_at_floor\" TO 5")
-            .execute(&pool)
+        // Build a dedicated pool whose after_connect sets buzz.created_at_floor = 5
+        // session-locally on each connection (set_config 3rd arg false = session scope).
+        // A floor of 5 s means any event with created_at > 5 s ago is rejected.
+        // Our outbox row's created_at is ~10 s ago → trigger fires on insert_event.
+        // This pool is fully isolated: no other pool or test is affected, and there
+        // is no cleanup dependence (dropping the pool closes all its connections).
+        let db_url = std::env::var("BUZZ_TEST_DATABASE_URL")
+            .unwrap_or_else(|_| "postgres://buzz:buzz_dev@localhost:5432/buzz".to_string());
+        let floor_pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(4)
+            .after_connect(|conn, _meta| {
+                Box::pin(async move {
+                    sqlx::query("SELECT set_config('buzz.created_at_floor', '5', false)")
+                        .execute(conn)
+                        .await?;
+                    Ok(())
+                })
+            })
+            .connect(&db_url)
             .await
-            .expect("set floor GUC");
+            .expect("connect floor pool");
 
-        // Build a fresh AppState (new pool). New connections from this pool inherit
-        // the DB-level GUC we just set, so `deliver_one`'s `insert_event` call will
-        // use a connection where the deferrable trigger is active.
-        let fresh_state = state_from_pool(e2e_pool().await).await;
+        // Build an AppState around the floor pool so deliver_one's insert_event call
+        // runs on a connection where the deferrable trigger is active.
+        let fresh_state = state_from_pool(floor_pool.clone()).await;
 
-        // Claim it so deliver_one has a real claim token.
+        // Claim the row via the floor pool so deliver_one has a real claim token.
         let lease_until = chrono::Utc::now() + chrono::Duration::seconds(30);
         let mut batch = fresh_state
             .db
@@ -4958,11 +4970,9 @@ mod tests {
         // NOT mark_outbox_delivered.
         crate::handlers::admin_outbox_worker::deliver_one(&fresh_state, &row).await;
 
-        // Reset the floor GUC so subsequent tests are not affected.
-        sqlx::query("ALTER DATABASE buzz RESET \"buzz.created_at_floor\"")
-            .execute(&pool)
-            .await
-            .expect("reset floor GUC");
+        // Drop the floor pool — all its connections close, GUC vanishes with them.
+        // No ALTER DATABASE, no global state, no reset required.
+        drop(floor_pool);
 
         // No tombstone event was persisted — the failure was inside insert_event.
         let post_event_count: i64 = sqlx::query_scalar(
@@ -5002,11 +5012,13 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires Postgres — reporter notice idempotency under concurrent delivery"]
     async fn reporter_notice_duplicate_delivery_persists_exactly_one() {
-        // Two workers race to deliver the same reporter_notice outbox row. The
-        // C3 fix makes notices deterministic (stable event ID from outbox created_at),
-        // so both workers produce byte-identical Nostr events. insert_event's
-        // ON CONFLICT DO NOTHING deduplicates at the DB level: exactly one notice
-        // is persisted regardless of which worker inserts first.
+        // Two workers race to deliver the same reporter_notice outbox row.
+        // Worker A holds a stale (expired) token; worker B holds the current
+        // (reclaimed) token. Both derive the same Nostr event from the row's
+        // immutable `created_at`, so both insert_event calls produce the same
+        // event ID → ON CONFLICT DO NOTHING ensures exactly one durable notice.
+        // Worker A's mark_outbox_delivered fails the claim-token fence (C2);
+        // worker B's succeeds. The row ends delivered and owned only by B's token.
         let pool = e2e_pool().await;
         let (community_id, _host) = e2e_community(&pool, "notice-overlap").await;
         let target = vec![31u8; 32];
@@ -5084,68 +5096,102 @@ mod tests {
         .await
         .expect("reporter_notice outbox row");
 
-        // Simulate worker A and worker B: claim two copies with different tokens
-        // by manually inserting a second outbox row pointing to the same action
-        // (simulates two pods each claiming and delivering the same logical notice).
-        // In practice the fencing prevents double-completion, but we want to test
-        // that TWO concurrent insert_event calls produce only ONE durable notice.
-        //
-        // To drive this through deliver_one without depending on claim-token races,
-        // we build TWO OutboxRecords with the same created_at (same idempotency_ts)
-        // and different claim_tokens, then call deliver_one with each sequentially.
-        let notice_record: buzz_db::relay_admin_actions::OutboxRecord = {
+        // Pre-warm: deliver once through the full production path so the DM channel
+        // is created (open_dm is check-then-insert; concurrent creation races on the
+        // unique participant_hash index). After this delivery the DM channel exists,
+        // so both concurrent workers will hit the idempotent fast path. Delete the
+        // resulting events and reset the outbox row so the actual overlap test starts
+        // from a clean state.
+        let state = state_from_pool(pool.clone()).await;
+        {
             let lease_until = chrono::Utc::now() + chrono::Duration::seconds(30);
-            let batch = {
-                let state_a = state_from_pool(pool.clone()).await;
-                state_a
-                    .db
-                    .claim_pending_admin_outbox_batch("notice-worker-a", lease_until, 100)
-                    .await
-                    .expect("claim batch a")
-            };
+            let warm_batch = state
+                .db
+                .claim_pending_admin_outbox_batch("notice-warmup", lease_until, 100)
+                .await
+                .expect("warmup claim batch");
+            let warm_row = warm_batch
+                .into_iter()
+                .find(|r| r.id == notice_outbox_id)
+                .expect("notice row in warmup batch");
+            crate::handlers::admin_outbox_worker::deliver_one(&state, &warm_row).await;
+        }
+        // Delete the events produced by the warm-up (kind:9 notice + discovery/profile
+        // events) so the concurrent test proves fresh insertion, not dedup against
+        // warm-up artefacts.
+        sqlx::query("DELETE FROM events WHERE community_id = $1")
+            .bind(community_id)
+            .execute(&pool)
+            .await
+            .expect("delete warmup events");
+        // Reset outbox row to pending so it can be re-claimed.
+        sqlx::query(
+            "UPDATE relay_admin_outbox SET state = 'pending', outbox_claim_token = NULL, \
+             held_by = NULL, lease_expires_at = NULL, attempt_count = 0 WHERE id = $1",
+        )
+        .bind(notice_outbox_id)
+        .execute(&pool)
+        .await
+        .expect("reset outbox row for overlap test");
+
+        // Worker A claims the outbox row and captures the stable created_at.
+        let lease_until_a = chrono::Utc::now() + chrono::Duration::seconds(30);
+        let record_a: buzz_db::relay_admin_actions::OutboxRecord = {
+            let state_a = state_from_pool(pool.clone()).await;
+            let batch = state_a
+                .db
+                .claim_pending_admin_outbox_batch("notice-worker-a", lease_until_a, 100)
+                .await
+                .expect("claim batch a");
             batch
                 .into_iter()
                 .find(|r| r.id == notice_outbox_id)
                 .expect("notice row in batch a")
         };
+        // Capture the immutable idempotency timestamp — both workers will derive
+        // the same Nostr event ID from this.
+        let idempotency_ts = record_a.created_at;
 
-        let state = state_from_pool(pool.clone()).await;
-
-        // Worker A delivers.
-        crate::handlers::admin_outbox_worker::deliver_one(&state, &notice_record).await;
-
-        // Manually reset the outbox row to `pending` so worker B can claim it.
-        // Expire the lease so claim_pending_admin_outbox_batch sees it as available.
+        // Simulate worker A's lease expiring and worker B reclaiming the row:
+        // assign a fresh token_b. This does NOT change created_at (the immutable
+        // idempotency anchor), so both workers still produce the same Nostr event.
+        let token_b = uuid::Uuid::new_v4();
         sqlx::query(
-            "UPDATE relay_admin_outbox SET state = 'pending', outbox_claim_token = NULL, \
-             held_by = 'notice-worker-b', lease_expires_at = now() - interval '1 second' \
+            "UPDATE relay_admin_outbox \
+             SET outbox_claim_token = $2, held_by = 'notice-worker-b', \
+                 lease_expires_at = now() + interval '30 seconds' \
              WHERE id = $1",
         )
         .bind(notice_outbox_id)
+        .bind(token_b)
         .execute(&pool)
         .await
-        .expect("reset row for worker b");
+        .expect("reassign token to worker b");
 
-        // Build worker B's OutboxRecord (same created_at, different token).
-        // We re-claim via the batch helper so we get the canonical record shape.
-        let record_b: buzz_db::relay_admin_actions::OutboxRecord = {
-            let batch_b = state
-                .db
-                .claim_pending_admin_outbox_batch(
-                    "notice-worker-b2",
-                    chrono::Utc::now() + chrono::Duration::seconds(30),
-                    100,
-                )
-                .await
-                .expect("claim batch b2");
-            batch_b
-                .into_iter()
-                .find(|r| r.id == notice_outbox_id)
-                .expect("notice row in batch b2")
+        // Build record_b directly from the same immutable row fields but with the
+        // current (B) token. record_a keeps the stale (A) token — it is now a
+        // "ghost" delivery from the expired worker.
+        let record_b = buzz_db::relay_admin_actions::OutboxRecord {
+            id: record_a.id,
+            action_id: record_a.action_id,
+            task_type: record_a.task_type.clone(),
+            payload: record_a.payload.clone(),
+            state: record_a.state.clone(),
+            dedup_key: record_a.dedup_key.clone(),
+            error_message: None,
+            attempt_count: record_a.attempt_count,
+            claim_token: token_b,
+            created_at: idempotency_ts, // same as record_a — same Nostr event ID
         };
 
-        // Worker B delivers — same created_at → same Nostr event ID → ON CONFLICT DO NOTHING.
-        crate::handlers::admin_outbox_worker::deliver_one(&state, &record_b).await;
+        // Run both deliveries concurrently. Both call insert_event with the same
+        // event ID → ON CONFLICT DO NOTHING. Worker A's mark_outbox_delivered is
+        // rejected by the C2 token fence (token_a ≠ token_b in DB). Worker B's
+        // mark_outbox_delivered succeeds.
+        let (_, _) = tokio::join!(
+            crate::handlers::admin_outbox_worker::deliver_one(&state, &record_a),
+            crate::handlers::admin_outbox_worker::deliver_one(&state, &record_b),
+        );
 
         // Assert: exactly one notice event (kind:9) with the specific report_id
         // source tag is persisted. The moderation_source tag carries report_id
@@ -5169,6 +5215,23 @@ mod tests {
         assert_eq!(
             total_notices, 1,
             "exactly one notice event must be persisted after two concurrent deliveries (ON CONFLICT DO NOTHING dedup)"
+        );
+
+        // Assert: row is delivered and owned only by token_b (worker B).
+        let (row_state, row_token): (String, uuid::Uuid) = sqlx::query_as(
+            "SELECT state, outbox_claim_token FROM relay_admin_outbox WHERE id = $1",
+        )
+        .bind(notice_outbox_id)
+        .fetch_one(&pool)
+        .await
+        .expect("fetch row state");
+        assert_eq!(
+            row_state, "delivered",
+            "row must be delivered after worker B completes"
+        );
+        assert_eq!(
+            row_token, token_b,
+            "row claim token must belong to worker B (stale A token must not rewrite)"
         );
     }
 }
