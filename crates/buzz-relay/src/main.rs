@@ -35,6 +35,29 @@ fn buzz_auto_migrate_enabled(value: Option<&str>) -> bool {
     })
 }
 
+fn configured_operator_lifecycle_policy(
+    origin: Option<&str>,
+    configured_pubkeys: &[String],
+) -> anyhow::Result<Option<(String, Arc<buzz_auth::OperatorLifecycleVerifier>)>> {
+    if configured_pubkeys.is_empty() {
+        return Ok(None);
+    }
+
+    let origin = origin
+        .filter(|origin| !origin.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("operator API origin is required"))?;
+    let pubkeys = configured_pubkeys
+        .iter()
+        .map(|value| {
+            nostr::PublicKey::from_hex(value)
+                .map_err(|_| anyhow::anyhow!("invalid configured operator public key"))
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    let verifier = buzz_auth::OperatorLifecycleVerifier::new(pubkeys)
+        .map_err(|_| anyhow::anyhow!("invalid operator verifier configuration"))?;
+    Ok(Some((origin.to_owned(), Arc::new(verifier))))
+}
+
 /// Controls how many per-community gauge series the usage poller emits.
 ///
 /// Datadog cost is proportional to the number of unique time-series.  With ~25
@@ -82,6 +105,51 @@ impl EmissionScope {
 }
 
 const USAGE_METRICS_LOCK_KEY: i64 = 0x4255_5A5A_4D45_5452;
+
+async fn admit_object_store(
+    store: &buzz_relay::api::git::store::GitStore,
+    required: bool,
+) -> anyhow::Result<()> {
+    if std::env::var("BUZZ_GIT_CONFORMANCE_PROBE")
+        .map(|value| value == "false")
+        .unwrap_or(false)
+    {
+        if required {
+            return Err(anyhow::anyhow!(
+                "operation restore requires the object-store CAS conformance gate"
+            ));
+        }
+        return Ok(());
+    }
+    let race_width = std::env::var("BUZZ_GIT_PROBE_WRITERS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(32);
+    let race_rounds = std::env::var("BUZZ_GIT_PROBE_ROUNDS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(3);
+    let cfg = buzz_relay::api::git::store::ProbeConfig {
+        race_width,
+        race_rounds,
+    };
+    tracing::info!(
+        race_width,
+        race_rounds,
+        "running object-store conformance probe (A3 gate)"
+    );
+    let report = store
+        .run_conformance_probe(cfg)
+        .await
+        .map_err(|error| anyhow::anyhow!("object-store conformance probe failed: {error}"))?;
+    tracing::info!(
+        race_width = report.race_width,
+        race_rounds = report.race_rounds,
+        transport_drops = report.transport_drops,
+        "object-store backend admitted: A3 conformance probe passed"
+    );
+    Ok(())
+}
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -143,6 +211,16 @@ async fn main() -> anyhow::Result<()> {
         error!("Invalid configuration: {e}");
         anyhow::anyhow!("Configuration error: {e}")
     })?;
+    // Parse the complete deployment-operator set before opening any service.
+    // A single malformed key rejects the whole set; no partial verifier can be
+    // installed or exposed by the optional router.
+    let operator_lifecycle_policy = configured_operator_lifecycle_policy(
+        config.relay_operator_api_origin.as_deref(),
+        &config.relay_operator_pubkeys,
+    )?;
+    buzz_relay::authorization_runtime::ProviderFreeV1Composition::preflight(
+        &config.nip_fi_authorization,
+    )?;
     info!(
         bind_addr = %config.bind_addr,
         relay_url = %config.relay_url,
@@ -437,6 +515,94 @@ async fn main() -> anyhow::Result<()> {
     );
     let state = Arc::new(app_state);
 
+    let protected_enforce = state
+        .config
+        .nip_fi_authorization
+        .iter()
+        .any(|configuration| configuration.mode() == buzz_auth::NipFiMode::Enforce);
+    // Enforce shares this conditional-write backend with Git. Admit its CAS
+    // behavior before the first restore floor or owner intent is touched.
+    if protected_enforce {
+        admit_object_store(&state.git_store, true).await?;
+    }
+
+    // Build every provider-free dependency before exposing any protected
+    // route. The stock empty configuration is strict Off and performs no
+    // protected resolver/listener I/O. A partial or unhealthy Enforce domain
+    // aborts startup instead of falling back to legacy routing.
+    let operation_restore = if protected_enforce {
+        // Witness reads use an independently constructed primary-PostgreSQL
+        // pool, never the writer transaction's pool or a lagging read replica.
+        let witness_db = Db::new(&DbConfig {
+            database_url: state.config.database_url.clone(),
+            read_database_url: None,
+            max_connections: state.config.db_read_pool_size.unwrap_or(2).max(1),
+            read_max_connections: None,
+            min_connections: 1,
+            replica_read_max_age_ms: 0,
+            ..DbConfig::default()
+        })
+        .await
+        .map_err(|error| anyhow::anyhow!("operation restore witness DB failed: {error}"))?;
+        let fence_pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(
+                buzz_relay::authorization_runtime::PRODUCTION_OPERATION_FENCE_CONNECTIONS,
+            )
+            .min_connections(0)
+            .acquire_timeout(std::time::Duration::from_millis(150))
+            .connect(&state.config.database_url)
+            .await
+            .map_err(|error| anyhow::anyhow!("operation restore fence DB failed: {error}"))?;
+        let restore_domains = state
+            .config
+            .nip_fi_authorization
+            .iter()
+            .filter(|configuration| configuration.mode() == buzz_auth::NipFiMode::Enforce)
+            .map(|configuration| {
+                configuration
+                    .restore_bootstrap_id()
+                    .map(|bootstrap| (configuration.authorization_domain(), bootstrap))
+                    .ok_or_else(|| anyhow::anyhow!("Enforce restore bootstrap is missing"))
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        Some(
+            buzz_relay::authorization_runtime::OperationRestoreRuntime::with_default_lease(
+                state.db.clone(),
+                witness_db,
+                fence_pool,
+                state.config.media.clone(),
+                restore_domains,
+            )?,
+        )
+    } else {
+        None
+    };
+    let provider_free_authorization =
+        buzz_relay::authorization_runtime::ProviderFreeV1Composition::build(
+            state.db.clone(),
+            state.relay_keypair.clone(),
+            state.config.nip_fi_authorization.clone(),
+            operation_restore,
+        )
+        .await?;
+    state.install_provider_free_authorization(provider_free_authorization.clone())?;
+    if let Some((origin, verifier)) = operator_lifecycle_policy {
+        let runtime = buzz_relay::operator_runtime::OperatorLifecycleRuntime::production(
+            &origin,
+            verifier,
+            state.nip98_replay.clone(),
+            provider_free_authorization,
+        )
+        .map_err(|_| anyhow::anyhow!("invalid operator lifecycle runtime configuration"))?;
+        if !runtime.healthy().await {
+            return Err(anyhow::anyhow!(
+                "operator lifecycle runtime is unhealthy during startup"
+            ));
+        }
+        state.install_operator_lifecycle_runtime(Arc::new(runtime))?;
+        info!("Operator lifecycle runtime installed");
+    }
+
     // Inter-relay mesh (BUZZ_MESH seam). `boot_mesh` returns None when the
     // kill switch is off — nothing is bound, published, or spawned, so the
     // relay behaves byte-identically to a build without the mesh. When
@@ -465,42 +631,10 @@ async fn main() -> anyhow::Result<()> {
         info!(runtime_id = %runtime_id, "Inter-relay mesh started");
     }
 
-    // Git-on-object-storage: admit the configured S3/MinIO backend against the
-    // linearizable conditional-write axiom (A3) before serving git traffic.
-    // Failure is fatal: a backend that cannot satisfy pointer CAS invalidates
-    // the manifest-pointer protocol. This is a deployment gate, not a proof.
-    if std::env::var("BUZZ_GIT_CONFORMANCE_PROBE")
-        .map(|v| v != "false")
-        .unwrap_or(true)
-    {
-        let race_width = std::env::var("BUZZ_GIT_PROBE_WRITERS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(32);
-        let race_rounds = std::env::var("BUZZ_GIT_PROBE_ROUNDS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(3);
-        let cfg = buzz_relay::api::git::store::ProbeConfig {
-            race_width,
-            race_rounds,
-        };
-        tracing::info!(
-            race_width,
-            race_rounds,
-            "running git object-store conformance probe (A3 gate)"
-        );
-        let report = state
-            .git_store
-            .run_conformance_probe(cfg)
-            .await
-            .map_err(|e| anyhow::anyhow!("git conformance probe failed: {e}"))?;
-        tracing::info!(
-            race_width = report.race_width,
-            race_rounds = report.race_rounds,
-            transport_drops = report.transport_drops,
-            "git object-store backend admitted: A3 conformance probe passed"
-        );
+    // Preserve the stock/deny startup order: Git's existing deployment gate
+    // remains after mesh startup when no protected restore runtime uses it.
+    if !protected_enforce {
+        admit_object_store(&state.git_store, false).await?;
     }
 
     // NIP-43: reconcile the event-backed roster for every provisioned
@@ -1962,9 +2096,9 @@ mod tests {
     use uuid::Uuid;
 
     use super::{
-        buzz_auto_migrate_enabled, dropped_in_memory_keys, idle_timeout_secs,
-        refresh_legacy_active_gauge_recency, run_periodic_until_cancelled, EmissionScope,
-        InMemoryMetricKey,
+        buzz_auto_migrate_enabled, configured_operator_lifecycle_policy, dropped_in_memory_keys,
+        idle_timeout_secs, refresh_legacy_active_gauge_recency, run_periodic_until_cancelled,
+        EmissionScope, InMemoryMetricKey,
     };
     use metrics::GaugeFn;
     use metrics_util::{
@@ -2010,6 +2144,29 @@ mod tests {
         assert!(buzz_auto_migrate_enabled(Some(" 1 ")));
         assert!(buzz_auto_migrate_enabled(Some("yes")));
         assert!(buzz_auto_migrate_enabled(Some("on")));
+    }
+
+    #[test]
+    fn empty_operator_configuration_installs_no_runtime_policy() {
+        assert!(configured_operator_lifecycle_policy(None, &[])
+            .expect("empty policy")
+            .is_none());
+    }
+
+    #[test]
+    fn operator_configuration_is_parsed_atomically() {
+        let valid = nostr::Keys::generate().public_key().to_hex();
+        assert!(configured_operator_lifecycle_policy(
+            Some("https://operator.example"),
+            &[valid.clone(), "not-a-public-key".to_owned()],
+        )
+        .is_err());
+        assert!(configured_operator_lifecycle_policy(None, std::slice::from_ref(&valid)).is_err());
+        assert!(
+            configured_operator_lifecycle_policy(Some("https://operator.example"), &[valid])
+                .expect("valid operator policy")
+                .is_some()
+        );
     }
 
     #[test]

@@ -10,9 +10,9 @@ use axum::{
     extract::{ConnectInfo, FromRequest, MatchedPath, State, WebSocketUpgrade},
     http::{HeaderMap, Request, StatusCode},
     middleware::{self, Next},
-    response::{IntoResponse, Json},
-    routing::{get, post, put},
-    Router,
+    response::{IntoResponse, Json, Response},
+    routing::{any, get, post},
+    Extension, Router,
 };
 use serde_json::json;
 use tower::ServiceExt;
@@ -33,24 +33,15 @@ use crate::state::AppState;
 /// Pure Nostr protocol: WebSocket (NIP-01), HTTP bridge (NIP-98), media (Blossom),
 /// git (smart HTTP), NIP-05, and health probes.
 pub fn build_router(state: Arc<AppState>) -> Router {
-    let media_body_limit = state
-        .config
-        .media
-        .max_image_bytes
-        .max(state.config.media.max_video_bytes) as usize;
-    let media_router = Router::new()
-        .route("/upload", put(api::media::upload_blob))
-        .route("/media/upload", put(api::media::upload_blob))
-        .route(
-            "/media/{sha256_ext}",
-            get(api::media::get_blob).head(api::media::head_blob),
-        )
-        .layer(RequestBodyLimitLayer::new(media_body_limit))
-        .with_state(state.clone());
-
-    let git_router = api::git::git_router(state.clone());
+    let protected_topology_router = protected_topology_router(state.clone());
 
     let git_policy_router = api::git::git_policy_router(state.clone());
+
+    // The deployment-operator surface is all-or-nothing. Snapshot the
+    // startup-installed runtime exactly once so an absent configuration leaves
+    // both lifecycle and provision routes genuinely unmounted.
+    let operator_lifecycle_router =
+        api::operator::lifecycle_router(state.operator_lifecycle_runtime().cloned());
 
     let admin_enabled = state.config.admin.is_some();
     let admin_web_dir = state
@@ -136,8 +127,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
     // Merge — each sub-router carries its own body limit.
     // Metrics → Trace → CORS applied once over the combined router.
     let mut merged = api_router
-        .merge(media_router)
-        .merge(git_router)
+        .merge(protected_topology_router)
         .merge(git_policy_router);
     if let Some(admin_router) = admin_router {
         merged = merged.merge(admin_router);
@@ -188,17 +178,155 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         merged = merged.fallback_service(spa_fallback);
     }
 
+    // Every existing registered route must be present in the centralized
+    // corporate-identity inventory. The deployment-global lifecycle router is
+    // merged only afterward because its own pre-body verifier is the sole
+    // admission authority for that distinct control plane.
+    merged = merged.route_layer(middleware::from_fn_with_state(
+        state.clone(),
+        enforce_corporate_identity_route_inventory,
+    ));
+    if let Some(operator_lifecycle_router) = operator_lifecycle_router {
+        merged = merged.merge(operator_lifecycle_router);
+    }
+
     merged
-        // Every registered route must be present in the centralized policy
-        // inventory. When the gate is enabled, an unclassified route fails
-        // before its handler can perform reads or writes.
-        .route_layer(middleware::from_fn_with_state(
-            state.clone(),
-            enforce_corporate_identity_route_inventory,
-        ))
         .layer(middleware::from_fn(track_metrics))
         .layer(http_trace_layer())
         .layer(build_cors_layer(&state.config.cors_origins))
+}
+
+#[derive(Clone)]
+struct ProtectedTopologyState {
+    app: Arc<AppState>,
+    legacy: Router,
+    protected: Router,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProtectedTopologySelection {
+    Legacy,
+    Deny,
+    Protected,
+}
+
+fn select_protected_topology(mode: buzz_auth::NipFiMode) -> ProtectedTopologySelection {
+    match mode {
+        buzz_auth::NipFiMode::Off => ProtectedTopologySelection::Legacy,
+        buzz_auth::NipFiMode::DenyProtected => ProtectedTopologySelection::Deny,
+        buzz_auth::NipFiMode::Enforce => ProtectedTopologySelection::Protected,
+    }
+}
+
+fn protected_topology_router(state: Arc<AppState>) -> Router {
+    let media_body_limit = state
+        .config
+        .media
+        .max_image_bytes
+        .max(state.config.media.max_video_bytes) as usize;
+    let legacy_media = Router::new()
+        .route("/upload", axum::routing::put(api::media::upload_blob))
+        .route("/media/upload", axum::routing::put(api::media::upload_blob))
+        .route(
+            "/media/{sha256_ext}",
+            get(api::media::get_blob).head(api::media::head_blob),
+        )
+        .layer(RequestBodyLimitLayer::new(media_body_limit))
+        .with_state(state.clone());
+    let legacy = legacy_media.merge(api::git::git_router(state.clone()));
+    let protected = api::media::protected_media_router(state.clone())
+        .merge(api::git::protected_git_router(state.clone()));
+    let topology = Arc::new(ProtectedTopologyState {
+        app: state,
+        legacy,
+        protected,
+    });
+    Router::new()
+        .route("/upload", any(dispatch_protected_topology))
+        .route("/media/upload", any(dispatch_protected_topology))
+        .route("/media/{sha256_ext}", any(dispatch_protected_topology))
+        .route(
+            "/git/{owner}/{repo}/info/refs",
+            any(dispatch_protected_topology),
+        )
+        .route(
+            "/git/{owner}/{repo}/git-upload-pack",
+            any(dispatch_protected_topology),
+        )
+        .route(
+            "/git/{owner}/{repo}/git-receive-pack",
+            any(dispatch_protected_topology),
+        )
+        .with_state(topology)
+}
+
+async fn dispatch_protected_topology(
+    State(topology): State<Arc<ProtectedTopologyState>>,
+    request: Request<Body>,
+) -> Response {
+    let raw_host = request
+        .headers()
+        .get(axum::http::header::HOST)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("");
+    let tenant = match crate::tenant::bind_community(&topology.app.db, raw_host).await {
+        Ok(tenant) => tenant,
+        Err(_) => {
+            return (
+                StatusCode::NOT_FOUND,
+                "relay: no community is configured for this host",
+            )
+                .into_response();
+        }
+    };
+    match select_protected_topology(topology.app.nip_fi_mode(tenant.community())) {
+        ProtectedTopologySelection::Legacy => topology
+            .legacy
+            .clone()
+            .oneshot(request)
+            .await
+            .unwrap_or_else(|never| match never {}),
+        ProtectedTopologySelection::Deny => {
+            (StatusCode::FORBIDDEN, "protected route denied").into_response()
+        }
+        ProtectedTopologySelection::Protected => {
+            let Some(composition) = topology.app.provider_free_authorization() else {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "protected route unavailable",
+                )
+                    .into_response();
+            };
+            let handle = match composition.protected_publication_handle(tenant.community()) {
+                Ok(handle) => handle,
+                Err(_) => {
+                    return (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "protected route unavailable",
+                    )
+                        .into_response();
+                }
+            };
+            let restore = match composition.operation_restore_runtime(tenant.community()) {
+                Ok(restore) => restore,
+                Err(_) => {
+                    return (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "protected route unavailable",
+                    )
+                        .into_response();
+                }
+            };
+            topology
+                .protected
+                .clone()
+                .layer(Extension(restore))
+                .layer(Extension(handle))
+                .oneshot(request)
+                .await
+                .unwrap_or_else(|never| match never {})
+        }
+    }
 }
 
 async fn enforce_corporate_identity_route_inventory(
@@ -455,16 +583,38 @@ async fn readiness_handler(State(state): State<Arc<AppState>>) -> impl IntoRespo
     let (pg_ok, redis_ok) = tokio::time::timeout(Duration::from_secs(2), check)
         .await
         .unwrap_or((false, false));
+    let authorization_ok = state
+        .provider_free_authorization()
+        .is_none_or(|runtime| runtime.is_healthy());
+    let operator_lifecycle_ok = match state.operator_lifecycle_runtime() {
+        Some(runtime) => runtime.healthy().await,
+        None => true,
+    };
 
-    if pg_ok && redis_ok {
+    if readiness_dependencies_healthy(pg_ok, redis_ok, authorization_ok, operator_lifecycle_ok) {
         (StatusCode::OK, Json(json!({"status": "ready"}))).into_response()
     } else {
         (
             StatusCode::SERVICE_UNAVAILABLE,
-            Json(json!({"status": "not_ready", "postgres": pg_ok, "redis": redis_ok})),
+            Json(json!({
+                "status": "not_ready",
+                "postgres": pg_ok,
+                "redis": redis_ok,
+                "provider_free_authorization": authorization_ok,
+                "operator_lifecycle": operator_lifecycle_ok
+            })),
         )
             .into_response()
     }
+}
+
+fn readiness_dependencies_healthy(
+    postgres: bool,
+    redis: bool,
+    provider_free_authorization: bool,
+    operator_lifecycle: bool,
+) -> bool {
+    postgres && redis && provider_free_authorization && operator_lifecycle
 }
 
 /// Status endpoint — service name, version, uptime.
@@ -517,7 +667,16 @@ fn build_cors_layer(cors_origins: &[String]) -> CorsLayer {
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        convert::Infallible,
+        sync::atomic::{AtomicUsize, Ordering as AtomicOrdering},
+        task::Poll,
+    };
+
+    use async_trait::async_trait;
     use axum::{
+        body::Bytes,
+        http::{header, HeaderValue},
         routing::{get, post},
         Router,
     };
@@ -532,6 +691,388 @@ mod tests {
     use tracing_subscriber::prelude::*;
 
     use super::*;
+
+    struct AlwaysFreshReplayGuard;
+
+    impl buzz_auth::Nip98ReplayGuard for AlwaysFreshReplayGuard {
+        fn try_mark_in_scope<'a>(
+            &'a self,
+            _scope: &'a str,
+            _event_id: &'a nostr::EventId,
+            _ttl_secs: u64,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<bool, buzz_auth::AuthError>> + Send + 'a>,
+        > {
+            Box::pin(async { Ok(true) })
+        }
+
+        fn try_mark_all_in_scope<'a>(
+            &'a self,
+            _scope: &'a str,
+            event_ids: &'a [nostr::EventId],
+            _ttl_secs: u64,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<bool, buzz_auth::AuthError>> + Send + 'a>,
+        > {
+            Box::pin(async move {
+                if !(1..=3).contains(&event_ids.len())
+                    || event_ids
+                        .iter()
+                        .enumerate()
+                        .any(|(index, event_id)| event_ids[..index].contains(event_id))
+                {
+                    return Err(buzz_auth::AuthError::Internal(
+                        "invalid atomic NIP-98 proof set".to_owned(),
+                    ));
+                }
+                Ok(true)
+            })
+        }
+    }
+
+    struct FullRouterOperatorExecutor {
+        mode: buzz_auth::NipFiMode,
+        healthy: bool,
+        calls: AtomicUsize,
+        denials: AtomicUsize,
+        provisions: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl crate::operator_runtime::OperatorLifecycleExecutor for FullRouterOperatorExecutor {
+        fn mode(&self, _domain: buzz_core::CommunityId) -> buzz_auth::NipFiMode {
+            self.mode
+        }
+
+        fn domain_healthy(&self, _domain: buzz_core::CommunityId) -> bool {
+            self.healthy
+        }
+
+        async fn execute(
+            &self,
+            _grant: &buzz_auth::VerifiedOperatorLifecycleGrant,
+            _intent: &buzz_db::operator_lifecycle::OperatorLifecycleIntent,
+        ) -> Result<
+            buzz_db::identity_lifecycle::IdentityLifecycleObservation,
+            buzz_db::operator_lifecycle::OperatorLifecycleError,
+        > {
+            self.calls.fetch_add(1, AtomicOrdering::SeqCst);
+            panic!("method-only routing probe must not execute a lifecycle operation")
+        }
+
+        async fn record_preauth_denial(
+            &self,
+            _intent: &buzz_db::operator_lifecycle::OperatorLifecycleIntent,
+            _reason: buzz_db::operator_lifecycle::OperatorAuthenticationDenialReason,
+        ) -> Result<
+            buzz_db::operator_lifecycle::OperatorPreauthDenialWrite,
+            buzz_db::operator_lifecycle::OperatorPreauthDenialPersistenceError,
+        > {
+            self.denials.fetch_add(1, AtomicOrdering::SeqCst);
+            Ok(buzz_db::operator_lifecycle::OperatorPreauthDenialWrite::Inserted)
+        }
+
+        async fn record_provision_preauth_denial(
+            &self,
+            _domain: buzz_core::CommunityId,
+            _body: &[u8],
+            _reason: buzz_db::operator_lifecycle::OperatorAuthenticationDenialReason,
+        ) -> Result<
+            buzz_db::operator_lifecycle::OperatorPreauthDenialWrite,
+            buzz_db::operator_lifecycle::OperatorPreauthDenialPersistenceError,
+        > {
+            self.denials.fetch_add(1, AtomicOrdering::SeqCst);
+            Ok(buzz_db::operator_lifecycle::OperatorPreauthDenialWrite::Inserted)
+        }
+
+        async fn provision(
+            &self,
+            _intent: &buzz_auth::VerifiedProvisionBindingIntent,
+        ) -> Result<
+            buzz_db::authorization_restore::ProvisionBindingExecution,
+            crate::operator_runtime::OperatorInvocationError,
+        > {
+            self.provisions.fetch_add(1, AtomicOrdering::SeqCst);
+            panic!("method-only routing probe must not provision a binding")
+        }
+
+        fn healthy(&self) -> bool {
+            self.healthy
+        }
+    }
+
+    fn operator_runtime(
+        mode: buzz_auth::NipFiMode,
+        healthy: bool,
+    ) -> (
+        Arc<crate::operator_runtime::OperatorLifecycleRuntime>,
+        Arc<FullRouterOperatorExecutor>,
+    ) {
+        let verifier =
+            buzz_auth::OperatorLifecycleVerifier::new(vec![nostr::Keys::generate().public_key()])
+                .expect("operator verifier");
+        let executor = Arc::new(FullRouterOperatorExecutor {
+            mode,
+            healthy,
+            calls: AtomicUsize::new(0),
+            denials: AtomicUsize::new(0),
+            provisions: AtomicUsize::new(0),
+        });
+        let runtime = Arc::new(
+            crate::operator_runtime::OperatorLifecycleRuntime::new(
+                "https://operator.example",
+                Arc::new(verifier),
+                Arc::new(AlwaysFreshReplayGuard),
+                executor.clone(),
+            )
+            .expect("operator runtime"),
+        );
+        (runtime, executor)
+    }
+
+    fn enforce_operator_runtime() -> Arc<crate::operator_runtime::OperatorLifecycleRuntime> {
+        operator_runtime(buzz_auth::NipFiMode::Enforce, true).0
+    }
+
+    fn counted_body(chunks: Vec<Vec<u8>>, polls: Arc<AtomicUsize>) -> Body {
+        let mut chunks = chunks.into_iter();
+        Body::from_stream(futures_util::stream::poll_fn(move |_| {
+            polls.fetch_add(1, AtomicOrdering::SeqCst);
+            Poll::Ready(
+                chunks
+                    .next()
+                    .map(|chunk| Ok::<Bytes, Infallible>(Bytes::from(chunk))),
+            )
+        }))
+    }
+
+    fn operator_request(
+        domain: uuid::Uuid,
+        host: &str,
+        origin: Option<&str>,
+        body: Body,
+    ) -> Request<Body> {
+        let mut request = Request::builder()
+            .method("POST")
+            .uri(format!(
+                "/operator/communities/{domain}/identity-lifecycle/retire"
+            ))
+            .header(header::HOST, host);
+        if let Some(origin) = origin {
+            request = request.header(header::ORIGIN, origin);
+        }
+        request
+            .extension(ConnectInfo(std::net::SocketAddr::from((
+                [127, 0, 0, 1],
+                9000,
+            ))))
+            .body(body)
+            .expect("operator request")
+    }
+
+    async fn installed_operator_router(
+        mode: buzz_auth::NipFiMode,
+        healthy: bool,
+    ) -> (Router, Arc<FullRouterOperatorExecutor>) {
+        let state = crate::state::tests::test_state().await;
+        let (runtime, executor) = operator_runtime(mode, healthy);
+        state
+            .install_operator_lifecycle_runtime(runtime)
+            .expect("operator runtime installation");
+        (build_router(state), executor)
+    }
+
+    fn assert_no_operator_side_effects(executor: &FullRouterOperatorExecutor) {
+        assert_eq!(executor.calls.load(AtomicOrdering::SeqCst), 0);
+        assert_eq!(executor.denials.load(AtomicOrdering::SeqCst), 0);
+        assert_eq!(executor.provisions.load(AtomicOrdering::SeqCst), 0);
+    }
+
+    #[test]
+    fn protected_route_topology_is_closed_and_mode_first() {
+        assert_eq!(
+            select_protected_topology(buzz_auth::NipFiMode::Off),
+            ProtectedTopologySelection::Legacy
+        );
+        assert_eq!(
+            select_protected_topology(buzz_auth::NipFiMode::DenyProtected),
+            ProtectedTopologySelection::Deny
+        );
+        assert_eq!(
+            select_protected_topology(buzz_auth::NipFiMode::Enforce),
+            ProtectedTopologySelection::Protected
+        );
+    }
+
+    #[test]
+    fn operator_lifecycle_health_is_a_readiness_dependency() {
+        assert!(readiness_dependencies_healthy(true, true, true, true));
+        assert!(!readiness_dependencies_healthy(true, true, true, false));
+        assert!(!readiness_dependencies_healthy(true, true, false, true));
+    }
+
+    #[tokio::test]
+    async fn full_router_mounts_the_installed_operator_runtime_exactly_once() {
+        let absent_state = crate::state::tests::test_state().await;
+        let domain = uuid::Uuid::new_v4();
+        let path = format!("/operator/communities/{domain}/identity-lifecycle/retire");
+        let absent_polls = Arc::new(AtomicUsize::new(0));
+        let absent = build_router(absent_state)
+            .oneshot(operator_request(
+                domain,
+                "operator.example",
+                None,
+                counted_body(
+                    vec![b"unmounted body must not be polled".to_vec()],
+                    Arc::clone(&absent_polls),
+                ),
+            ))
+            .await
+            .expect("absent response");
+        assert_eq!(absent.status(), StatusCode::NOT_FOUND);
+        assert_eq!(absent_polls.load(AtomicOrdering::SeqCst), 0);
+
+        let installed_state = crate::state::tests::test_state().await;
+        installed_state
+            .install_operator_lifecycle_runtime(enforce_operator_runtime())
+            .expect("first runtime installation");
+        assert!(installed_state
+            .install_operator_lifecycle_runtime(enforce_operator_runtime())
+            .is_err());
+        let mounted = build_router(installed_state)
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri(path)
+                    .header(header::HOST, "operator.example")
+                    .extension(ConnectInfo(std::net::SocketAddr::from((
+                        [127, 0, 0, 1],
+                        9000,
+                    ))))
+                    .body(Body::empty())
+                    .expect("mounted request"),
+            )
+            .await
+            .expect("mounted response");
+        assert_eq!(mounted.status(), StatusCode::METHOD_NOT_ALLOWED);
+    }
+
+    #[tokio::test]
+    async fn full_router_preserves_uniform_operator_unavailable_boundary() {
+        let domain = uuid::Uuid::new_v4();
+        let cases = [
+            (
+                "wrong host",
+                buzz_auth::NipFiMode::Enforce,
+                true,
+                "wrong.example",
+                None,
+            ),
+            (
+                "wrong origin",
+                buzz_auth::NipFiMode::Enforce,
+                true,
+                "operator.example",
+                Some("https://wrong.example"),
+            ),
+            (
+                "off",
+                buzz_auth::NipFiMode::Off,
+                true,
+                "operator.example",
+                None,
+            ),
+            (
+                "deny protected",
+                buzz_auth::NipFiMode::DenyProtected,
+                true,
+                "operator.example",
+                None,
+            ),
+            (
+                "unhealthy",
+                buzz_auth::NipFiMode::Enforce,
+                false,
+                "operator.example",
+                None,
+            ),
+        ];
+        let mut expected_headers = None;
+
+        for (label, mode, healthy, host, origin) in cases {
+            let (router, executor) = installed_operator_router(mode, healthy).await;
+            let polls = Arc::new(AtomicUsize::new(0));
+            let response = router
+                .oneshot(operator_request(
+                    domain,
+                    host,
+                    origin,
+                    counted_body(
+                        vec![b"unavailable body must not be polled".to_vec()],
+                        Arc::clone(&polls),
+                    ),
+                ))
+                .await
+                .expect("unavailable response");
+
+            assert_eq!(response.status(), StatusCode::NOT_FOUND, "{label}");
+            assert_eq!(
+                response.headers().get(header::CONTENT_TYPE),
+                Some(&HeaderValue::from_static("application/json")),
+                "{label}"
+            );
+            assert!(response.headers().get(header::RETRY_AFTER).is_none());
+            if let Some(expected_headers) = &expected_headers {
+                assert_eq!(response.headers(), expected_headers, "{label}");
+            } else {
+                expected_headers = Some(response.headers().clone());
+            }
+            let body = axum::body::to_bytes(response.into_body(), 1024)
+                .await
+                .expect("unavailable body");
+            assert_eq!(
+                body.as_ref(),
+                br#"{"error":"operator endpoint unavailable"}"#,
+                "{label}"
+            );
+            assert_eq!(polls.load(AtomicOrdering::SeqCst), 0, "{label}");
+            assert_no_operator_side_effects(&executor);
+        }
+    }
+
+    #[tokio::test]
+    async fn full_router_preserves_operator_body_limit_after_merge() {
+        let domain = uuid::Uuid::new_v4();
+        let (router, executor) =
+            installed_operator_router(buzz_auth::NipFiMode::Enforce, true).await;
+
+        let boundary = router
+            .clone()
+            .oneshot(operator_request(
+                domain,
+                "operator.example",
+                Some("https://operator.example"),
+                Body::from(vec![b' '; 64 * 1024]),
+            ))
+            .await
+            .expect("boundary response");
+        assert_eq!(boundary.status(), StatusCode::BAD_REQUEST);
+
+        let oversized = router
+            .oneshot(operator_request(
+                domain,
+                "operator.example",
+                Some("https://operator.example"),
+                counted_body(
+                    vec![vec![b'a'; 32 * 1024], vec![b'b'; 32 * 1024 + 1]],
+                    Arc::new(AtomicUsize::new(0)),
+                ),
+            ))
+            .await
+            .expect("oversized response");
+        assert_eq!(oversized.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert_no_operator_side_effects(&executor);
+    }
 
     async fn require_route_inventory(
         request: Request<Body>,

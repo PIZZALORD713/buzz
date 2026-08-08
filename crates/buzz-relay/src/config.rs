@@ -4,6 +4,7 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use buzz_auth::AuthorizationEventCapacityPolicy;
+use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tracing::warn;
@@ -132,6 +133,9 @@ pub const MAX_DRAIN_JITTER_MS: u64 = 20_000;
 /// Relay runtime configuration, loaded from environment variables.
 #[derive(Debug, Clone)]
 pub struct Config {
+    /// Complete per-domain provider-free V1 authorization configuration.
+    /// Empty is strict stock Off.
+    pub nip_fi_authorization: Vec<crate::authorization_runtime::BaseV1AuthorizationConfiguration>,
     /// Address the relay HTTP/WebSocket server binds to.
     pub bind_addr: SocketAddr,
     /// Postgres database connection URL.
@@ -267,7 +271,8 @@ pub struct Config {
     /// Every operator NIP-98 `u` tag is verified against this origin, independent
     /// of the inbound HTTP `Host` header and tenant registry. Required when
     /// `RELAY_OPERATOR_PUBKEYS` is non-empty. Set via `RELAY_OPERATOR_API_ORIGIN`
-    /// as an `http://` or `https://` origin with no path, query, or fragment.
+    /// as an HTTPS origin with no credentials, non-default port, path, query,
+    /// or fragment.
     pub relay_operator_api_origin: Option<String>,
 
     /// Deployment-level relay operator pubkeys allowed to use the
@@ -375,6 +380,123 @@ pub struct Config {
     pub serve_git_web_gui: bool,
 }
 
+#[derive(Deserialize)]
+#[serde(tag = "mode", rename_all = "snake_case", deny_unknown_fields)]
+enum RawNipFiDomainConfiguration {
+    DenyProtected { authorization_domain: uuid::Uuid },
+    Enforce(Box<RawNipFiEnforceConfiguration>),
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawNipFiEnforceConfiguration {
+    authorization_domain: uuid::Uuid,
+    issuer: String,
+    audience: String,
+    subject_claim: String,
+    jwks: jsonwebtoken::jwk::JwkSet,
+    assertion_header: String,
+    provenance_header: String,
+    provenance_key_hex: String,
+    maximum_token_age_seconds: u64,
+    clock_skew_seconds: u64,
+    maximum_lease_seconds: u64,
+    max_events_per_domain: u64,
+    max_bytes_per_domain: u64,
+    max_envelope_bytes: u32,
+    policy_revision: u64,
+    enrollment_mode: crate::authorization_runtime::BaseV1EnrollmentMode,
+    nostr_key_claim: Option<String>,
+    risk_acknowledgement: Option<String>,
+    restore_bootstrap_id: uuid::Uuid,
+}
+
+fn parse_nip_fi_authorization(
+) -> Result<Vec<crate::authorization_runtime::BaseV1AuthorizationConfiguration>, ConfigError> {
+    let raw = match std::env::var("BUZZ_NIP_FI_V1_CONFIG_JSON") {
+        Err(std::env::VarError::NotPresent) => return Ok(Vec::new()),
+        Err(error) => {
+            return Err(ConfigError::InvalidValue(format!(
+                "BUZZ_NIP_FI_V1_CONFIG_JSON must be valid UTF-8: {error}"
+            )));
+        }
+        Ok(raw) if raw.trim().is_empty() => return Ok(Vec::new()),
+        Ok(raw) => raw,
+    };
+    let entries: Vec<RawNipFiDomainConfiguration> =
+        serde_json::from_str(&raw).map_err(|error| {
+            ConfigError::InvalidValue(format!(
+                "BUZZ_NIP_FI_V1_CONFIG_JSON must be a complete JSON domain array: {error}"
+            ))
+        })?;
+    let mut configurations = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let configuration = match entry {
+            RawNipFiDomainConfiguration::DenyProtected {
+                authorization_domain,
+            } => crate::authorization_runtime::BaseV1AuthorizationConfiguration::deny_protected(
+                buzz_core::CommunityId::from_uuid(authorization_domain),
+            ),
+            RawNipFiDomainConfiguration::Enforce(configuration) => {
+                let RawNipFiEnforceConfiguration {
+                    authorization_domain,
+                    issuer,
+                    audience,
+                    subject_claim,
+                    jwks,
+                    assertion_header,
+                    provenance_header,
+                    provenance_key_hex,
+                    maximum_token_age_seconds,
+                    clock_skew_seconds,
+                    maximum_lease_seconds,
+                    max_events_per_domain,
+                    max_bytes_per_domain,
+                    max_envelope_bytes,
+                    policy_revision,
+                    enrollment_mode,
+                    nostr_key_claim,
+                    risk_acknowledgement,
+                    restore_bootstrap_id,
+                } = *configuration;
+                let provenance_key = hex::decode(provenance_key_hex).map_err(|_| {
+                    ConfigError::InvalidValue(
+                        "BUZZ_NIP_FI_V1_CONFIG_JSON provenance key is invalid".to_owned(),
+                    )
+                })?;
+                let capacity = AuthorizationEventCapacityPolicy::new(
+                    max_events_per_domain,
+                    max_bytes_per_domain,
+                    max_envelope_bytes,
+                )
+                .map_err(|error| ConfigError::InvalidValue(error.to_string()))?;
+                crate::authorization_runtime::BaseV1AuthorizationConfiguration::enforce_direct(
+                    buzz_core::CommunityId::from_uuid(authorization_domain),
+                    capacity,
+                    policy_revision,
+                    enrollment_mode,
+                    issuer,
+                    audience,
+                    subject_claim,
+                    jwks,
+                    nostr_key_claim,
+                    assertion_header,
+                    provenance_header,
+                    provenance_key,
+                    Duration::from_secs(maximum_token_age_seconds),
+                    Duration::from_secs(clock_skew_seconds),
+                    risk_acknowledgement,
+                    Duration::from_secs(maximum_lease_seconds),
+                    restore_bootstrap_id,
+                )
+            }
+        }
+        .map_err(|error| ConfigError::InvalidValue(error.to_string()))?;
+        configurations.push(configuration);
+    }
+    Ok(configurations)
+}
+
 fn parse_bind_addr(raw: &str) -> Result<SocketAddr, ConfigError> {
     raw.parse::<SocketAddr>()
         .map_err(|e| ConfigError::InvalidBindAddr(e.to_string()))
@@ -430,23 +552,34 @@ fn rate_limit_config_from_env() -> Result<buzz_auth::RateLimitConfig, ConfigErro
 
 fn parse_operator_api_origin(raw: &str) -> Result<String, ConfigError> {
     let raw = raw.trim();
+    if raw.is_empty() || raw.contains(',') || raw.contains('\n') || raw.contains('\r') {
+        return Err(ConfigError::InvalidValue(
+            "RELAY_OPERATOR_API_ORIGIN must contain exactly one unambiguous origin".to_string(),
+        ));
+    }
     let url = url::Url::parse(raw).map_err(|e| {
         ConfigError::InvalidValue(format!("RELAY_OPERATOR_API_ORIGIN is not a valid URL: {e}"))
     })?;
-    if !matches!(url.scheme(), "http" | "https")
-        || url.host().is_none()
+    let host_is_valid = match url.host() {
+        Some(url::Host::Domain(host)) => !host.ends_with('.'),
+        Some(url::Host::Ipv4(_) | url::Host::Ipv6(_)) => true,
+        None => false,
+    };
+    if url.scheme() != "https"
+        || !host_is_valid
         || !url.username().is_empty()
         || url.password().is_some()
+        || url.port().is_some()
         || url.path() != "/"
         || url.query().is_some()
         || url.fragment().is_some()
     {
         return Err(ConfigError::InvalidValue(
-            "RELAY_OPERATOR_API_ORIGIN must be an http(s) origin with no credentials, path, query, or fragment"
+            "RELAY_OPERATOR_API_ORIGIN must be an HTTPS origin with no credentials, non-default port, path, query, or fragment"
                 .to_string(),
         ));
     }
-    Ok(raw.trim_end_matches('/').to_string())
+    Ok(url.origin().ascii_serialization())
 }
 
 const DEFAULT_PUSH_GATEWAY_DELIVERY_URL: &str = "https://push.buzz.xyz/v1/deliveries/apns";
@@ -739,6 +872,7 @@ fn inert_env_vars<'a>(names: &[&'a str], lookup: impl Fn(&str) -> Option<String>
 impl Config {
     /// Loads configuration from environment variables, falling back to development defaults.
     pub fn from_env() -> Result<Self, ConfigError> {
+        let nip_fi_authorization = parse_nip_fi_authorization()?;
         let bind_addr_raw =
             std::env::var("BUZZ_BIND_ADDR").unwrap_or_else(|_| "0.0.0.0:3000".to_string());
         let bind_addr = parse_bind_addr(&bind_addr_raw)?;
@@ -1269,6 +1403,7 @@ impl Config {
         }
 
         Ok(Self {
+            nip_fi_authorization,
             bind_addr,
             database_url,
             read_database_url,
@@ -1446,6 +1581,10 @@ mod tests {
         assert!(config.max_connections > 0);
         assert!(config.send_buffer_size > 0);
         assert_eq!(config.max_frame_bytes, DEFAULT_MAX_FRAME_BYTES);
+        assert!(
+            config.nip_fi_authorization.is_empty(),
+            "provider-free authorization must default to strict Off"
+        );
         assert!(config.slow_client_grace_limit > 0);
         assert!(
             !config.pubkey_allowlist_enabled,
@@ -1509,6 +1648,73 @@ mod tests {
             config.corporate_identity.event_capacity.is_none(),
             "disabled identity must not invent authorization event capacity"
         );
+    }
+
+    #[test]
+    fn nip_fi_domain_configuration_is_explicit_and_complete() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        let previous = std::env::var_os("BUZZ_NIP_FI_V1_CONFIG_JSON");
+        let domain = uuid::Uuid::new_v4();
+
+        std::env::set_var(
+            "BUZZ_NIP_FI_V1_CONFIG_JSON",
+            format!(r#"[{{"mode":"deny_protected","authorization_domain":"{domain}"}}]"#),
+        );
+        let deny = parse_nip_fi_authorization().expect("complete deny configuration");
+
+        let enforce = serde_json::json!([{
+            "mode": "enforce",
+            "authorization_domain": domain,
+            "issuer": "https://issuer.example",
+            "audience": "buzz-relay",
+            "subject_claim": "employee_id",
+            "jwks": {"keys": [{
+                "kty": "OKP",
+                "crv": "Ed25519",
+                "x": "W5IdGgO6kT9y_Lknfulx05osPx0NTwHpGNJixSlFLmQ",
+                "kid": "fixture-ed25519",
+                "use": "sig",
+                "key_ops": ["verify"],
+                "alg": "EdDSA"
+            }]},
+            "assertion_header": "x-buzz-identity",
+            "provenance_header": "x-buzz-identity-proof",
+            "provenance_key_hex": "09".repeat(32),
+            "maximum_token_age_seconds": 300,
+            "clock_skew_seconds": 30,
+            "maximum_lease_seconds": 60,
+            "max_events_per_domain": 100,
+            "max_bytes_per_domain": 1 << 20,
+            "max_envelope_bytes": 16 << 10,
+            "policy_revision": 1,
+            "enrollment_mode": "attested_key",
+            "nostr_key_claim": "nostr_pubkey",
+            "restore_bootstrap_id": uuid::Uuid::new_v4()
+        }]);
+        std::env::set_var("BUZZ_NIP_FI_V1_CONFIG_JSON", enforce.to_string());
+        let enforce = parse_nip_fi_authorization().expect("complete Enforce configuration");
+
+        std::env::set_var(
+            "BUZZ_NIP_FI_V1_CONFIG_JSON",
+            format!(r#"[{{"mode":"enforce","authorization_domain":"{domain}"}}]"#),
+        );
+        let incomplete = parse_nip_fi_authorization();
+
+        if let Some(value) = previous {
+            std::env::set_var("BUZZ_NIP_FI_V1_CONFIG_JSON", value);
+        } else {
+            std::env::remove_var("BUZZ_NIP_FI_V1_CONFIG_JSON");
+        }
+
+        assert_eq!(deny.len(), 1);
+        assert_eq!(deny[0].mode(), buzz_auth::NipFiMode::DenyProtected);
+        assert_eq!(enforce.len(), 1);
+        assert_eq!(enforce[0].mode(), buzz_auth::NipFiMode::Enforce);
+        assert_eq!(
+            enforce[0].enrollment_mode(),
+            Some(crate::authorization_runtime::BaseV1EnrollmentMode::AttestedKey)
+        );
+        assert!(matches!(incomplete, Err(ConfigError::InvalidValue(_))));
     }
 
     #[test]
@@ -2156,7 +2362,7 @@ mod tests {
         );
         std::env::set_var(
             "RELAY_OPERATOR_API_ORIGIN",
-            "http://buzz.mesh.bb-production.com",
+            "https://Buzz.Mesh.BB-Production.Com:443/",
         );
         let config = Config::from_env().expect("config");
         std::env::remove_var("RELAY_OPERATOR_PUBKEYS");
@@ -2168,6 +2374,10 @@ mod tests {
                 "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
                 "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string(),
             ]
+        );
+        assert_eq!(
+            config.relay_operator_api_origin.as_deref(),
+            Some("https://buzz.mesh.bb-production.com")
         );
     }
 
@@ -2210,8 +2420,70 @@ mod tests {
 
         assert!(matches!(
             result,
-            Err(ConfigError::InvalidValue(ref msg)) if msg.contains("must be an http(s) origin")
+            Err(ConfigError::InvalidValue(ref msg)) if msg.contains("RELAY_OPERATOR_API_ORIGIN")
         ));
+    }
+
+    #[test]
+    fn relay_operator_api_origin_requires_https_for_every_host() {
+        for origin in [
+            "http://operator.example",
+            "http://localhost",
+            "http://localhost:8080/",
+            "http://127.0.0.1",
+            "http://127.255.0.1:8080",
+            "http://[::1]",
+            "http://localhost.example",
+            "http://example.localhost",
+            "http://127.0.0.1.example",
+            "http://0.0.0.0",
+            "http://[::ffff:127.0.0.1]",
+        ] {
+            assert!(
+                parse_operator_api_origin(origin).is_err(),
+                "every HTTP origin must fail: {origin}"
+            );
+        }
+
+        for (origin, canonical) in [
+            ("https://operator.example/", "https://operator.example"),
+            ("https://Operator.Example:443/", "https://operator.example"),
+            ("https://localhost:443/", "https://localhost"),
+            ("https://127.0.0.1/", "https://127.0.0.1"),
+            ("https://[::1]:443/", "https://[::1]"),
+        ] {
+            assert_eq!(
+                parse_operator_api_origin(origin).expect("valid operator origin"),
+                canonical
+            );
+        }
+    }
+
+    #[test]
+    fn relay_operator_api_origin_rejects_ambiguous_or_non_origin_values() {
+        for origin in [
+            "",
+            "https://one.example,https://two.example",
+            "https://one.example\nhttps://two.example",
+            "https://operator.example.",
+            "https://user@operator.example",
+            "https://user:secret@operator.example",
+            "https://operator.example:444",
+            "https://localhost:8443/",
+            "https://operator.example:0",
+            "https://operator.example:65536",
+            "https://operator.example:not-a-port",
+            "https://operator.example:443:444",
+            "https://operator.example/path",
+            "https://operator.example?query",
+            "https://operator.example#fragment",
+            "ftp://operator.example",
+        ] {
+            assert!(
+                parse_operator_api_origin(origin).is_err(),
+                "ambiguous or non-origin value must fail: {origin:?}"
+            );
+        }
     }
 
     #[test]

@@ -576,6 +576,12 @@ impl Default for ConnectionManager {
     }
 }
 
+/// A second deployment-operator runtime cannot replace the one whose routes
+/// were selected during startup.
+#[derive(Clone, Copy, Debug, thiserror::Error, PartialEq, Eq)]
+#[error("operator lifecycle runtime is already installed")]
+pub struct OperatorLifecycleRuntimeAlreadyInstalled;
+
 /// Shared application state, cloned cheaply via inner `Arc` fields.
 #[derive(Clone)]
 pub struct AppState {
@@ -713,6 +719,17 @@ pub struct AppState {
     /// See `crates/buzz-conformance/` and `crate::conformance` for the
     /// schema, emitter helpers, and the independent checker.
     pub tracer: Arc<dyn buzz_conformance::Tracer>,
+
+    /// Immutable provider-free authorization registry, installed completely
+    /// before the app router is constructed. Unset is strict stock Off.
+    authorization:
+        Arc<std::sync::OnceLock<crate::authorization_runtime::ProviderFreeV1Composition>>,
+
+    /// Complete deployment-operator runtime, installed once before router
+    /// construction. Unset means the lifecycle and provision routes do not
+    /// exist; request handling must never synthesize a fallback runtime.
+    operator_lifecycle:
+        Arc<std::sync::OnceLock<Arc<crate::operator_runtime::OperatorLifecycleRuntime>>>,
 
     /// Inter-relay mesh handle, set once by `main.rs` after `mesh_boot` (never
     /// a constructor parameter, so `AppState::new` call sites are untouched).
@@ -924,6 +941,8 @@ impl AppState {
             // construction (see test helpers in
             // `crates/buzz-test-client` once those land).
             tracer: Arc::new(crate::conformance::NoopTracer),
+            authorization: Arc::new(std::sync::OnceLock::new()),
+            operator_lifecycle: Arc::new(std::sync::OnceLock::new()),
             mesh: Arc::new(std::sync::OnceLock::new()),
         };
         (
@@ -939,6 +958,49 @@ impl AppState {
     /// must no-op to today's behavior. Set once by `main.rs` after boot.
     pub fn mesh(&self) -> Option<&crate::mesh_boot::MeshHandle> {
         self.mesh.get()
+    }
+
+    /// Atomically expose one fully built provider-free registry.
+    pub fn install_provider_free_authorization(
+        &self,
+        composition: crate::authorization_runtime::ProviderFreeV1Composition,
+    ) -> Result<(), crate::authorization_runtime::ProviderFreeV1CompositionError> {
+        self.authorization.set(composition).map_err(|_| {
+            crate::authorization_runtime::ProviderFreeV1CompositionError::AlreadyInstalled
+        })
+    }
+
+    /// Installed provider-free registry, if root completed startup composition.
+    pub fn provider_free_authorization(
+        &self,
+    ) -> Option<&crate::authorization_runtime::ProviderFreeV1Composition> {
+        self.authorization.get()
+    }
+
+    /// Atomically expose one fully configured deployment-operator runtime.
+    /// Installation happens only after provider-free authorization is ready
+    /// and before either app router is constructed.
+    pub fn install_operator_lifecycle_runtime(
+        &self,
+        runtime: Arc<crate::operator_runtime::OperatorLifecycleRuntime>,
+    ) -> Result<(), OperatorLifecycleRuntimeAlreadyInstalled> {
+        self.operator_lifecycle
+            .set(runtime)
+            .map_err(|_| OperatorLifecycleRuntimeAlreadyInstalled)
+    }
+
+    /// Installed deployment-operator runtime, if startup configured one.
+    pub fn operator_lifecycle_runtime(
+        &self,
+    ) -> Option<&Arc<crate::operator_runtime::OperatorLifecycleRuntime>> {
+        self.operator_lifecycle.get()
+    }
+
+    /// Mode-first lookup. An absent registry or unconfigured domain is Off.
+    pub fn nip_fi_mode(&self, domain: CommunityId) -> buzz_auth::NipFiMode {
+        self.authorization
+            .get()
+            .map_or(buzz_auth::NipFiMode::Off, |runtime| runtime.mode(domain))
     }
 
     /// Record an event ID as locally-published for dedup, scoped to the
@@ -1344,7 +1406,7 @@ impl std::fmt::Debug for AppState {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::connection::{AuthState, ConnectionState};
     use std::collections::HashMap;
@@ -1383,7 +1445,7 @@ mod tests {
         (mgr, conn_id, rx, ctrl_rx, cancel, bp)
     }
 
-    async fn test_state() -> Arc<AppState> {
+    pub(crate) async fn test_state() -> Arc<AppState> {
         let mut config = crate::config::Config::from_env().expect("default config loads");
         config.require_relay_membership = false;
         config.redis_url = "redis://127.0.0.1:1".to_string();

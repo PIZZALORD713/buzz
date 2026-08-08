@@ -267,7 +267,24 @@ pub(crate) async fn nip11_document(state: &crate::state::AppState, raw_host: &st
             .push("nip-pl".to_string());
         info.push = Some(push);
     }
+    if let Ok(tenant) = crate::tenant::bind_community(&state.db, raw_host).await {
+        let domain = tenant.community();
+        if advertise_nip_fi(
+            state.nip_fi_mode(domain),
+            state.provider_free_authorization().is_some_and(|runtime| {
+                runtime.is_healthy() && runtime.protected_publication_handle(domain).is_ok()
+            }),
+        ) {
+            info.supported_extensions
+                .get_or_insert_default()
+                .push("nip-fi".to_owned());
+        }
+    }
     info
+}
+
+fn advertise_nip_fi(mode: buzz_auth::NipFiMode, complete_healthy_runtime: bool) -> bool {
+    mode == buzz_auth::NipFiMode::Enforce && complete_healthy_runtime
 }
 
 /// Fetches the workspace icon for the community bound to `raw_host`, as the
@@ -349,6 +366,17 @@ const _RELAY_INFO_BUILD_STATIC_INPUT_FENCE: fn(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn nip_fi_discovery_requires_enforce_and_a_complete_healthy_runtime() {
+        use buzz_auth::NipFiMode;
+
+        assert!(!advertise_nip_fi(NipFiMode::Off, false));
+        assert!(!advertise_nip_fi(NipFiMode::Off, true));
+        assert!(!advertise_nip_fi(NipFiMode::DenyProtected, true));
+        assert!(!advertise_nip_fi(NipFiMode::Enforce, false));
+        assert!(advertise_nip_fi(NipFiMode::Enforce, true));
+    }
 
     #[test]
     fn push_descriptor_is_gated_by_gateway_configuration_and_tenant_binding() {
