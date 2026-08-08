@@ -175,19 +175,6 @@ impl Drop for ScopeMutationGuard {
 }
 
 impl WebSocketManager {
-    fn advance_generation(projection: &mut ProjectionState) -> bool {
-        let Some(generation) = projection.generation.checked_add(1) else {
-            projection.suspended = true;
-            if let Some(owner) = projection.owner.take() {
-                let _ = owner.channel.send(serde_json::Value::Null);
-            }
-            projection.current = None;
-            return false;
-        };
-        projection.generation = generation;
-        true
-    }
-
     async fn remove(&self, id: Id) -> Option<Arc<ConnectionHandle>> {
         self.connections.lock().await.remove(&id)
     }
@@ -456,97 +443,6 @@ impl WebSocketManager {
                 let _ = owner.channel.send(serde_json::Value::Null);
             }
             projection.current = None;
-        }
-    }
-
-    /// Invalidate all browser-visible status and revoke the current socket's
-    /// ownership. Late work from that socket is rejected by the owner fence.
-    pub(crate) async fn invalidate_projection(&self) {
-        {
-            let mut projection = self.projection.lock().await;
-            Self::advance_generation(&mut projection);
-            if let Some(owner) = projection.owner.take() {
-                let _ = owner.channel.send(serde_json::Value::Null);
-            }
-            projection.current = None;
-        }
-        self.cancel_status_connections().await;
-    }
-
-    /// Enter a fail-closed workspace or identity mutation interval.
-    /// Overlapping mutations keep status disabled until the last one exits.
-    pub(crate) async fn begin_scope_mutation(&self) -> Result<ScopeMutationGuard, String> {
-        let token = {
-            let mut projection = self.projection.lock().await;
-            let Some(token) = projection.mutation_head.checked_add(1) else {
-                projection.suspended = true;
-                return Err("status scope mutation token exhausted".to_string());
-            };
-            projection.mutation_head = token;
-            projection.active_mutations.insert(token);
-            if !Self::advance_generation(&mut projection) {
-                projection.active_mutations.remove(&token);
-                return Err("status projection generation exhausted".to_string());
-            }
-            if let Some(owner) = projection.owner.take() {
-                let _ = owner.channel.send(serde_json::Value::Null);
-            }
-            projection.current = None;
-            token
-        };
-        let guard = ScopeMutationGuard {
-            manager: Some(self.clone()),
-            token,
-        };
-        self.cancel_status_connections().await;
-        Ok(guard)
-    }
-
-    /// Exit one workspace or identity mutation interval and fence all work
-    /// that raced the mutation, including failed or panicked blocking work.
-    async fn finish_scope_mutation(&self, token: u64) {
-        {
-            let mut projection = self.projection.lock().await;
-            if !projection.active_mutations.remove(&token) {
-                return;
-            }
-            Self::advance_generation(&mut projection);
-            if let Some(owner) = projection.owner.take() {
-                let _ = owner.channel.send(serde_json::Value::Null);
-            }
-            projection.current = None;
-        }
-        self.cancel_status_connections().await;
-    }
-
-    /// Permanently disable status projection for the remainder of this process.
-    /// Sign-out uses this before starting restart so no racing webview request
-    /// can regain presentation ownership with the retiring identity.
-    pub(crate) async fn suspend_projection(&self) {
-        {
-            let mut projection = self.projection.lock().await;
-            projection.suspended = true;
-            Self::advance_generation(&mut projection);
-            if let Some(owner) = projection.owner.take() {
-                let _ = owner.channel.send(serde_json::Value::Null);
-            }
-            projection.current = None;
-        }
-        self.cancel_status_connections().await;
-    }
-
-    async fn cancel_status_connections(&self) {
-        let handles = self
-            .connections
-            .lock()
-            .await
-            .values()
-            .cloned()
-            .collect::<Vec<_>>();
-        for handle in handles {
-            if handle.status_scope.lock().await.take().is_some() {
-                handle.cancel.cancel();
-            }
         }
     }
 

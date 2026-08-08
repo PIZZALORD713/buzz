@@ -523,17 +523,14 @@ export class RelayClient {
       }
     }
   }
-
   private async connect() {
     if (this.stabilityTimer !== null) {
       window.clearTimeout(this.stabilityTimer);
       this.stabilityTimer = null;
     }
-
     this.connectionStateEmitter.set(
       this.hasConnectedOnce ? "reconnecting" : "connecting",
     );
-
     const generation = ++this.connectionGeneration;
     let statusConnection!: RelayClientStatusConnection;
     this.onMessageChannel = new Channel<unknown>((message) => {
@@ -561,7 +558,6 @@ export class RelayClient {
       (event) => this.sendRaw(["AUTH", event]),
     );
     this.statusConnection = statusConnection;
-
     try {
       if (!this.relayUrl) {
         this.relayUrl = await getRelayWsUrl();
@@ -578,7 +574,6 @@ export class RelayClient {
       }
       this.wsId = wsId;
       statusConnection.bind(wsId, connectionRelayUrl);
-
       await new Promise<void>((resolve, reject) => {
         const timeout = window.setTimeout(() => {
           const error = new Error("Relay authentication timed out.");
@@ -586,7 +581,6 @@ export class RelayClient {
           this.resetConnection(error);
           reject(error);
         }, AUTH_TIMEOUT_MS);
-
         this.authRequest = {
           pendingEventId: "",
           resolve,
@@ -594,12 +588,10 @@ export class RelayClient {
           timeout,
         };
       });
-
       this.stabilityTimer = window.setTimeout(() => {
         this.stabilityTimer = null;
         this.reconnectDelayMs = RECONNECT_BASE_DELAY_MS;
       }, BACKOFF_RESET_STABLE_MS);
-
       this.connectionStateEmitter.set("connected");
       await this.replayLiveSubscriptions();
       this.stallWatchdog.start();
@@ -616,7 +608,6 @@ export class RelayClient {
       throw connectionError;
     }
   }
-
   private async subscribe(
     filter: RelaySubscriptionFilter,
     onEvent: (event: RelayEvent) => void,
