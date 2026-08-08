@@ -397,6 +397,8 @@ impl WebSocketManager {
         }
     }
 
+    // Keep the complete owner and presentation tuple explicit at this final stale-work fence.
+    #[allow(clippy::too_many_arguments)]
     async fn expire_projection_if_owner(
         &self,
         id: Id,
