@@ -1932,9 +1932,24 @@ fn classify_body_read_error(
     }
 }
 
+/// Provider bodies that mean "this model cannot accept image input", the
+/// signal the agent loop uses to strip rejected images from history and
+/// continue the turn (see `replace_unsupported_images`).
+///
+/// Deliberately tight, same doctrine as [`is_context_length_error`]: each
+/// phrase is a verbatim capability rejection observed live. Misclassifying a
+/// generic 400 as recoverable would mutate history for an error that removing
+/// images cannot fix.
 fn is_unsupported_image_input_error(body: &str) -> bool {
-    body.to_ascii_lowercase()
-        .contains("no endpoints found that support image input")
+    let b = body.to_ascii_lowercase();
+    // OpenRouter 404: no provider endpoint accepts images for this model.
+    b.contains("no endpoints found that support image input")
+        // OpenAI-compatible 400 from text-only single-model deployments,
+        // e.g. Crusoe serverless GLM: `"crusoeai/GLM-5.2-NVFP4 is not a
+        // multimodal model"`. Without this arm the 400 is terminal, the image
+        // stays in history, and every subsequent request in the session fails
+        // identically — the turn wedges until the harness/user gives up.
+        || b.contains("is not a multimodal model")
 }
 
 /// Build the terminal `AgentError::Llm` for a `post()` exit that has given up
@@ -2129,6 +2144,13 @@ where
                     "{status}: {body}"
                 ))));
             }
+            // Image-capability rejection is equally recoverable and equally
+            // deterministic: a text-only deployment 400s the same request
+            // forever. Typed here (not just on the 404 arm) because
+            // OpenAI-compatible providers report it as a 400.
+            if status == 400 && is_unsupported_image_input_error(&body) {
+                return Err(PostError::Agent(AgentError::UnsupportedImageInput(body)));
+            }
             return Err(PostError::Agent(AgentError::Llm(format!(
                 "{status}: {body}"
             ))));
@@ -2237,22 +2259,56 @@ pub(crate) fn build_token_source(cfg: &Config) -> Result<Arc<dyn TokenSource>, A
     }
 }
 
+/// Completion-token cap that [`Llm::summarize`] actually requests from
+/// `provider`, given the caller's visible-text budget. OpenRouter grants
+/// reasoning a separate, equal budget on top of the text budget (see
+/// [`openrouter_summary_body`]), so its top-level cap is double the caller's
+/// budget; every other provider requests the caller's budget unchanged.
+/// Callers that reserve output headroom in an input budget
+/// (`handoff_prompt_budget_bytes`) must reserve THIS value, not the text
+/// budget — otherwise input plus the actual completion allowance can exceed
+/// the configured context window.
+pub(crate) fn summary_completion_cap(provider: Provider, max_output_tokens: u32) -> u32 {
+    match provider {
+        Provider::OpenRouter => max_output_tokens.saturating_mul(2),
+        Provider::Anthropic | Provider::OpenAi | Provider::Databricks | Provider::DatabricksV2 => {
+            max_output_tokens
+        }
+    }
+}
+
 /// Build the request body for `Llm::summarize` on `Provider::OpenRouter`.
 /// Extracted so tests can assert on the actual wire shape instead of a
-/// hand-rolled literal — summaries never carry `reasoning` (see
-/// `apply_openrouter_mutations`, which the summary path never calls).
-/// It spells the token limit `max_tokens` directly for the same reason: the
-/// mutation that renames it is never applied here.
+/// hand-rolled literal — summaries never carry config-driven reasoning
+/// *effort* (see `apply_openrouter_mutations`, which the summary path never
+/// calls). It spells the token limit `max_tokens` directly for the same
+/// reason: the mutation that renames it is never applied here.
 fn openrouter_summary_body(
     effective_model: &str,
     system_prompt: &str,
     user_prompt: &str,
     max_output_tokens: u32,
 ) -> Value {
+    // Reasoning models spend output tokens thinking before emitting any
+    // visible text, and that spend counts against `max_tokens`. Left
+    // unseparated, a model can burn the entire cap mid-reasoning and return an
+    // empty `content` — observed with deepseek-v4-flash, where 13 consecutive
+    // handoff attempts length-stopped inside the reasoning channel and every
+    // one degraded to lossy history truncation. Give reasoning its own
+    // equal-sized budget on top of the text budget so `max_output_tokens`
+    // remains what the caller means: visible summary text. `exclude` keeps the
+    // reasoning out of the response body; `summarize()` only reads `content`.
+    // Non-reasoning endpoints ignore the `reasoning` object (see
+    // `apply_openrouter_mutations` on why it is never paired with
+    // `provider.require_parameters`).
     json!({
         "model": effective_model,
         "stream": false,
-        "max_tokens": max_output_tokens,
+        "max_tokens": summary_completion_cap(Provider::OpenRouter, max_output_tokens),
+        "reasoning": {
+            "max_tokens": max_output_tokens,
+            "exclude": true,
+        },
         "messages": [
             { "role": "system", "content": system_prompt },
             { "role": "user", "content": user_prompt },
@@ -2500,6 +2556,12 @@ async fn openrouter_post(
             // agents keep the permanent context-400 stuck loop.
             if status == 400 && is_context_length_error(&body) {
                 return Err(AgentError::LlmContextExceeded(format!("{status}: {body}")));
+            }
+            // Same 400-shaped image rejection as the shared `post()` terminal:
+            // OpenRouter normally reports this as a 404 (handled above), but a
+            // BYOK/passthrough upstream can surface the provider's own 400.
+            if status == 400 && is_unsupported_image_input_error(&body) {
+                return Err(AgentError::UnsupportedImageInput(body));
             }
             return Err(AgentError::Llm(format!("{status}: {body}")));
         }
@@ -6263,8 +6325,14 @@ mod tests {
         assert!(body.get("max_completion_tokens").is_none());
     }
 
+    /// The summary body reserves `max_output_tokens` for visible text by
+    /// granting reasoning a separate, equal budget on top and excluding it
+    /// from the response. Without the separation, a reasoning model can spend
+    /// the entire cap thinking and length-stop with empty `content`, which
+    /// `summarize()` reports as an empty summary and the handoff degrades to
+    /// lossy truncation.
     #[test]
-    fn openrouter_summary_carries_neither_reasoning_nor_provider() {
+    fn openrouter_summary_budgets_reasoning_separately_and_carries_no_provider() {
         let body = openrouter_summary_body(
             "anthropic/claude-opus-4-7",
             "summarize",
@@ -6274,14 +6342,25 @@ mod tests {
         assert_eq!(body["model"], "anthropic/claude-opus-4-7");
         assert_eq!(body["messages"][0]["role"], "system");
         assert_eq!(body["messages"][1]["content"], "text to summarize");
-        assert_eq!(body["max_tokens"], 1024);
+        assert_eq!(
+            body["max_tokens"], 2048,
+            "total cap must cover the text budget plus the reasoning budget"
+        );
+        assert_eq!(
+            body["reasoning"]["max_tokens"], 1024,
+            "reasoning gets its own budget so it cannot starve the summary text"
+        );
+        assert_eq!(
+            body["reasoning"]["exclude"], true,
+            "reasoning must not be included in the response; summarize() reads only content"
+        );
+        assert!(
+            body["reasoning"].get("effort").is_none(),
+            "budget-based cap only; effort stays unset for the summary call"
+        );
         assert!(
             body.get("max_completion_tokens").is_none(),
             "summary body must use OpenRouter's token-limit spelling"
-        );
-        assert!(
-            body.get("reasoning").is_none(),
-            "summary body must not carry reasoning"
         );
         assert!(
             body.get("provider").is_none(),
@@ -7484,6 +7563,73 @@ mod tests {
         .unwrap_err();
         assert!(
             matches!(&err, AgentError::UnsupportedImageInput(s) if s.contains("support image input")),
+            "image rejection must reach the history-recovery path: got {err:?}"
+        );
+        assert_eq!(
+            attempts.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "a deterministic capability rejection must not be retried"
+        );
+    }
+
+    /// OpenAI-compatible text-only deployments report the image rejection as a
+    /// 400, not OpenRouter's 404 — Crusoe serverless GLM answers
+    /// `"crusoeai/GLM-5.2-NVFP4 is not a multimodal model"` to every request
+    /// whose history contains an image. Before the 400 arm existed, this fell
+    /// through to terminal `AgentError::Llm`: the image stayed in history and
+    /// every later call in the session failed identically (measured live:
+    /// 8 wedged benchmark trials, 40 min of doomed retries each). Asserted
+    /// through `complete()` so the arm's return path into the convergence
+    /// mapper is covered, same doctrine as the context-400 tests above.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn openai_400_unsupported_image_is_typed_through_complete() {
+        let (base_url, captured) = spawn_sequence_stub(vec![StubHttpResponse {
+            status: 400,
+            body: json!({"error":{"message":"crusoeai/GLM-5.2-NVFP4 is not a multimodal model","type":"invalid_request_error"}}),
+        }])
+        .await;
+        let mut c = cfg(Provider::OpenAi);
+        c.base_url = base_url;
+        let llm = Llm::new(&c).unwrap();
+        let err = complete_model(&llm, &c, "gpt-probe-model")
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, AgentError::UnsupportedImageInput(s) if s.contains("not a multimodal model")),
+            "a text-only deployment's 400 must reach the history-recovery path: got {err:?}"
+        );
+        assert_eq!(
+            captured.lock().await.len(),
+            1,
+            "a deterministic capability rejection must not be retried"
+        );
+    }
+
+    /// Same 400-shaped rejection at the OpenRouter terminal, which has its own
+    /// status ladder: a BYOK/passthrough upstream can surface the provider's
+    /// own 400 body instead of OpenRouter's 404 routing error.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn openrouter_post_400_unsupported_image_is_typed_and_not_retried() {
+        let (url, _captured, attempts) = spawn_openrouter_stub(vec![CannedResponse::new(
+            400,
+            r#"{"error":{"message":"crusoeai/GLM-5.2-NVFP4 is not a multimodal model"}}"#,
+        )])
+        .await;
+        let http = Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap();
+        let err = openrouter_post(
+            &http,
+            &format!("{url}/x"),
+            &json!({}),
+            "key",
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(&err, AgentError::UnsupportedImageInput(s) if s.contains("not a multimodal model")),
             "image rejection must reach the history-recovery path: got {err:?}"
         );
         assert_eq!(
