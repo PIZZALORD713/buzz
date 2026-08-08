@@ -15,12 +15,15 @@
 //! - NIP-42/NIP-98 produce a [`ConnectionAuthContext`] authentication shim.
 //! - Protected routes receive only the immutable context produced by the one
 //!   provider-free authorization finalizer.
-//! - No JWT validation, no token management, no IdP runtime dependency.
+//! - Federated assertions are verified into origin-sealed, provider-free evidence.
+//! - No token management or IdP-specific runtime dependency.
 
 /// Channel access checking trait and helpers.
 pub mod access;
 /// Authentication error types.
 pub mod error;
+/// Provider-free corporate identity binding evidence verification.
+pub mod evidence;
 /// Provider-free local authorization composition.
 pub mod foundation;
 /// NIP-42 challenge–response authentication.
@@ -36,6 +39,11 @@ pub mod scope;
 
 pub use access::{check_read_access, check_write_access, require_scope, ChannelAccessChecker};
 pub use error::AuthError;
+pub use evidence::{
+    AssertionVerificationPolicy, EvidenceClock, EvidenceError, ExactSingleHttpHeader,
+    NostrKeyClaimPolicy, RequestEvidenceBinding, StaticJwksAssertionVerifier, SystemEvidenceClock,
+    VerifiedAssertionEvidence, VerifiedIdentityBindingEvidence,
+};
 pub use foundation::{
     ActiveLocalBinding, AuthContext, AuthorizationAuditConfig, AuthorizationAuditConfigError,
     AuthorizationError, AuthorizationEventCapacityPolicy, AuthorizationEventCapacityPolicyError,

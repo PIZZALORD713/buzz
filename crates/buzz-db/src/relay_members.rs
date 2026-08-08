@@ -10,8 +10,12 @@ use chrono::{DateTime, Utc};
 use sqlx::{PgPool, Row as _};
 
 use crate::error::Result;
-use crate::identity_binding::{BindIdentityResult, IdentityBindingConflict, IdentityBindingInput};
+use crate::identity_lifecycle::{
+    resolve_verified_identity_binding_tx, verified_identity_matches_member,
+    VerifiedIdentityBindingDenial, VerifiedIdentityBindingHandle, VerifiedIdentityBindingOutcome,
+};
 use crate::CommunityId;
+use buzz_auth::VerifiedIdentityBindingEvidence;
 
 /// A single relay member record.
 #[derive(Debug, Clone)]
@@ -158,11 +162,9 @@ pub async fn claim_relay_membership(
         .await?
     {
         MembershipClaimOutcome::Joined { inserted, .. } => Ok(inserted),
-        MembershipClaimOutcome::IdentityConflict(_) | MembershipClaimOutcome::IdentityRevoked => {
-            Err(crate::DbError::InvalidData(
-                "unexpected corporate identity result without staged identity".to_string(),
-            ))
-        }
+        MembershipClaimOutcome::IdentityDenied(_) => Err(crate::DbError::InvalidData(
+            "unexpected corporate identity result without staged identity".to_string(),
+        )),
     }
 }
 
@@ -174,12 +176,10 @@ pub enum MembershipClaimOutcome {
         /// Whether the membership row was newly inserted.
         inserted: bool,
         /// Binding committed in the same transaction, when one was staged.
-        identity_binding: Option<BindIdentityResult>,
+        identity_binding: Option<VerifiedIdentityBindingHandle>,
     },
-    /// The staged identity conflicts with an active binding.
-    IdentityConflict(IdentityBindingConflict),
-    /// The staged identity is revoked.
-    IdentityRevoked,
+    /// The sealed identity was denied without committing membership.
+    IdentityDenied(VerifiedIdentityBindingDenial),
 }
 
 /// Claims relay membership and an optional corporate identity in one transaction.
@@ -189,22 +189,26 @@ pub async fn claim_relay_membership_with_identity(
     pubkey: &str,
     role: &str,
     policy_version: Option<&str>,
-    identity: Option<&IdentityBindingInput<'_>>,
+    identity: Option<&VerifiedIdentityBindingEvidence>,
 ) -> Result<MembershipClaimOutcome> {
-    crate::identity_binding::validate_membership_identity_key(pubkey, identity)?;
+    if let Some(identity) = identity {
+        let member_pubkey = hex::decode(pubkey).map_err(|_| {
+            crate::DbError::InvalidData("membership pubkey must be 32-byte hex".to_owned())
+        })?;
+        if !verified_identity_matches_member(community, &member_pubkey, identity) {
+            return Err(crate::DbError::InvalidData(
+                "membership pubkey does not match sealed identity".to_owned(),
+            ));
+        }
+    }
     let mut tx = pool.begin().await?;
     let identity_binding = if let Some(identity) = identity {
-        match crate::identity_binding::bind_or_validate_identity_tx(&mut tx, community, identity)
-            .await?
-        {
-            binding @ (BindIdentityResult::Created | BindIdentityResult::Matched) => Some(binding),
-            BindIdentityResult::Conflict(conflict) => {
+        match resolve_verified_identity_binding_tx(&mut tx, identity).await? {
+            VerifiedIdentityBindingOutcome::Created(binding)
+            | VerifiedIdentityBindingOutcome::Matched(binding) => Some(binding),
+            VerifiedIdentityBindingOutcome::Denied(reason) => {
                 tx.rollback().await?;
-                return Ok(MembershipClaimOutcome::IdentityConflict(conflict));
-            }
-            BindIdentityResult::Revoked => {
-                tx.rollback().await?;
-                return Ok(MembershipClaimOutcome::IdentityRevoked);
+                return Ok(MembershipClaimOutcome::IdentityDenied(reason));
             }
         }
     } else {

@@ -903,9 +903,12 @@ dependencies = [
 name = "buzz-auth"
 version = "0.1.0"
 dependencies = [
+ "base64 0.22.1",
  "buzz-core",
  "chrono",
  "hex",
+ "http",
+ "jsonwebtoken",
  "nostr",
  "rand 0.10.1",
  "serde",
@@ -1005,9 +1008,12 @@ dependencies = [
 name = "buzz-db"
 version = "0.1.0"
 dependencies = [
+ "buzz-auth",
  "buzz-core",
  "chrono",
  "hex",
+ "http",
+ "jsonwebtoken",
  "metrics",
  "metrics-util",
  "nostr",

@@ -222,6 +222,7 @@ impl axum::extract::FromRequestParts<Arc<AppState>> for GitAuth {
             state,
             tenant.community(),
             pubkey,
+            buzz_auth::ProofTransport::GitSmartHttpSession,
             identity_jwt.as_deref(),
             auth_tag,
         )

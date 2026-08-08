@@ -187,6 +187,7 @@ pub async fn handle_auth(event: nostr::Event, conn: Arc<ConnectionState>, state:
                 &state,
                 conn.tenant.community(),
                 pubkey,
+                buzz_auth::ProofTransport::Nip42,
                 conn.corporate_identity_jwt.as_deref(),
                 auth_tag_json.as_deref(),
             )
@@ -279,14 +280,6 @@ pub async fn handle_auth(event: nostr::Event, conn: Arc<ConnectionState>, state:
                     return;
                 }
             };
-            if let crate::corporate_identity::CorporateIdentityDecision::Delegated {
-                owner_pubkey,
-                ..
-            } = &identity_decision
-            {
-                auth_ctx.agent_owner_pubkey = Some(*owner_pubkey);
-            }
-
             // Open relay NIP-OA backfill: extract owner for agent→owner DB mapping
             // (needed for observer frame auth). Only runs on open relays — on closed
             // relays, enforce_relay_membership already handles NIP-OA delegation.

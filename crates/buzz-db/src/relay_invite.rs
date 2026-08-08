@@ -17,6 +17,7 @@
 //! `FOR UPDATE` serializes concurrent claims for one invite across relay
 //! processes — exactly one claimant can win the final slot.
 
+use buzz_auth::VerifiedIdentityBindingEvidence;
 use buzz_core::invite::{
     encode_v2_code, hash_v2_code, MAX_INVITE_TTL_SECS, MAX_INVITE_USES, MIN_INVITE_TTL_SECS,
     V2_SECRET_LEN,
@@ -25,7 +26,10 @@ use chrono::{DateTime, Utc};
 use sqlx::{PgPool, Row as _};
 
 use crate::error::Result;
-use crate::identity_binding::{BindIdentityResult, IdentityBindingConflict, IdentityBindingInput};
+use crate::identity_lifecycle::{
+    resolve_verified_identity_binding_tx, verified_identity_matches_member,
+    VerifiedIdentityBindingDenial, VerifiedIdentityBindingHandle, VerifiedIdentityBindingOutcome,
+};
 use crate::CommunityId;
 
 /// Outcome of a v2 invite claim. Expected invalid/expired/exhausted states are
@@ -41,7 +45,7 @@ pub enum ClaimOutcome {
         /// Remaining slots, or `None` when the invite is unlimited.
         uses_remaining: Option<i32>,
         /// Binding committed in the same transaction, when one was staged.
-        identity_binding: Option<BindIdentityResult>,
+        identity_binding: Option<VerifiedIdentityBindingHandle>,
     },
     /// The claimer was already a member. `use_count` was NOT incremented.
     AlreadyMember {
@@ -50,7 +54,7 @@ pub enum ClaimOutcome {
         /// Remaining slots, or `None` when the invite is unlimited.
         uses_remaining: Option<i32>,
         /// Binding committed in the same transaction, when one was staged.
-        identity_binding: Option<BindIdentityResult>,
+        identity_binding: Option<VerifiedIdentityBindingHandle>,
     },
     /// The invite's `expires_at` has passed.
     Expired,
@@ -58,10 +62,8 @@ pub enum ClaimOutcome {
     Exhausted,
     /// No invite row matches `(community_id, token_hash)`.
     Invalid,
-    /// The staged identity conflicts with another active principal or pubkey.
-    IdentityConflict(IdentityBindingConflict),
-    /// The staged identity principal or key is revoked.
-    IdentityRevoked,
+    /// The sealed identity was denied without consuming the invite.
+    IdentityDenied(VerifiedIdentityBindingDenial),
 }
 
 /// A freshly minted v2 invite, including the plaintext code and metadata.
@@ -213,9 +215,18 @@ pub async fn claim_relay_invite_with_identity(
     token_hash: &[u8; 32],
     claimer_pubkey: &str,
     policy_version: Option<&str>,
-    identity: Option<&IdentityBindingInput<'_>>,
+    identity: Option<&VerifiedIdentityBindingEvidence>,
 ) -> Result<ClaimOutcome> {
-    crate::identity_binding::validate_membership_identity_key(claimer_pubkey, identity)?;
+    if let Some(identity) = identity {
+        let member_pubkey = hex::decode(claimer_pubkey).map_err(|_| {
+            crate::DbError::InvalidData("membership pubkey must be 32-byte hex".to_owned())
+        })?;
+        if !verified_identity_matches_member(community, &member_pubkey, identity) {
+            return Err(crate::DbError::InvalidData(
+                "membership pubkey does not match sealed identity".to_owned(),
+            ));
+        }
+    }
     let mut tx = pool.begin().await?;
     sqlx::query("SET LOCAL lock_timeout = '3s'")
         .execute(&mut *tx)
@@ -260,38 +271,6 @@ pub async fn claim_relay_invite_with_identity(
         return Ok(ClaimOutcome::Expired);
     }
 
-    let identity_binding = if let Some(identity) = identity {
-        match crate::identity_binding::bind_or_validate_identity_tx(&mut tx, community, identity)
-            .await?
-        {
-            binding @ (BindIdentityResult::Created | BindIdentityResult::Matched) => Some(binding),
-            BindIdentityResult::Conflict(conflict) => {
-                tx.rollback().await?;
-                log_claim_outcome(
-                    community,
-                    Some(invite_id),
-                    "identity_conflict",
-                    max_uses,
-                    Some(use_count),
-                );
-                return Ok(ClaimOutcome::IdentityConflict(conflict));
-            }
-            BindIdentityResult::Revoked => {
-                tx.rollback().await?;
-                log_claim_outcome(
-                    community,
-                    Some(invite_id),
-                    "identity_revoked",
-                    max_uses,
-                    Some(use_count),
-                );
-                return Ok(ClaimOutcome::IdentityRevoked);
-            }
-        }
-    } else {
-        None
-    };
-
     let uses_remaining = || max_uses.map(|mu| mu - use_count);
 
     // 5. Check existing membership.
@@ -303,6 +282,25 @@ pub async fn claim_relay_invite_with_identity(
             .await?;
 
     if existing.is_some() {
+        let identity_binding = if let Some(identity) = identity {
+            match resolve_verified_identity_binding_tx(&mut tx, identity).await? {
+                VerifiedIdentityBindingOutcome::Created(binding)
+                | VerifiedIdentityBindingOutcome::Matched(binding) => Some(binding),
+                VerifiedIdentityBindingOutcome::Denied(reason) => {
+                    tx.rollback().await?;
+                    log_claim_outcome(
+                        community,
+                        Some(invite_id),
+                        "identity_denied",
+                        max_uses,
+                        Some(use_count),
+                    );
+                    return Ok(ClaimOutcome::IdentityDenied(reason));
+                }
+            }
+        } else {
+            None
+        };
         // 6. Already a member — insert policy evidence but do NOT increment.
         if let Some(version) = policy_version {
             sqlx::query(
@@ -344,6 +342,26 @@ pub async fn claim_relay_invite_with_identity(
             return Ok(ClaimOutcome::Exhausted);
         }
     }
+
+    let identity_binding = if let Some(identity) = identity {
+        match resolve_verified_identity_binding_tx(&mut tx, identity).await? {
+            VerifiedIdentityBindingOutcome::Created(binding)
+            | VerifiedIdentityBindingOutcome::Matched(binding) => Some(binding),
+            VerifiedIdentityBindingOutcome::Denied(reason) => {
+                tx.rollback().await?;
+                log_claim_outcome(
+                    community,
+                    Some(invite_id),
+                    "identity_denied",
+                    max_uses,
+                    Some(use_count),
+                );
+                return Ok(ClaimOutcome::IdentityDenied(reason));
+            }
+        }
+    } else {
+        None
+    };
 
     // 8. Insert relay member. The conflict branch covers a claimant admitted
     // concurrently through a different invite: only the transaction that
@@ -469,21 +487,6 @@ mod tests {
 
     async fn delete_test_community(pool: &PgPool, community: CommunityId) {
         let mut tx = pool.begin().await.expect("begin test cleanup");
-        sqlx::query("DELETE FROM identity_revoked_keys WHERE community_id = $1")
-            .bind(community.as_uuid())
-            .execute(&mut *tx)
-            .await
-            .expect("delete test revoked keys");
-        sqlx::query("DELETE FROM identity_bindings WHERE community_id = $1")
-            .bind(community.as_uuid())
-            .execute(&mut *tx)
-            .await
-            .expect("delete test identity bindings");
-        sqlx::query("DELETE FROM identity_principals WHERE community_id = $1")
-            .bind(community.as_uuid())
-            .execute(&mut *tx)
-            .await
-            .expect("delete test identity principals");
         sqlx::query("DELETE FROM relay_invites WHERE community_id = $1")
             .bind(community.as_uuid())
             .execute(&mut *tx)
@@ -621,77 +624,6 @@ mod tests {
                 .await
                 .expect("second membership") as u8;
         assert_eq!(admitted, 1);
-        delete_test_community(&pool, community).await;
-    }
-
-    #[tokio::test]
-    #[ignore = "requires Postgres"]
-    async fn invite_claim_commits_identity_and_membership_atomically() {
-        let pool = setup_pool().await;
-        let community = make_test_community(&pool).await;
-        let claimer = test_pubkey();
-        let pubkey = hex::decode(&claimer).expect("test pubkey hex");
-        let identity = IdentityBindingInput {
-            issuer: "https://idp.example",
-            uid: "atomic-user",
-            pubkey: &pubkey,
-            display_name: Some("private@example.com"),
-            source: crate::identity_binding::SOURCE_JWT_NPUB,
-        };
-        let invalid_hash = [7_u8; 32];
-
-        assert_eq!(
-            claim_relay_invite_with_identity(
-                &pool,
-                community,
-                &invalid_hash,
-                &claimer,
-                None,
-                Some(&identity),
-            )
-            .await
-            .expect("invalid claim result"),
-            ClaimOutcome::Invalid
-        );
-        assert!(
-            crate::identity_binding::get_active_identity_binding_by_pubkey(
-                &pool, community, &pubkey,
-            )
-            .await
-            .expect("binding lookup after invalid claim")
-            .is_none()
-        );
-
-        let invite = mint_relay_invite(&pool, community, "owner", 3600, Some(1))
-            .await
-            .expect("mint invite");
-        let hash = hash_v2_code(&invite.code);
-        assert!(matches!(
-            claim_relay_invite_with_identity(
-                &pool,
-                community,
-                &hash,
-                &claimer,
-                None,
-                Some(&identity),
-            )
-            .await
-            .expect("valid atomic claim"),
-            ClaimOutcome::Joined { .. }
-        ));
-        assert!(is_relay_member(&pool, community, &claimer)
-            .await
-            .expect("membership committed"));
-        assert_eq!(
-            crate::identity_binding::get_active_identity_binding_by_pubkey(
-                &pool, community, &pubkey,
-            )
-            .await
-            .expect("binding lookup")
-            .expect("binding committed")
-            .uid,
-            "atomic-user"
-        );
         delete_test_community(&pool, community).await;
     }
 

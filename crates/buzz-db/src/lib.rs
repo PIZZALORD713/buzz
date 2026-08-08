@@ -15,6 +15,10 @@ pub mod admin_moderation;
 pub mod api_token;
 /// Relay-scoped archived identity persistence (NIP-IA).
 pub mod archived_identities;
+/// Canonical authorization receipt and immutable event persistence.
+pub mod authorization_events;
+/// Canonical identity enrollment-policy selection.
+pub mod authorization_policy;
 /// Channel and membership persistence.
 pub mod channel;
 /// Direct message channel persistence.
@@ -27,8 +31,8 @@ pub mod event;
 pub mod feed;
 /// Git repository name registry (NIP-34 kind:30617).
 pub mod git_repo;
-/// Corporate identity binding persistence.
-pub mod identity_binding;
+/// Canonical identity lifecycle engine and sealed compatibility facade.
+pub mod identity_lifecycle;
 /// Embedded database migrations.
 pub mod migration;
 /// Community moderation: reports, bans/timeouts, audit actions.
@@ -2237,7 +2241,7 @@ impl Db {
         pubkey: &[u8],
         role: channel::MemberRole,
         invited_by: Option<&[u8]>,
-        identity: Option<&identity_binding::IdentityBindingInput<'_>>,
+        identity: Option<&buzz_auth::VerifiedIdentityBindingEvidence>,
     ) -> Result<channel::ChannelAdmissionOutcome> {
         channel::add_member_with_identity(
             &self.pool,
@@ -2557,99 +2561,6 @@ impl Db {
         limit: u32,
     ) -> Result<Vec<user::UserSearchProfile>> {
         user::search_users(&self.pool, community_id, query, limit).await
-    }
-
-    /// Create or validate a corporate identity binding.
-    pub async fn bind_or_validate_identity(
-        &self,
-        community_id: CommunityId,
-        issuer: &str,
-        uid: &str,
-        pubkey: &[u8],
-        display_name: Option<&str>,
-        source: &str,
-    ) -> Result<identity_binding::BindIdentityResult> {
-        identity_binding::bind_or_validate_identity(
-            &self.pool,
-            community_id,
-            issuer,
-            uid,
-            pubkey,
-            display_name,
-            source,
-        )
-        .await
-    }
-
-    /// Return the active corporate identity binding for `pubkey`, if any.
-    pub async fn get_active_identity_binding_by_pubkey(
-        &self,
-        community_id: CommunityId,
-        pubkey: &[u8],
-    ) -> Result<Option<identity_binding::IdentityBinding>> {
-        identity_binding::get_active_identity_binding_by_pubkey(&self.pool, community_id, pubkey)
-            .await
-    }
-
-    /// Disable a corporate principal and revoke its active key.
-    pub async fn revoke_identity_principal(
-        &self,
-        community_id: CommunityId,
-        issuer: &str,
-        uid: &str,
-        revoked_by: Option<&[u8]>,
-        reason: &str,
-    ) -> Result<bool> {
-        identity_binding::revoke_identity_principal(
-            &self.pool,
-            community_id,
-            issuer,
-            uid,
-            revoked_by,
-            reason,
-        )
-        .await
-    }
-
-    /// Revoke one corporate identity key without disabling its principal.
-    pub async fn revoke_identity_key(
-        &self,
-        community_id: CommunityId,
-        pubkey: &[u8],
-        revoked_by: Option<&[u8]>,
-        reason: &str,
-    ) -> Result<bool> {
-        identity_binding::revoke_identity_key(&self.pool, community_id, pubkey, revoked_by, reason)
-            .await
-    }
-
-    /// Atomically rotate a corporate principal to a replacement key.
-    #[allow(clippy::too_many_arguments)]
-    pub async fn rotate_identity_binding(
-        &self,
-        community_id: CommunityId,
-        issuer: &str,
-        uid: &str,
-        old_pubkey: &[u8],
-        new_pubkey: &[u8],
-        display_name: Option<&str>,
-        source: &str,
-        rotated_by: Option<&[u8]>,
-        reason: &str,
-    ) -> Result<()> {
-        identity_binding::rotate_identity_binding(
-            &self.pool,
-            community_id,
-            issuer,
-            uid,
-            old_pubkey,
-            new_pubkey,
-            display_name,
-            source,
-            rotated_by,
-            reason,
-        )
-        .await
     }
 
     /// Atomically set agent owner — only if no owner is currently assigned.
@@ -4197,7 +4108,7 @@ impl Db {
         pubkey: &str,
         role: &str,
         policy_version: Option<&str>,
-        identity: Option<&identity_binding::IdentityBindingInput<'_>>,
+        identity: Option<&buzz_auth::VerifiedIdentityBindingEvidence>,
     ) -> Result<relay_members::MembershipClaimOutcome> {
         relay_members::claim_relay_membership_with_identity(
             &self.pool,
@@ -4345,7 +4256,7 @@ impl Db {
         token_hash: &[u8; 32],
         claimer_pubkey: &str,
         policy_version: Option<&str>,
-        identity: Option<&identity_binding::IdentityBindingInput<'_>>,
+        identity: Option<&buzz_auth::VerifiedIdentityBindingEvidence>,
     ) -> Result<relay_invite::ClaimOutcome> {
         relay_invite::claim_relay_invite_with_identity(
             &self.pool,

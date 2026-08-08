@@ -17,7 +17,7 @@ pub mod config;
 pub mod conformance;
 /// WebSocket connection lifecycle and state.
 pub mod connection;
-/// Corporate identity verification and uid/pubkey binding.
+/// Corporate identity verification and canonical principal/key binding.
 pub mod corporate_identity;
 /// Relay error types.
 pub mod error;

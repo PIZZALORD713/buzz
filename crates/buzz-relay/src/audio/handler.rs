@@ -266,6 +266,7 @@ async fn handle_active_audio_connection(
         &state,
         tenant.community(),
         pubkey,
+        buzz_auth::ProofTransport::Nip42,
         corporate_identity_jwt.as_deref(),
         auth_tag_json.as_deref(),
     )
@@ -630,8 +631,8 @@ async fn handle_active_audio_connection(
     };
 
     if let Some((added_by, identity_proof)) = deferred_private_admission {
-        let identity_input =
-            crate::corporate_identity::binding_input_for_proof(&identity_proof, &pubkey);
+        let identity_evidence =
+            crate::corporate_identity::binding_evidence_for_proof(&identity_proof);
         let outcome = state
             .db
             .add_member_with_identity(
@@ -640,24 +641,25 @@ async fn handle_active_audio_connection(
                 &pubkey_bytes,
                 MemberRole::Member,
                 Some(&added_by),
-                identity_input.as_ref(),
+                identity_evidence,
             )
             .await;
         let committed_binding = match outcome {
             Ok(buzz_db::channel::ChannelAdmissionOutcome::Joined {
                 identity_binding, ..
-            }) => identity_binding,
-            Ok(buzz_db::channel::ChannelAdmissionOutcome::IdentityConflict(conflict)) => Some(
-                buzz_db::identity_binding::BindIdentityResult::Conflict(conflict),
+            }) => Ok(identity_binding.map(|binding| *binding)),
+            Ok(buzz_db::channel::ChannelAdmissionOutcome::IdentityDenied(denial)) => Err(
+                crate::corporate_identity::atomic_identity_denial_error(denial),
             ),
-            Ok(buzz_db::channel::ChannelAdmissionOutcome::IdentityRevoked) => {
-                Some(buzz_db::identity_binding::BindIdentityResult::Revoked)
-            }
+            Err(error) => Err(crate::corporate_identity::CorporateIdentityError::Db(error)),
+        };
+        let committed_binding = match committed_binding {
+            Ok(binding) => binding,
             Err(e) => {
-                warn!(channel_id = %channel_id, pubkey = %pubkey_hex, "audio membership auto-add failed: {e}");
+                warn!(channel_id = %channel_id, pubkey = %pubkey_hex, error = %e, "audio membership auto-add denied");
                 let _ = ws_send
                     .send(WsMessage::Text(
-                        serde_json::json!({"type":"error","message":"not a member"})
+                        serde_json::json!({"type":"error","message": e.public_message()})
                             .to_string()
                             .into(),
                     ))

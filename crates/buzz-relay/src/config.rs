@@ -68,7 +68,8 @@ pub struct JoinPolicyConfig {
 ///
 /// The relay does not care whether the JWT was injected by a trusted proxy or
 /// attached by a first-party client. It only validates the JWT and binds the
-/// configured uid claim to the authenticated Nostr pubkey after NIP proof.
+/// configured principal claim to the authenticated Nostr event author after
+/// NIP proof.
 #[derive(Debug, Clone)]
 pub struct CorporateIdentityConfig {
     /// Whether every authenticated request must satisfy corporate identity.
@@ -90,9 +91,10 @@ pub struct CorporateIdentityConfig {
     pub uid_claim: String,
     /// Claim name used for verified display.
     ///
-    /// This value is stored only in the private relay binding table. It is
-    /// never projected into a public Nostr event unless
-    /// `public_display_claim` is configured separately.
+    /// This value is retained only while evaluating the verified JWT. It is
+    /// neither persisted in the canonical binding generation nor projected
+    /// into a public Nostr event unless `public_display_claim` is configured
+    /// separately.
     pub display_claim: String,
     /// Optional claim name explicitly approved for public NIP-85 projection.
     /// Unset by default so private corporate attributes stay private.

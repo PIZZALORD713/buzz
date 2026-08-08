@@ -353,14 +353,14 @@ pub struct FederatedPrincipalStorageKey<'a> {
     subject: &'a str,
 }
 
-impl FederatedPrincipalStorageKey<'_> {
+impl<'a> FederatedPrincipalStorageKey<'a> {
     /// Exact validated issuer bytes for a parameterized database bind.
-    pub fn issuer(&self) -> &str {
+    pub const fn issuer(&self) -> &'a str {
         self.issuer
     }
 
     /// Exact opaque subject bytes for a parameterized database bind.
-    pub fn subject(&self) -> &str {
+    pub const fn subject(&self) -> &'a str {
         self.subject
     }
 }

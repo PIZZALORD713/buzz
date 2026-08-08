@@ -78,6 +78,7 @@ async fn verify_media_corporate_identity(
         state,
         tenant.community(),
         pubkey,
+        buzz_auth::ProofTransport::Blossom,
         identity_jwt.as_deref(),
         auth_tag,
     )
