@@ -40,9 +40,16 @@ pub mod scope;
 pub use access::{check_read_access, check_write_access, require_scope, ChannelAccessChecker};
 pub use error::AuthError;
 pub use evidence::{
-    AssertionVerificationPolicy, EvidenceClock, EvidenceError, ExactSingleHttpHeader,
-    NostrKeyClaimPolicy, RequestEvidenceBinding, StaticJwksAssertionVerifier, SystemEvidenceClock,
-    VerifiedAssertionEvidence, VerifiedIdentityBindingEvidence,
+    verify_blossom_authorization, verify_blossom_delegated, verify_blossom_direct,
+    verify_git_smart_http_authorization, verify_git_smart_http_delegated,
+    verify_git_smart_http_direct, verify_nip42_delegated, verify_nip42_direct, verify_nip98_direct,
+    AssertionVerificationPolicy, AuthoritativeDelegationGrant, BlossomAction,
+    CanonicalBlossomRequest, CanonicalGitSmartHttpRequest, CanonicalHttpRequestTarget,
+    DelegationGrantSource, EvidenceClock, EvidenceError, ExactSingleHttpHeader,
+    GitSmartHttpOperation, NostrKeyClaimPolicy, RequestEvidenceBinding,
+    StaticJwksAssertionVerifier, SystemEvidenceClock, TrustedProxyAssertionVerifier,
+    VerifiedAssertionEvidence, VerifiedBlossomAuthorization, VerifiedDelegatedEvidence,
+    VerifiedDirectEvidence, VerifiedGitSmartHttpAuthorization, VerifiedIdentityBindingEvidence,
 };
 pub use foundation::{
     ActiveLocalBinding, AuthContext, AuthorizationAuditConfig, AuthorizationAuditConfigError,
@@ -55,7 +62,10 @@ pub use foundation::{
     VerifiedFederatedAssertion, VerifiedNostrProof, HARD_MAX_AUTHORIZATION_EVENTS_PER_DOMAIN,
     HARD_MAX_AUTHORIZATION_EVENT_BYTES_PER_DOMAIN, HARD_MAX_AUTHORIZATION_EVENT_ENVELOPE_BYTES,
 };
-pub use nip42::{generate_challenge, verify_nip42_event};
+pub use nip42::{
+    generate_challenge, verify_nip42_authorization_proof, verify_nip42_event,
+    Nip42AuthorizationProofError,
+};
 pub use nip98::verify_nip98_event;
 pub use nip98_replay::{
     nip98_replay_key, nip98_replay_key_for_scope, Nip98ReplayGuard, DEFAULT_REPLAY_TTL_SECS,

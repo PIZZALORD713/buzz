@@ -905,8 +905,10 @@ version = "0.1.0"
 dependencies = [
  "base64 0.22.1",
  "buzz-core",
+ "buzz-sdk",
  "chrono",
  "hex",
+ "hmac 0.13.0",
  "http",
  "jsonwebtoken",
  "nostr",
