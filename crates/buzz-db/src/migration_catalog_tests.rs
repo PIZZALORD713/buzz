@@ -258,6 +258,55 @@ async fn parity_scenario() {
         .run_to(33, &pool)
         .await
         .expect("apply invalidation/restore/status prerequisite 0033");
+    let pre_0034_catalog = catalog_snapshot(&pool).await;
+    let canonical_before: String = sqlx::query_scalar(
+        "SELECT jsonb_build_array( \
+             configuration_state,max_events_per_domain,max_bytes_per_domain, \
+             max_envelope_bytes,retained_event_count,retained_envelope_bytes, \
+             retained_largest_envelope_bytes,health_state,failure_code, \
+             failure_observed_at,configured_at,updated_at \
+         )::text FROM authorization_event_capacity WHERE community_id=$1",
+    )
+    .bind(uuid::Uuid::parse_str("41000000-0000-0000-0000-000000000001").unwrap())
+    .fetch_one(&pool)
+    .await
+    .expect("snapshot canonical capacity before 0034");
+    MIGRATOR
+        .run_to(34, &pool)
+        .await
+        .expect("apply dedicated operator pre-auth prerequisite 0034");
+    let post_0034_catalog = catalog_snapshot(&pool).await;
+    let unchanged_post_0034: Vec<_> = post_0034_catalog
+        .iter()
+        .filter(|row| !row.contains("authorization_operator_preauth"))
+        .cloned()
+        .collect();
+    assert_eq!(
+        unchanged_post_0034, pre_0034_catalog,
+        "0034 must not alter any pre-existing PostgreSQL catalog object"
+    );
+    let canonical_after: String = sqlx::query_scalar(
+        "SELECT jsonb_build_array( \
+             configuration_state,max_events_per_domain,max_bytes_per_domain, \
+             max_envelope_bytes,retained_event_count,retained_envelope_bytes, \
+             retained_largest_envelope_bytes,health_state,failure_code, \
+             failure_observed_at,configured_at,updated_at \
+         )::text FROM authorization_event_capacity WHERE community_id=$1",
+    )
+    .bind(uuid::Uuid::parse_str("41000000-0000-0000-0000-000000000001").unwrap())
+    .fetch_one(&pool)
+    .await
+    .expect("snapshot canonical capacity after 0034");
+    assert_eq!(canonical_after, canonical_before);
+    let preauth_rows: (i64, i64) = sqlx::query_as(
+        "SELECT \
+            (SELECT count(*) FROM authorization_operator_preauth_denial_capacity), \
+            (SELECT count(*) FROM authorization_operator_preauth_denial_events)",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("inspect empty dedicated pre-auth lane");
+    assert_eq!(preauth_rows, (0, 0));
     let protected_rows: (i64, i64, i64) = sqlx::query_as(
         "SELECT \
             (SELECT count(*) FROM authorization_invalidation_domains), \
@@ -272,7 +321,7 @@ async fn parity_scenario() {
     let populated_seeds = seed_snapshot(&pool).await;
     assert_eq!(
         populated_catalog, fresh_catalog,
-        "populated synthesized-#1476 upgrade must produce the fresh 0033 catalog"
+        "populated synthesized-#1476 upgrade must produce the fresh 0034 catalog"
     );
     assert_eq!(populated_seeds, fresh_seeds);
 
@@ -309,7 +358,7 @@ async fn parity_scenario() {
 
 #[tokio::test]
 #[ignore = "requires a dedicated disposable Postgres database"]
-async fn invalidation_restore_status_0033_fresh_populated_and_desired_schema_have_full_postgresql_catalog_parity(
+async fn operator_preauth_0034_fresh_populated_and_desired_schema_have_full_postgresql_catalog_parity(
 ) {
     tokio::time::timeout(TEST_DEADLINE, parity_scenario())
         .await

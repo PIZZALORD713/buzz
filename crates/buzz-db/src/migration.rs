@@ -12,6 +12,10 @@ use crate::Result;
 #[path = "migration_catalog_tests.rs"]
 mod catalog_tests;
 
+#[cfg(test)]
+#[path = "migration_operator_preauth_tests.rs"]
+mod operator_preauth_tests;
+
 static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("../../migrations");
 
 /// Run all pending Buzz database migrations.
@@ -565,7 +569,7 @@ mod tests {
         let mut migrations: Vec<_> = MIGRATOR.iter().collect();
         migrations.sort_by_key(|migration| migration.version);
 
-        assert_eq!(migrations.len(), 33);
+        assert_eq!(migrations.len(), 34);
         assert_eq!(migrations[0].version, 1);
         assert_eq!(&*migrations[0].description, "initial schema");
         assert!(migrations[0]
@@ -1028,6 +1032,16 @@ mod tests {
             .sql
             .as_str()
             .contains("CREATE TABLE client_status_revisions"));
+        assert_eq!(migrations[33].version, 34);
+        assert_eq!(&*migrations[33].description, "nip fi operator preauth");
+        let operator_preauth = migrations[33].sql.as_str();
+        assert!(operator_preauth
+            .contains("CREATE TABLE authorization_operator_preauth_denial_capacity"));
+        assert!(
+            operator_preauth.contains("CREATE TABLE authorization_operator_preauth_denial_events")
+        );
+        assert!(!operator_preauth.contains("authorization_authentication_denial_attempts"));
+        assert!(!operator_preauth.contains("CREATE OR REPLACE FUNCTION authorization_event_"));
     }
 
     #[test]
@@ -1045,12 +1059,12 @@ mod tests {
         }
         assert_eq!(
             migrations.last().map(|migration| migration.version),
-            Some(33)
+            Some(34)
         );
     }
 
     #[test]
-    fn synthesized_0029_through_0031_migration_identity_is_frozen() {
+    fn synthesized_0029_through_0033_migration_identity_is_frozen() {
         let expected = [
             (
                 29,
@@ -1066,6 +1080,16 @@ mod tests {
                 31,
                 "nip fi identity lifecycle upgrade",
                 "31e919e55af4c50d4de4247eaddbdb454178df218a07fcb635466fecf632bdbb7b2f25cb1d486d1225dc9f2dfef92065",
+            ),
+            (
+                32,
+                "nip fi protected authority",
+                "5e40b572b6543fdfa03b4010be47d0a0cc7be4a1823ab9f3764b05cf644be84d9d09fd64a1fcdd37c0d08497753cb0dc",
+            ),
+            (
+                33,
+                "nip fi invalidation restore status",
+                "68e87cbb8449de654c826a10a81f8d2705155db48e4cd1547d06b9531b3768f20f97d9ffe400003c019a9f6f830b3bd8",
             ),
         ];
         for (version, description, checksum) in expected {
@@ -1407,7 +1431,7 @@ mod tests {
         run_migrations(&pool)
             .await
             .expect("retry succeeds after operator repair");
-        assert_eq!(applied_versions(&pool).await.last().copied(), Some(32));
+        assert_eq!(applied_versions(&pool).await.last().copied(), Some(34));
     }
 
     #[tokio::test]

@@ -18,20 +18,6 @@ SET client_min_messages = warning;
 SET row_security = off;
 
 --
--- Name: public; Type: SCHEMA; Schema: -; Owner: -
---
-
--- *not* creating schema, since initdb creates it
-
-
---
--- Name: SCHEMA public; Type: COMMENT; Schema: -; Owner: -
---
-
-COMMENT ON SCHEMA public IS '';
-
-
---
 -- Name: pgcrypto; Type: EXTENSION; Schema: -; Owner: -
 --
 
@@ -623,6 +609,399 @@ BEGIN
                   CONSTRAINT = 'authorization_operation_version_delta_cardinality';
     END IF;
     RETURN NULL;
+END;
+$$;
+
+
+--
+-- Name: authorization_operator_preauth_denial_capacity_before_insert_v1(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.authorization_operator_preauth_denial_capacity_before_insert_v1() RETURNS trigger
+    LANGUAGE plpgsql SECURITY DEFINER
+    SET search_path TO 'pg_catalog', 'public'
+    AS $$
+DECLARE
+    policy authorization_operator_preauth_denial_capacity%ROWTYPE;
+    existing authorization_operator_preauth_denial_events%ROWTYPE;
+    envelope_bytes INTEGER;
+    authoritative_now TIMESTAMPTZ;
+    exact_count BIGINT;
+    exact_bytes BIGINT;
+    exact_largest INTEGER;
+    new_episode BOOLEAN;
+    claim_signal BOOLEAN;
+    effective_generation BIGINT;
+BEGIN
+    SELECT * INTO policy
+    FROM authorization_operator_preauth_denial_capacity
+    WHERE community_id = NEW.community_id
+    FOR UPDATE;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'operator pre-auth denial capacity policy missing'
+            USING ERRCODE = 'check_violation',
+                  CONSTRAINT = 'authorization_operator_preauth_capacity_required';
+    END IF;
+    -- Take authoritative time only after the per-domain serialization lock.
+    -- Lock wait must not shorten retention or miss rows that expired while
+    -- this writer was waiting.
+    authoritative_now := clock_timestamp();
+
+    SELECT * INTO existing
+    FROM authorization_operator_preauth_denial_events
+    WHERE community_id = NEW.community_id
+      AND operation_id = NEW.operation_id
+      AND correlation_id = NEW.correlation_id
+      AND semantic_fingerprint = NEW.semantic_fingerprint
+      AND denial_reason = NEW.denial_reason;
+    IF FOUND THEN
+        IF existing.event_id IS DISTINCT FROM NEW.event_id
+            OR existing.attempt_id IS DISTINCT FROM NEW.attempt_id
+            OR existing.expected_revision IS DISTINCT FROM NEW.expected_revision
+            OR existing.action IS DISTINCT FROM NEW.action
+            OR existing.reason_code IS DISTINCT FROM NEW.reason_code
+            OR existing.occurred_at IS DISTINCT FROM NEW.occurred_at
+            OR existing.canonical_envelope IS DISTINCT FROM NEW.canonical_envelope
+            OR existing.envelope_digest IS DISTINCT FROM NEW.envelope_digest
+        THEN
+            RAISE EXCEPTION 'operator pre-auth denial replay payload conflicts'
+                USING ERRCODE = 'unique_violation',
+                      CONSTRAINT = 'authorization_operator_preauth_replay_conflict';
+        END IF;
+        -- Exact replay is idempotent, including when the retained row is
+        -- already past its expiry but has not yet been reclaimed by another
+        -- distinct attempt.
+        RETURN NULL;
+    END IF;
+
+    SELECT count(*),
+           COALESCE(sum(octet_length(canonical_envelope)), 0),
+           COALESCE(max(octet_length(canonical_envelope)), 0)
+    INTO exact_count, exact_bytes, exact_largest
+    FROM authorization_operator_preauth_denial_events
+    WHERE community_id = NEW.community_id;
+    IF policy.retained_event_count <> exact_count
+        OR policy.retained_envelope_bytes <> exact_bytes
+        OR policy.retained_largest_envelope_bytes <> exact_largest
+    THEN
+        RAISE EXCEPTION 'operator pre-auth denial capacity counters are corrupt'
+            USING ERRCODE = 'check_violation',
+                  CONSTRAINT = 'authorization_operator_preauth_counter_integrity';
+    END IF;
+
+    PERFORM set_config(
+        'buzz.operator_preauth_capacity_transition',
+        'reclaim:' || NEW.community_id::text,
+        true
+    );
+    WITH candidates AS (
+        SELECT community_id, event_id
+        FROM authorization_operator_preauth_denial_events
+        WHERE community_id = NEW.community_id
+          AND retain_until <= authoritative_now
+        ORDER BY retain_until, event_id
+        LIMIT 256
+        FOR UPDATE
+    )
+    DELETE FROM authorization_operator_preauth_denial_events events
+    USING candidates
+    WHERE events.community_id = candidates.community_id
+      AND events.event_id = candidates.event_id;
+
+    SELECT count(*),
+           COALESCE(sum(octet_length(canonical_envelope)), 0),
+           COALESCE(max(octet_length(canonical_envelope)), 0)
+    INTO exact_count, exact_bytes, exact_largest
+    FROM authorization_operator_preauth_denial_events
+    WHERE community_id = NEW.community_id;
+    UPDATE authorization_operator_preauth_denial_capacity
+    SET retained_event_count = exact_count,
+        retained_envelope_bytes = exact_bytes,
+        retained_largest_envelope_bytes = exact_largest,
+        updated_at = GREATEST(updated_at, authoritative_now)
+    WHERE community_id = NEW.community_id
+    RETURNING * INTO policy;
+    PERFORM set_config('buzz.operator_preauth_capacity_transition', '', true);
+
+    envelope_bytes := octet_length(NEW.canonical_envelope);
+    IF envelope_bytes > policy.max_envelope_bytes
+        OR policy.retained_event_count >= policy.max_events_per_domain
+        OR envelope_bytes > policy.max_bytes_per_domain - policy.retained_envelope_bytes
+    THEN
+        new_episode := policy.saturation_generation = 0
+            OR (policy.last_recovered_at IS NOT NULL
+                AND policy.last_saturated_at IS NOT NULL
+                AND policy.last_recovered_at >= policy.last_saturated_at);
+        effective_generation := policy.saturation_generation
+            + CASE WHEN new_episode THEN 1 ELSE 0 END;
+        claim_signal := policy.last_signaled_generation < effective_generation
+            AND (policy.next_signal_at IS NULL
+                 OR authoritative_now >= policy.next_signal_at);
+        PERFORM set_config(
+            'buzz.operator_preauth_capacity_transition',
+            'saturate:' || NEW.community_id::text,
+            true
+        );
+        UPDATE authorization_operator_preauth_denial_capacity
+        SET saturation_generation = CASE
+                WHEN new_episode THEN saturation_generation + 1
+                ELSE saturation_generation
+            END,
+            last_signaled_generation = CASE
+                WHEN claim_signal THEN effective_generation
+                ELSE last_signaled_generation
+            END,
+            last_saturated_at = CASE
+                WHEN new_episode THEN authoritative_now
+                ELSE last_saturated_at
+            END,
+            last_signal_at = CASE
+                WHEN claim_signal THEN authoritative_now
+                ELSE last_signal_at
+            END,
+            next_signal_at = CASE
+                WHEN claim_signal THEN authoritative_now + INTERVAL '60 seconds'
+                ELSE next_signal_at
+            END,
+            last_signal_xid = CASE
+                WHEN claim_signal THEN pg_current_xact_id()
+                ELSE last_signal_xid
+            END,
+            updated_at = GREATEST(updated_at, authoritative_now)
+        WHERE community_id = NEW.community_id;
+        PERFORM set_config('buzz.operator_preauth_capacity_transition', '', true);
+        RETURN NULL;
+    END IF;
+
+    NEW.accepted_at := authoritative_now;
+    NEW.retain_until := authoritative_now + INTERVAL '24 hours';
+    PERFORM set_config(
+        'buzz.operator_preauth_capacity_transition',
+        'insert:' || NEW.community_id::text,
+        true
+    );
+    PERFORM set_config(
+        'buzz.operator_preauth_envelope_bytes',
+        envelope_bytes::text,
+        true
+    );
+    UPDATE authorization_operator_preauth_denial_capacity
+    SET retained_event_count = retained_event_count + 1,
+        retained_envelope_bytes = retained_envelope_bytes + envelope_bytes,
+        retained_largest_envelope_bytes = GREATEST(
+            retained_largest_envelope_bytes,
+            envelope_bytes
+        ),
+        last_recovered_at = CASE
+            WHEN last_saturated_at IS NOT NULL
+                 AND (last_recovered_at IS NULL OR last_recovered_at < last_saturated_at)
+            THEN authoritative_now
+            ELSE last_recovered_at
+        END,
+        updated_at = GREATEST(updated_at, authoritative_now)
+    WHERE community_id = NEW.community_id;
+    PERFORM set_config('buzz.operator_preauth_envelope_bytes', '', true);
+    PERFORM set_config('buzz.operator_preauth_capacity_transition', '', true);
+    RETURN NEW;
+EXCEPTION WHEN OTHERS THEN
+    PERFORM set_config('buzz.operator_preauth_envelope_bytes', '', true);
+    PERFORM set_config('buzz.operator_preauth_capacity_transition', '', true);
+    RAISE;
+END;
+$$;
+
+
+--
+-- Name: authorization_operator_preauth_denial_capacity_guard_v1(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.authorization_operator_preauth_denial_capacity_guard_v1() RETURNS trigger
+    LANGUAGE plpgsql SECURITY DEFINER
+    SET search_path TO 'pg_catalog', 'public'
+    AS $$
+DECLARE
+    transition TEXT;
+    exact_count BIGINT;
+    exact_bytes BIGINT;
+    exact_largest INTEGER;
+    inserted_bytes INTEGER;
+BEGIN
+    transition := current_setting('buzz.operator_preauth_capacity_transition', true);
+    IF TG_OP = 'INSERT' THEN
+        SELECT count(*),
+               COALESCE(sum(octet_length(canonical_envelope)), 0),
+               COALESCE(max(octet_length(canonical_envelope)), 0)
+        INTO exact_count, exact_bytes, exact_largest
+        FROM authorization_operator_preauth_denial_events
+        WHERE community_id = NEW.community_id;
+        IF NEW.saturation_generation <> 0
+            OR NEW.last_signaled_generation <> 0
+            OR NEW.last_saturated_at IS NOT NULL
+            OR NEW.last_recovered_at IS NOT NULL
+            OR NEW.last_signal_at IS NOT NULL
+            OR NEW.next_signal_at IS NOT NULL
+            OR NEW.last_signal_xid IS NOT NULL
+        THEN
+            RAISE EXCEPTION 'operator pre-auth denial capacity must begin at exact empty state'
+                USING ERRCODE = 'check_violation',
+                      CONSTRAINT = 'authorization_operator_preauth_initial_state';
+        END IF;
+        -- Derivation keeps startup `INSERT ... ON CONFLICT DO NOTHING`
+        -- idempotent after retained rows exist while preventing callers from
+        -- fabricating aggregate counters on a genuinely new row.
+        NEW.retained_event_count := exact_count;
+        NEW.retained_envelope_bytes := exact_bytes;
+        NEW.retained_largest_envelope_bytes := exact_largest;
+        RETURN NEW;
+    END IF;
+
+    IF NEW.community_id IS DISTINCT FROM OLD.community_id
+        OR NEW.max_events_per_domain IS DISTINCT FROM OLD.max_events_per_domain
+        OR NEW.max_bytes_per_domain IS DISTINCT FROM OLD.max_bytes_per_domain
+        OR NEW.max_envelope_bytes IS DISTINCT FROM OLD.max_envelope_bytes
+        OR NEW.configured_at IS DISTINCT FROM OLD.configured_at
+        OR NEW.updated_at < OLD.updated_at
+    THEN
+        RAISE EXCEPTION 'operator pre-auth denial capacity policy is immutable'
+            USING ERRCODE = 'check_violation';
+    END IF;
+
+    IF pg_trigger_depth() <> 2 THEN
+        RAISE EXCEPTION 'operator pre-auth denial capacity transition requires nested trigger ownership'
+            USING ERRCODE = 'check_violation';
+    END IF;
+
+    IF transition = 'reclaim:' || OLD.community_id::text THEN
+        SELECT count(*),
+               COALESCE(sum(octet_length(canonical_envelope)), 0),
+               COALESCE(max(octet_length(canonical_envelope)), 0)
+        INTO exact_count, exact_bytes, exact_largest
+        FROM authorization_operator_preauth_denial_events
+        WHERE community_id = OLD.community_id;
+        IF NEW.retained_event_count <> exact_count
+            OR NEW.retained_envelope_bytes <> exact_bytes
+            OR NEW.retained_largest_envelope_bytes <> exact_largest
+            OR NEW.retained_event_count > OLD.retained_event_count
+            OR NEW.retained_envelope_bytes > OLD.retained_envelope_bytes
+            OR NEW.retained_largest_envelope_bytes > OLD.retained_largest_envelope_bytes
+            OR NEW.saturation_generation IS DISTINCT FROM OLD.saturation_generation
+            OR NEW.last_signaled_generation IS DISTINCT FROM OLD.last_signaled_generation
+            OR NEW.last_saturated_at IS DISTINCT FROM OLD.last_saturated_at
+            OR NEW.last_recovered_at IS DISTINCT FROM OLD.last_recovered_at
+            OR NEW.last_signal_at IS DISTINCT FROM OLD.last_signal_at
+            OR NEW.next_signal_at IS DISTINCT FROM OLD.next_signal_at
+            OR NEW.last_signal_xid IS DISTINCT FROM OLD.last_signal_xid
+        THEN
+            RAISE EXCEPTION 'operator pre-auth denial reclamation counters are not exact'
+                USING ERRCODE = 'check_violation';
+        END IF;
+        RETURN NEW;
+    END IF;
+
+    IF transition = 'saturate:' || OLD.community_id::text THEN
+        IF NEW.retained_event_count IS DISTINCT FROM OLD.retained_event_count
+            OR NEW.retained_envelope_bytes IS DISTINCT FROM OLD.retained_envelope_bytes
+            OR NEW.retained_largest_envelope_bytes
+               IS DISTINCT FROM OLD.retained_largest_envelope_bytes
+            OR NEW.last_recovered_at IS DISTINCT FROM OLD.last_recovered_at
+            OR NEW.saturation_generation NOT IN (
+                OLD.saturation_generation,
+                OLD.saturation_generation + 1
+            )
+            OR (NEW.saturation_generation = OLD.saturation_generation
+                AND NEW.last_saturated_at IS DISTINCT FROM OLD.last_saturated_at)
+            OR (NEW.saturation_generation = OLD.saturation_generation + 1
+                AND (NEW.last_saturated_at IS NULL
+                     OR (OLD.last_saturated_at IS NOT NULL
+                         AND NEW.last_saturated_at < OLD.last_saturated_at)))
+            OR NEW.last_signaled_generation NOT IN (
+                OLD.last_signaled_generation,
+                NEW.saturation_generation
+            )
+            OR (
+                NEW.last_signaled_generation = OLD.last_signaled_generation
+                AND (
+                    NEW.last_signal_at IS DISTINCT FROM OLD.last_signal_at
+                    OR NEW.next_signal_at IS DISTINCT FROM OLD.next_signal_at
+                    OR NEW.last_signal_xid IS DISTINCT FROM OLD.last_signal_xid
+                )
+            )
+            OR (
+                NEW.last_signaled_generation > OLD.last_signaled_generation
+                AND (
+                    NEW.last_signaled_generation <> NEW.saturation_generation
+                    OR NEW.last_signal_at IS NULL
+                    OR NEW.next_signal_at <> NEW.last_signal_at + INTERVAL '60 seconds'
+                    OR NEW.last_signal_xid IS DISTINCT FROM pg_current_xact_id()
+                    OR (OLD.next_signal_at IS NOT NULL
+                        AND NEW.last_signal_at < OLD.next_signal_at)
+                )
+            )
+        THEN
+            RAISE EXCEPTION 'operator pre-auth denial saturation transition is invalid'
+                USING ERRCODE = 'check_violation';
+        END IF;
+        RETURN NEW;
+    END IF;
+
+    BEGIN
+        inserted_bytes := current_setting('buzz.operator_preauth_envelope_bytes', true)::INTEGER;
+    EXCEPTION WHEN OTHERS THEN
+        RAISE EXCEPTION 'operator pre-auth denial insert is missing its exact envelope size'
+            USING ERRCODE = 'check_violation';
+    END;
+    IF transition IS DISTINCT FROM 'insert:' || OLD.community_id::text
+        OR inserted_bytes <= 0
+        OR NEW.retained_event_count <> OLD.retained_event_count + 1
+        OR NEW.retained_envelope_bytes <> OLD.retained_envelope_bytes + inserted_bytes
+        OR NEW.retained_largest_envelope_bytes
+           <> GREATEST(OLD.retained_largest_envelope_bytes, inserted_bytes)
+        OR NEW.saturation_generation IS DISTINCT FROM OLD.saturation_generation
+        OR NEW.last_signaled_generation IS DISTINCT FROM OLD.last_signaled_generation
+        OR NEW.last_saturated_at IS DISTINCT FROM OLD.last_saturated_at
+        OR NEW.last_signal_at IS DISTINCT FROM OLD.last_signal_at
+        OR NEW.next_signal_at IS DISTINCT FROM OLD.next_signal_at
+        OR NEW.last_signal_xid IS DISTINCT FROM OLD.last_signal_xid
+        OR NOT (
+            NEW.last_recovered_at IS NOT DISTINCT FROM OLD.last_recovered_at
+            OR (
+                OLD.last_saturated_at IS NOT NULL
+                AND (OLD.last_recovered_at IS NULL
+                     OR OLD.last_recovered_at < OLD.last_saturated_at)
+                AND NEW.last_recovered_at >= OLD.last_saturated_at
+            )
+        )
+    THEN
+        RAISE EXCEPTION 'operator pre-auth denial capacity cannot be reset online'
+            USING ERRCODE = 'check_violation';
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+
+--
+-- Name: authorization_operator_preauth_denial_events_retention_guard_v1(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.authorization_operator_preauth_denial_events_retention_guard_v1() RETURNS trigger
+    LANGUAGE plpgsql SECURITY DEFINER
+    SET search_path TO 'pg_catalog', 'public'
+    AS $$
+BEGIN
+    IF TG_OP = 'UPDATE' THEN
+        RAISE EXCEPTION 'operator pre-auth denial events are immutable'
+            USING ERRCODE = 'check_violation';
+    END IF;
+    IF pg_trigger_depth() <> 2
+        OR current_setting('buzz.operator_preauth_capacity_transition', true)
+           IS DISTINCT FROM 'reclaim:' || OLD.community_id::text
+        OR clock_timestamp() < OLD.retain_until
+    THEN
+        RAISE EXCEPTION 'operator pre-auth denial event is still retained'
+            USING ERRCODE = 'check_violation';
+    END IF;
+    RETURN OLD;
 END;
 $$;
 
@@ -1789,6 +2168,78 @@ CREATE TABLE public.authorization_operation_version_deltas (
     CONSTRAINT authorization_operation_version_deltas_component_digest_check CHECK ((octet_length(component_digest) = 32)),
     CONSTRAINT authorization_operation_version_deltas_component_key_check CHECK ((octet_length(component_key) = 32)),
     CONSTRAINT authorization_operation_version_deltas_component_kind_check CHECK ((component_kind = ANY (ARRAY[1, 2, 3, 4, 5, 6, 7])))
+);
+
+
+--
+-- Name: authorization_operator_preauth_denial_capacity; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.authorization_operator_preauth_denial_capacity (
+    community_id uuid NOT NULL,
+    max_events_per_domain bigint NOT NULL,
+    max_bytes_per_domain bigint NOT NULL,
+    max_envelope_bytes integer NOT NULL,
+    retained_event_count bigint DEFAULT 0 NOT NULL,
+    retained_envelope_bytes bigint DEFAULT 0 NOT NULL,
+    retained_largest_envelope_bytes integer DEFAULT 0 NOT NULL,
+    configured_at timestamp with time zone DEFAULT transaction_timestamp() NOT NULL,
+    updated_at timestamp with time zone DEFAULT transaction_timestamp() NOT NULL,
+    saturation_generation bigint DEFAULT 0 NOT NULL,
+    last_signaled_generation bigint DEFAULT 0 NOT NULL,
+    last_saturated_at timestamp with time zone,
+    last_recovered_at timestamp with time zone,
+    last_signal_at timestamp with time zone,
+    next_signal_at timestamp with time zone,
+    last_signal_xid xid8,
+    CONSTRAINT authorization_operator_preau_retained_largest_envelope_by_check CHECK ((retained_largest_envelope_bytes >= 0)),
+    CONSTRAINT authorization_operator_preauth_de_retained_envelope_bytes_check CHECK ((retained_envelope_bytes >= 0)),
+    CONSTRAINT authorization_operator_preauth_deni_max_events_per_domain_check CHECK (((max_events_per_domain >= 1) AND (max_events_per_domain <= 1000000))),
+    CONSTRAINT authorization_operator_preauth_denia_max_bytes_per_domain_check CHECK (((max_bytes_per_domain >= 1) AND (max_bytes_per_domain <= '4294967296'::bigint))),
+    CONSTRAINT authorization_operator_preauth_denia_retained_event_count_check CHECK ((retained_event_count >= 0)),
+    CONSTRAINT authorization_operator_preauth_denial__max_envelope_bytes_check CHECK (((max_envelope_bytes >= 1) AND (max_envelope_bytes <= 65536))),
+    CONSTRAINT authorization_operator_preauth_denial_capacity_check CHECK ((max_envelope_bytes <= max_bytes_per_domain)),
+    CONSTRAINT authorization_operator_preauth_denial_capacity_check1 CHECK ((retained_event_count <= max_events_per_domain)),
+    CONSTRAINT authorization_operator_preauth_denial_capacity_check2 CHECK ((retained_envelope_bytes <= max_bytes_per_domain)),
+    CONSTRAINT authorization_operator_preauth_denial_capacity_check3 CHECK ((retained_largest_envelope_bytes <= max_envelope_bytes)),
+    CONSTRAINT authorization_operator_preauth_saturation_generation_nonneg CHECK ((saturation_generation >= 0)),
+    CONSTRAINT authorization_operator_preauth_saturation_state_consistent CHECK ((((saturation_generation = 0) AND (last_signaled_generation = 0) AND (last_saturated_at IS NULL) AND (last_recovered_at IS NULL) AND (last_signal_at IS NULL) AND (next_signal_at IS NULL) AND (last_signal_xid IS NULL)) OR ((saturation_generation > 0) AND (last_saturated_at IS NOT NULL) AND (((last_signaled_generation = 0) AND (last_signal_at IS NULL) AND (next_signal_at IS NULL) AND (last_signal_xid IS NULL)) OR ((last_signaled_generation > 0) AND (last_signal_at IS NOT NULL) AND (next_signal_at = (last_signal_at + '00:01:00'::interval)) AND (last_signal_xid IS NOT NULL)))))),
+    CONSTRAINT authorization_operator_preauth_signaled_generation_bounded CHECK (((last_signaled_generation >= 0) AND (last_signaled_generation <= saturation_generation)))
+);
+
+
+--
+-- Name: authorization_operator_preauth_denial_events; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.authorization_operator_preauth_denial_events (
+    community_id uuid NOT NULL,
+    event_id uuid NOT NULL,
+    operation_id uuid NOT NULL,
+    correlation_id uuid NOT NULL,
+    attempt_id uuid NOT NULL,
+    semantic_fingerprint bytea NOT NULL,
+    denial_reason smallint NOT NULL,
+    expected_revision bigint NOT NULL,
+    action smallint NOT NULL,
+    reason_code smallint NOT NULL,
+    occurred_at timestamp with time zone NOT NULL,
+    accepted_at timestamp with time zone DEFAULT transaction_timestamp() NOT NULL,
+    canonical_envelope bytea NOT NULL,
+    envelope_digest bytea NOT NULL,
+    retain_until timestamp with time zone NOT NULL,
+    CONSTRAINT authorization_operator_preauth_denia_semantic_fingerprint_check CHECK ((octet_length(semantic_fingerprint) = 32)),
+    CONSTRAINT authorization_operator_preauth_denial__canonical_envelope_check CHECK (((octet_length(canonical_envelope) >= 1) AND (octet_length(canonical_envelope) <= 65536))),
+    CONSTRAINT authorization_operator_preauth_denial_e_expected_revision_check CHECK ((expected_revision > 0)),
+    CONSTRAINT authorization_operator_preauth_denial_eve_envelope_digest_check CHECK ((octet_length(envelope_digest) = 32)),
+    CONSTRAINT authorization_operator_preauth_denial_even_correlation_id_check CHECK ((correlation_id <> '00000000-0000-0000-0000-000000000000'::uuid)),
+    CONSTRAINT authorization_operator_preauth_denial_event_denial_reason_check CHECK ((denial_reason = ANY (ARRAY[1, 2, 3]))),
+    CONSTRAINT authorization_operator_preauth_denial_events_action_check CHECK ((action = ANY (ARRAY[1, 2, 3, 4, 5, 6, 7, 8]))),
+    CONSTRAINT authorization_operator_preauth_denial_events_attempt_id_check CHECK ((attempt_id <> '00000000-0000-0000-0000-000000000000'::uuid)),
+    CONSTRAINT authorization_operator_preauth_denial_events_event_id_check CHECK ((event_id <> '00000000-0000-0000-0000-000000000000'::uuid)),
+    CONSTRAINT authorization_operator_preauth_denial_events_operation_id_check CHECK ((operation_id <> '00000000-0000-0000-0000-000000000000'::uuid)),
+    CONSTRAINT authorization_operator_preauth_denial_events_reason_code_check CHECK ((reason_code = ANY (ARRAY[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]))),
+    CONSTRAINT authorization_operator_preauth_retention_positive CHECK ((retain_until > accepted_at))
 );
 
 
@@ -3363,6 +3814,30 @@ ALTER TABLE ONLY public.authorization_operation_version_deltas
 
 
 --
+-- Name: authorization_operator_preauth_denial_events authorization_operator_preaut_community_id_operation_id_cor_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.authorization_operator_preauth_denial_events
+    ADD CONSTRAINT authorization_operator_preaut_community_id_operation_id_cor_key UNIQUE (community_id, operation_id, correlation_id, semantic_fingerprint, denial_reason);
+
+
+--
+-- Name: authorization_operator_preauth_denial_capacity authorization_operator_preauth_denial_capacity_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.authorization_operator_preauth_denial_capacity
+    ADD CONSTRAINT authorization_operator_preauth_denial_capacity_pkey PRIMARY KEY (community_id);
+
+
+--
+-- Name: authorization_operator_preauth_denial_events authorization_operator_preauth_denial_events_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.authorization_operator_preauth_denial_events
+    ADD CONSTRAINT authorization_operator_preauth_denial_events_pkey PRIMARY KEY (community_id, event_id);
+
+
+--
 -- Name: channel_members channel_members_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -3936,6 +4411,13 @@ ALTER TABLE ONLY public.workflow_runs
 
 ALTER TABLE ONLY public.workflows
     ADD CONSTRAINT workflows_pkey PRIMARY KEY (community_id, id);
+
+
+--
+-- Name: authorization_operator_preauth_denial_retention; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX authorization_operator_preauth_denial_retention ON public.authorization_operator_preauth_denial_events USING btree (community_id, retain_until, event_id);
 
 
 --
@@ -5997,6 +6479,48 @@ CREATE TRIGGER authorization_operation_version_deltas_no_truncate BEFORE TRUNCAT
 
 
 --
+-- Name: authorization_operator_preauth_denial_events authorization_operator_preauth_denial_capacity_insert; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER authorization_operator_preauth_denial_capacity_insert BEFORE INSERT ON public.authorization_operator_preauth_denial_events FOR EACH ROW EXECUTE FUNCTION public.authorization_operator_preauth_denial_capacity_before_insert_v1();
+
+
+--
+-- Name: authorization_operator_preauth_denial_capacity authorization_operator_preauth_denial_capacity_monotonic; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER authorization_operator_preauth_denial_capacity_monotonic BEFORE INSERT OR UPDATE ON public.authorization_operator_preauth_denial_capacity FOR EACH ROW EXECUTE FUNCTION public.authorization_operator_preauth_denial_capacity_guard_v1();
+
+
+--
+-- Name: authorization_operator_preauth_denial_capacity authorization_operator_preauth_denial_capacity_no_delete; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER authorization_operator_preauth_denial_capacity_no_delete BEFORE DELETE ON public.authorization_operator_preauth_denial_capacity FOR EACH ROW EXECUTE FUNCTION public.nip_fi_reject_row_mutation_v1();
+
+
+--
+-- Name: authorization_operator_preauth_denial_capacity authorization_operator_preauth_denial_capacity_no_truncate; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER authorization_operator_preauth_denial_capacity_no_truncate BEFORE TRUNCATE ON public.authorization_operator_preauth_denial_capacity FOR EACH STATEMENT EXECUTE FUNCTION public.nip_fi_reject_truncate_v1();
+
+
+--
+-- Name: authorization_operator_preauth_denial_events authorization_operator_preauth_denial_events_immutable; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER authorization_operator_preauth_denial_events_immutable BEFORE DELETE OR UPDATE ON public.authorization_operator_preauth_denial_events FOR EACH ROW EXECUTE FUNCTION public.authorization_operator_preauth_denial_events_retention_guard_v1();
+
+
+--
+-- Name: authorization_operator_preauth_denial_events authorization_operator_preauth_denial_events_no_truncate; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER authorization_operator_preauth_denial_events_no_truncate BEFORE TRUNCATE ON public.authorization_operator_preauth_denial_events FOR EACH STATEMENT EXECUTE FUNCTION public.nip_fi_reject_truncate_v1();
+
+
+--
 -- Name: client_status_revisions client_status_revisions_immutable; Type: TRIGGER; Schema: public; Owner: -
 --
 
@@ -6389,6 +6913,22 @@ ALTER TABLE ONLY public.authorization_operation_version_delta_manifests
 
 ALTER TABLE ONLY public.authorization_operation_version_deltas
     ADD CONSTRAINT authorization_operation_version_deltas_community_id_fkey FOREIGN KEY (community_id) REFERENCES public.communities(id);
+
+
+--
+-- Name: authorization_operator_preauth_denial_capacity authorization_operator_preauth_denial_capacit_community_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.authorization_operator_preauth_denial_capacity
+    ADD CONSTRAINT authorization_operator_preauth_denial_capacit_community_id_fkey FOREIGN KEY (community_id) REFERENCES public.communities(id);
+
+
+--
+-- Name: authorization_operator_preauth_denial_events authorization_operator_preauth_denial_events_community_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.authorization_operator_preauth_denial_events
+    ADD CONSTRAINT authorization_operator_preauth_denial_events_community_id_fkey FOREIGN KEY (community_id) REFERENCES public.communities(id);
 
 
 --
@@ -6925,6 +7465,27 @@ ALTER TABLE ONLY public.workflows
 
 ALTER TABLE ONLY public.workflows
     ADD CONSTRAINT workflows_community_id_owner_pubkey_fkey FOREIGN KEY (community_id, owner_pubkey) REFERENCES public.users(community_id, pubkey);
+
+
+--
+-- Name: FUNCTION authorization_operator_preauth_denial_capacity_before_insert_v1(); Type: ACL; Schema: public; Owner: -
+--
+
+REVOKE ALL ON FUNCTION public.authorization_operator_preauth_denial_capacity_before_insert_v1() FROM PUBLIC;
+
+
+--
+-- Name: FUNCTION authorization_operator_preauth_denial_capacity_guard_v1(); Type: ACL; Schema: public; Owner: -
+--
+
+REVOKE ALL ON FUNCTION public.authorization_operator_preauth_denial_capacity_guard_v1() FROM PUBLIC;
+
+
+--
+-- Name: FUNCTION authorization_operator_preauth_denial_events_retention_guard_v1(); Type: ACL; Schema: public; Owner: -
+--
+
+REVOKE ALL ON FUNCTION public.authorization_operator_preauth_denial_events_retention_guard_v1() FROM PUBLIC;
 
 
 --

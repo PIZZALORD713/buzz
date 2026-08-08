@@ -704,14 +704,14 @@ jobs:
             --run-ignored ignored-only
         env:
           DATABASE_URL: postgres://buzz:${{ env.BUZZ_TEST_POSTGRES_PASSWORD }}@localhost:5432/buzz_identity_tests
-      - name: NIP-FI 0031-0032 projection, protected authority, and exact catalog parity
+      - name: NIP-FI 0031-0034 migration catalog and behavior
         run: |
           docker exec -e PGPASSWORD="${BUZZ_TEST_POSTGRES_PASSWORD}" buzz-postgres \
             psql -U buzz -d postgres -v ON_ERROR_STOP=1 \
             -c "CREATE DATABASE buzz_schema_parity"
           cargo nextest run \
             --archive-file target/ci/backend-integration-tests.tar.zst \
-            -E 'package(buzz-db) and (test(protected_authority_0032_fresh_populated_and_desired_schema_have_full_postgresql_catalog_parity) or test(protected_authority_0032_enforces_exact_fence_and_immutability) or test(populated_0030_projects_exact_lifecycle_and_capacity_bootstrap) or test(identity_0031_rejects_duplicate_ambiguous_and_open_lineage_atomically) or test(authorization_capacity_hard_boundaries_are_exact))' \
+            -E 'package(buzz-db) and (test(operator_preauth_0034_fresh_populated_and_desired_schema_have_full_postgresql_catalog_parity) or test(operator_preauth_0034_enforces_bounded_retention_and_trigger_ownership) or test(protected_authority_0032_enforces_exact_fence_and_immutability) or test(populated_0030_projects_exact_lifecycle_and_capacity_bootstrap) or test(identity_0031_rejects_duplicate_ambiguous_and_open_lineage_atomically) or test(authorization_capacity_hard_boundaries_are_exact))' \
             --test-threads 1 \
             --run-ignored ignored-only
         env:
