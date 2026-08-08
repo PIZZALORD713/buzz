@@ -157,6 +157,9 @@ export function CommunityOnboardingFlow({
   const systemColorScheme = useSystemColorScheme();
   const [displayName, setDisplayName] = React.useState("");
   const [avatarUrl, setAvatarUrl] = React.useState("");
+  const [localAvatarPreviewUrl, setLocalAvatarPreviewUrl] = React.useState<
+    string | null
+  >(null);
   const [avatarSquishKey, setAvatarSquishKey] = React.useState(0);
   const [transitionDirection, setTransitionDirection] =
     React.useState<OnboardingTransitionDirection>("forward");
@@ -688,7 +691,9 @@ export function CommunityOnboardingFlow({
                                   </div>
                                 ) : (
                                   <ProfileAvatar
-                                    avatarUrl={avatarUrl || null}
+                                    avatarUrl={
+                                      localAvatarPreviewUrl || avatarUrl || null
+                                    }
                                     className="h-full w-full rounded-full text-5xl"
                                     label={displayName.trim() || "Your profile"}
                                     testId="community-avatar-live-preview"
@@ -717,6 +722,7 @@ export function CommunityOnboardingFlow({
                           setAnimatedPreviewCaption
                         }
                         onEmojiAvatarChange={animateEmojiAvatarChange}
+                        onLocalPreviewChange={setLocalAvatarPreviewUrl}
                         onUploadingChange={setIsUploadingAvatar}
                         onUrlChange={setAvatarUrl}
                         presentation="onboarding-modal"

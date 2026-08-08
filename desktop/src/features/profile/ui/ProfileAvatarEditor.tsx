@@ -71,6 +71,7 @@ export function ProfileAvatarEditor({
   onCustomColorPickerOpenChange,
   onEmojiAvatarChange,
   onModeChange,
+  onLocalPreviewChange,
   onUploadedAvatarChange,
   onUrlChange,
   onAnimatedAvatarApply,
@@ -95,6 +96,9 @@ export function ProfileAvatarEditor({
   const [isDragging, setIsDragging] = React.useState(false);
   const [urlDraft, setUrlDraft] = React.useState("");
   const localPreview = useLocalAvatarPreview();
+  React.useEffect(() => {
+    onLocalPreviewChange?.(localPreview.previewUrl);
+  }, [localPreview.previewUrl, onLocalPreviewChange]);
   const [selectedEmoji, setSelectedEmoji] = React.useState<string | null>(
     () => initialEmojiAvatar?.emoji ?? null,
   );

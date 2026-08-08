@@ -2092,6 +2092,9 @@ test("connected first-community profile keeps Back bottom-left and balances the 
   );
   await expect(saveButton).toBeDisabled();
   await expect(saveButton).toHaveText("Save");
+  await expect(
+    page.getByTestId("community-avatar-live-preview-image"),
+  ).toHaveAttribute("src", /^blob:/);
   await saveButton.click();
   await expect(avatarDialog).toHaveCount(0);
   const avatarCircleImage = page.getByTestId("community-avatar-circle-image");

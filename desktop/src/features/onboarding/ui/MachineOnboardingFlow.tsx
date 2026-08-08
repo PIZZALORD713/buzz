@@ -252,32 +252,33 @@ export function MachineOnboardingFlow({
   }, [backupSession, backupSubview, identityWasImported]);
 
   const chromeBackAction =
-    page === "key-import" && !identityLost
+    page === "key-import" &&
+    (!identityLost || keyImportStage === "backup-password")
       ? { onClick: backFromKeyImport }
-      : page === "backup" && backupSubview === "options"
-        ? { label: "Return to onboarding", onClick: returnToCreatedKey }
-        : page === "backup" && backupSubview === "password"
-          ? backupSession.created
-            ? undefined
-            : { onClick: backFromPasswordBackup }
-          : page === "backup"
-            ? {
-                onClick: () => {
-                  setTransitionDirection("backward");
-                  setPage("identity");
-                },
-              }
-            : page === "setup"
-              ? { onClick: backFromSetup }
-              : page === "config"
-                ? {
-                    disabled: isDefaultConfigSaving,
-                    onClick: () => {
-                      setTransitionDirection("backward");
-                      setPage("setup");
-                    },
-                  }
-                : undefined;
+      : page === "backup" && backupSubview !== "created"
+        ? {
+            label: "Return to onboarding",
+            onClick: returnToCreatedKey,
+            testId: "backup-return-to-onboarding",
+          }
+        : page === "backup"
+          ? {
+              onClick: () => {
+                setTransitionDirection("backward");
+                setPage("identity");
+              },
+            }
+          : page === "setup"
+            ? { onClick: backFromSetup }
+            : page === "config"
+              ? {
+                  disabled: isDefaultConfigSaving,
+                  onClick: () => {
+                    setTransitionDirection("backward");
+                    setPage("setup");
+                  },
+                }
+              : undefined;
 
   return (
     <div
@@ -292,7 +293,7 @@ export function MachineOnboardingFlow({
     >
       <StartupWindowDragRegion />
       {page === "identity" ? <LandingBees /> : null}
-      {page !== "identity" ? (
+      {page !== "identity" && !isSecuritySubview ? (
         <OnboardingChrome
           current={page === "config" ? 4 : page === "setup" ? 3 : 2}
         />
@@ -413,6 +414,7 @@ export function MachineOnboardingFlow({
                     onImport={importExistingIdentity}
                     onStageChange={setKeyImportStage}
                     showBack={false}
+                    showPasswordStageBack={false}
                     variant="spotlight"
                   />
                   {identityLost && keyImportStage === "key-entry" ? (

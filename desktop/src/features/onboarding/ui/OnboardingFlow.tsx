@@ -606,6 +606,7 @@ export function OnboardingFlow({
                   onImport={importExistingKey}
                   onStageChange={setKeyImportStage}
                   showBack={false}
+                  showPasswordStageBack={false}
                 />
               </OnboardingSlideTransition>
             ) : (

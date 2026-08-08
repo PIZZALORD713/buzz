@@ -8,6 +8,14 @@ const OnboardingFooterTargetContext = React.createContext<HTMLElement | null>(
   null,
 );
 
+/** Configuration for the provider-rendered, bottom-docked Back button. */
+export type OnboardingBackAction = {
+  disabled?: boolean;
+  label?: string;
+  onClick: () => void;
+  testId?: string;
+};
+
 /**
  * Renders the shared, bottom-docked CTA slot for an onboarding shell and
  * exposes it to descendant steps via context.
@@ -21,13 +29,6 @@ const OnboardingFooterTargetContext = React.createContext<HTMLElement | null>(
  * `--buzz-welcome-chartreuse` and the theme color tokens still resolve for the
  * docked buttons.
  */
-export type OnboardingBackAction = {
-  disabled?: boolean;
-  label?: string;
-  onClick: () => void;
-  testId?: string;
-};
-
 export function OnboardingFooterProvider({
   backAction,
   children,
