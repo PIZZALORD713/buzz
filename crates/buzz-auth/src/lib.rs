@@ -32,6 +32,8 @@ pub mod nip42;
 pub mod nip98;
 /// NIP-98 replay protection — shared, community-scoped, atomic seen-set.
 pub mod nip98_replay;
+/// Origin-sealed deployment-operator lifecycle and provisioning authority.
+pub mod operator_lifecycle;
 /// Per-connection rate limiting.
 pub mod rate_limit;
 /// OAuth scope parsing and enforcement.
@@ -70,6 +72,11 @@ pub use nip98::verify_nip98_event;
 pub use nip98_replay::{
     nip98_replay_key, nip98_replay_key_for_scope, Nip98ReplayGuard, DEFAULT_REPLAY_TTL_SECS,
     MAX_REPLAY_TTL_SECS,
+};
+pub use operator_lifecycle::{
+    OperatorLifecycleAction, OperatorLifecycleGrantError, OperatorLifecycleVerifier,
+    VerifiedOperatorLifecycleCandidate, VerifiedOperatorLifecycleGrant,
+    VerifiedProvisionBindingCandidate, VerifiedProvisionBindingIntent,
 };
 pub use rate_limit::{
     ip_rate_limit_key, rate_limit_key, LimitType, RateLimitConfig, RateLimitResult, RateLimiter,
