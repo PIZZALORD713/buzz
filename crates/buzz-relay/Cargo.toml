@@ -93,6 +93,7 @@ mesh-llm-host-runtime = { git = "https://github.com/Mesh-LLM/mesh-llm.git", tag 
 buzz-test-client = { path = "../buzz-test-client" }
 ed25519-dalek = "=3.0.0-rc.0"
 buzz-core = { workspace = true, features = ["test-utils"] }
+buzz-db = { workspace = true, features = ["test-utils"] }
 buzz-auth = { workspace = true, features = ["dev"] }
 reqwest = { workspace = true }
 tokio-tungstenite = { workspace = true }

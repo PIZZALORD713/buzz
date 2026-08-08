@@ -29,6 +29,8 @@ pub mod authorization_restore;
 pub mod authorization_version;
 /// Channel and membership persistence.
 pub mod channel;
+/// Epoch-free PostgreSQL client-binding status revision allocation.
+pub mod client_status;
 /// Direct message channel persistence.
 pub mod dm;
 /// Database error types.

@@ -2,10 +2,12 @@
 
 mod finalization;
 mod publication;
+mod status;
 
 pub use buzz_db::authorization_restore::{
     OperationRestoreError, OperationRestoreRuntime, ProtectedPublicationRestoreReconciliation,
-    RestoredProtectedPublicationError, PRODUCTION_OPERATION_FENCE_CONNECTIONS,
+    RestoredClientStatusError, RestoredProtectedPublicationError,
+    PRODUCTION_OPERATION_FENCE_CONNECTIONS,
 };
 
 pub use finalization::{
@@ -18,3 +20,4 @@ pub use publication::{
     LiveProtectedPublicationWitness, ProtectedPublicationObserver,
     ProtectedPublicationObserverError,
 };
+pub use status::{ProductionClientStatusError, ProductionClientStatusRuntime};

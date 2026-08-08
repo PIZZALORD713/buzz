@@ -11,6 +11,8 @@ pub mod agent_turn_metric;
 pub mod authorization;
 /// Channel and membership enums shared across crates.
 pub mod channel;
+/// Relay-authenticated, display-only current-binding status contract.
+pub mod client_binding_status;
 /// NIP-AE Agent Engrams — slug grammar, conversation key, d-tag derivation,
 /// body parse/serialize, envelope build/validate, head selection.
 pub mod engram;

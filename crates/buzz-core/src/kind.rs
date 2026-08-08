@@ -85,6 +85,11 @@ pub const KIND_AUTH: u32 = 22242;
 pub const KIND_BLOSSOM_AUTH: u32 = 24242;
 /// Buzz custom one-time identity binding proof (ephemeral, not stored).
 pub const KIND_NOSTR_IDENTITY_BINDING: u32 = 24243;
+/// Buzz relay-authenticated, display-only client binding status.
+///
+/// Kind 24244 is ephemeral and relay-authored. It is never durable profile
+/// authority and must not be used to make authorization decisions.
+pub const KIND_CLIENT_BINDING_STATUS: u32 = 24244;
 /// NIP-98: HTTP auth event (used in nip98.rs, not stored).
 pub const KIND_HTTP_AUTH: u32 = 27235;
 
@@ -702,6 +707,7 @@ pub const ALL_KINDS: &[u32] = &[
     KIND_TYPING_INDICATOR,
     KIND_HUDDLE_REACTION,
     KIND_BLOSSOM_AUTH,
+    KIND_CLIENT_BINDING_STATUS,
     KIND_PAIRING,
     KIND_AGENT_OBSERVER_FRAME,
     KIND_HTTP_AUTH,
@@ -837,6 +843,7 @@ pub const fn is_relay_only_kind(kind: u32) -> bool {
     matches!(
         kind,
         KIND_NIP43_MEMBERSHIP_LIST
+            | KIND_CLIENT_BINDING_STATUS
             | KIND_CHANNEL_SUMMARY
             | KIND_PRESENCE_SNAPSHOT
             | KIND_DM_VISIBILITY
@@ -917,6 +924,12 @@ mod tests {
     fn nip43_membership_snapshot_is_relay_only() {
         assert!(is_relay_only_kind(KIND_NIP43_MEMBERSHIP_LIST));
         assert!(!is_relay_only_kind(KIND_NIP43_LEAVE_REQUEST));
+    }
+
+    #[test]
+    fn client_binding_status_is_relay_only_and_ephemeral() {
+        assert!(is_relay_only_kind(KIND_CLIENT_BINDING_STATUS));
+        assert!(is_ephemeral(KIND_CLIENT_BINDING_STATUS));
     }
 
     #[test]

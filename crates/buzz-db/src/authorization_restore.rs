@@ -23,6 +23,10 @@ use crate::{
         AuthorizationVersionComponentKind, ProtectedPublicationCommit, ProtectedPublicationError,
         ProtectedPublicationRequest, ProtectedPublicationRestoreIdentity,
     },
+    client_status::{
+        AllocatedClientStatusRevision, ClientStatusAllocationRequest, ClientStatusRestoreIdentity,
+        ClientStatusRevisionError, ClientStatusWithdrawalRequest,
+    },
     Db, DbError,
 };
 use async_trait::async_trait;
@@ -231,6 +235,17 @@ pub enum RestoredProtectedPublicationError {
     /// The canonical publication transaction denied or failed.
     #[error(transparent)]
     Publication(#[from] ProtectedPublicationError),
+    /// The external operation witness failed.
+    #[error(transparent)]
+    Restore(#[from] OperationRestoreError),
+}
+
+/// Fail-closed combined status-revision/database/restore result.
+#[derive(Debug, Error)]
+pub enum RestoredClientStatusError {
+    /// The canonical status transaction denied or failed.
+    #[error(transparent)]
+    Revision(#[from] ClientStatusRevisionError),
     /// The external operation witness failed.
     #[error(transparent)]
     Restore(#[from] OperationRestoreError),
@@ -1342,6 +1357,18 @@ impl OperationRestoreRuntime {
         .await
     }
 
+    async fn begin_client_status(
+        &self,
+        identity: ClientStatusRestoreIdentity,
+    ) -> Result<FencedRestoreIntent, OperationRestoreError> {
+        self.begin_fenced(OperationIdentity {
+            domain: identity.authorization_domain(),
+            operation_id: identity.operation_id(),
+            request_fingerprint: identity.request_fingerprint(),
+        })
+        .await
+    }
+
     /// Execute one sealed staged publication on its lock-owning primary
     /// session. The session is never returned to a pool.
     pub async fn commit_protected_publication(
@@ -1370,6 +1397,60 @@ impl OperationRestoreRuntime {
                 Err(error.into())
             }
             Err(error @ ProtectedPublicationError::Database(_)) => {
+                self.abandon_ambiguous(fenced);
+                Err(error.into())
+            }
+        }
+    }
+
+    /// Allocate one exact client-status revision behind an external Pending
+    /// intent and the same-session PostgreSQL operation fence.
+    pub async fn allocate_client_status_revision(
+        &self,
+        request: ClientStatusAllocationRequest,
+    ) -> Result<AllocatedClientStatusRevision, RestoredClientStatusError> {
+        let mut fenced = self.begin_client_status(request.restore_identity()).await?;
+        let result = self
+            .0
+            .writer_db
+            .allocate_client_status_revision_fenced(fenced.capability_mut()?, request)
+            .await;
+        self.finish_client_status_write(fenced, result).await
+    }
+
+    /// Allocate one exact client-status withdrawal behind an external Pending
+    /// intent and the same-session PostgreSQL operation fence.
+    pub async fn withdraw_client_status_revision(
+        &self,
+        request: ClientStatusWithdrawalRequest,
+    ) -> Result<AllocatedClientStatusRevision, RestoredClientStatusError> {
+        let mut fenced = self.begin_client_status(request.restore_identity()).await?;
+        let result = self
+            .0
+            .writer_db
+            .withdraw_client_status_revision_fenced(fenced.capability_mut()?, request)
+            .await;
+        self.finish_client_status_write(fenced, result).await
+    }
+
+    async fn finish_client_status_write(
+        &self,
+        fenced: FencedRestoreIntent,
+        result: Result<AllocatedClientStatusRevision, ClientStatusRevisionError>,
+    ) -> Result<AllocatedClientStatusRevision, RestoredClientStatusError> {
+        match result {
+            Ok(allocated) => {
+                self.commit_fenced(fenced).await?;
+                Ok(allocated)
+            }
+            Err(
+                error @ (ClientStatusRevisionError::StaleEvidence
+                | ClientStatusRevisionError::RevisionConflict),
+            ) => {
+                self.abort_fenced(fenced).await?;
+                Err(error.into())
+            }
+            Err(error) => {
                 self.abandon_ambiguous(fenced);
                 Err(error.into())
             }
