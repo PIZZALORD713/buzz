@@ -357,7 +357,11 @@ jobs:
             -p buzz-test-client \
             --lib \
             --test e2e_event_reminder \
+            --test j3c_current_binding_relay_harness \
             --archive-file target/ci/backend-integration-tests.tar.zst
+          cargo nextest list \
+            --archive-file target/ci/backend-integration-tests.tar.zst \
+            -E 'binary(j3c_current_binding_relay_harness)'
       - name: Save relay artifacts cache
         if: steps.relay-artifacts-cache.outputs.cache-hit != 'true'
         uses: actions/cache/save@caa296126883cff596d87d8935842f9db880ef25 # v5
@@ -684,6 +688,11 @@ jobs:
           done
           cat /tmp/buzz-relay.log
           exit 1
+      - name: Current-binding relay loopback harness
+        run: |
+          cargo nextest run \
+            --archive-file target/ci/backend-integration-tests.tar.zst \
+            -E 'binary(j3c_current_binding_relay_harness)'
       - name: Invite security tests
         run: |
           cargo nextest run \
