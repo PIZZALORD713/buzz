@@ -741,7 +741,6 @@ export function ProfileAvatarEditor({
                   onPreviewCaptionChange={onAnimatedPreviewCaptionChange}
                   previewContainer={animatedPreviewContainer}
                   registerApply={registerAnimatedApply}
-                  autoStartCamera={isOnboardingModal}
                   compactReview={isOnboardingModal}
                   showApplyButton={!onDone}
                   testIdPrefix={testIdPrefix}

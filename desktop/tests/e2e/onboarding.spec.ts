@@ -2168,12 +2168,23 @@ test("connected first-community profile keeps Back bottom-left and balances the 
   expect(emojiEditorLayout.saveBox.y).toBe(imageEditorLayout.saveBox.y);
   await page.getByRole("tab", { name: "Animated" }).click();
   await expect(saveButton).toHaveCount(0);
+  const iphoneCameraButton = page.getByTestId(
+    "community-avatar-animated-camera-iphone",
+  );
+  const computerCameraButton = page.getByTestId(
+    "community-avatar-animated-camera-computer",
+  );
+  await expect(iphoneCameraButton).toBeVisible();
+  await expect(computerCameraButton).toBeVisible();
+  await expect(iphoneCameraButton).toHaveAttribute("aria-pressed", "false");
+  await expect(computerCameraButton).toHaveAttribute("aria-pressed", "false");
+  await iphoneCameraButton.click();
   await expect(
     page.getByTestId("community-avatar-animated-error"),
   ).toContainText("Could not access the camera");
-  const retryCameraButton = page.getByTestId("community-avatar-animated-retry");
-  await expect(retryCameraButton).toHaveText("Try camera again");
-  await retryCameraButton.click();
+  await expect(iphoneCameraButton).toHaveAttribute("aria-pressed", "true");
+  await computerCameraButton.click();
+  await expect(computerCameraButton).toHaveAttribute("aria-pressed", "true");
   const captureButton = page.getByTestId("community-avatar-animated-record");
   await expect(captureButton).toHaveText("Capture 3 sec video");
   await captureButton.click();
