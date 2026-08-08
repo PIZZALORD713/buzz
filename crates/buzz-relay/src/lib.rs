@@ -4,6 +4,9 @@
 
 mod admission;
 
+/// Origin-sealed deployment-operator identity lifecycle composition.
+pub mod operator_runtime;
+
 /// Provider-free authorization finalization and publication observation.
 pub mod authorization_runtime;
 
