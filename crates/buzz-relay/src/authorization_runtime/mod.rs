@@ -23,8 +23,8 @@ pub use finalization::{
     ProtectedPublicationEvidence, VerifiedProtectedPublicationRoute,
 };
 pub use production::{
-    BaseV1AuthorizationConfiguration, BaseV1EnrollmentMode, ProviderFreeV1Composition,
-    ProviderFreeV1CompositionError,
+    BaseV1AuthorizationConfiguration, BaseV1EnrollmentMode, ClientStatusAdmissionPolicy,
+    ProviderFreeV1Composition, ProviderFreeV1CompositionError,
 };
 pub use publication::{
     LiveProtectedPublicationWitness, ProtectedPublicationObserver,

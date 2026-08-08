@@ -72,10 +72,69 @@ pub struct BaseV1AuthorizationConfiguration {
     authorization_domain: CommunityId,
     mode: NipFiMode,
     event_capacity: Option<AuthorizationEventCapacityPolicy>,
+    client_status_admission: Option<ClientStatusAdmissionPolicy>,
     assertion_verifier: Option<Arc<TrustedProxyAssertionVerifier>>,
     enrollment_policy: Option<AuthorizationEnrollmentPolicy>,
     maximum_lease: Duration,
     restore_bootstrap_id: Option<uuid::Uuid>,
+}
+
+/// Explicit per-domain admission bounds for optional kind-24244 presentation.
+///
+/// The values are operator policy, not identity data, but Debug remains
+/// redacted so configuration dumps cannot become an accidental policy oracle.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct ClientStatusAdmissionPolicy {
+    max_presentations_per_domain: u64,
+    max_presentations_per_actor: u64,
+    max_presentations_per_peer: u64,
+}
+
+impl ClientStatusAdmissionPolicy {
+    /// Validate one complete Enforce-mode policy against canonical audit
+    /// capacity before any Redis, database, listener, or restore-store I/O.
+    pub(crate) fn new(
+        event_capacity: AuthorizationEventCapacityPolicy,
+        max_presentations_per_domain: u64,
+        max_presentations_per_actor: u64,
+        max_presentations_per_peer: u64,
+    ) -> Result<Self, ProviderFreeV1CompositionError> {
+        if max_presentations_per_domain == 0
+            || max_presentations_per_actor == 0
+            || max_presentations_per_peer == 0
+            || max_presentations_per_domain > event_capacity.max_events_per_domain()
+            || max_presentations_per_actor > max_presentations_per_domain
+            || max_presentations_per_peer > max_presentations_per_domain
+        {
+            return Err(ProviderFreeV1CompositionError::IncompleteConfiguration);
+        }
+        Ok(Self {
+            max_presentations_per_domain,
+            max_presentations_per_actor,
+            max_presentations_per_peer,
+        })
+    }
+
+    /// Fixed-window domain bound.
+    pub const fn max_presentations_per_domain(self) -> u64 {
+        self.max_presentations_per_domain
+    }
+
+    /// Fixed-window authenticated-actor bound.
+    pub const fn max_presentations_per_actor(self) -> u64 {
+        self.max_presentations_per_actor
+    }
+
+    /// Fixed-window canonical-peer bound.
+    pub const fn max_presentations_per_peer(self) -> u64 {
+        self.max_presentations_per_peer
+    }
+}
+
+impl fmt::Debug for ClientStatusAdmissionPolicy {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("ClientStatusAdmissionPolicy([REDACTED])")
+    }
 }
 
 impl BaseV1AuthorizationConfiguration {
@@ -88,6 +147,7 @@ impl BaseV1AuthorizationConfiguration {
             authorization_domain,
             mode: NipFiMode::DenyProtected,
             event_capacity: None,
+            client_status_admission: None,
             assertion_verifier: None,
             enrollment_policy: None,
             maximum_lease: Duration::ZERO,
@@ -101,6 +161,7 @@ impl BaseV1AuthorizationConfiguration {
     pub(crate) fn enforce_direct(
         authorization_domain: CommunityId,
         event_capacity: AuthorizationEventCapacityPolicy,
+        client_status_admission: ClientStatusAdmissionPolicy,
         policy_revision: u64,
         enrollment_mode: BaseV1EnrollmentMode,
         issuer: impl Into<String>,
@@ -190,6 +251,7 @@ impl BaseV1AuthorizationConfiguration {
             authorization_domain,
             mode: NipFiMode::Enforce,
             event_capacity: Some(event_capacity),
+            client_status_admission: Some(client_status_admission),
             assertion_verifier: Some(Arc::new(assertion_verifier)),
             enrollment_policy: Some(enrollment_policy),
             maximum_lease,
@@ -229,6 +291,11 @@ impl BaseV1AuthorizationConfiguration {
     pub const fn restore_bootstrap_id(&self) -> Option<uuid::Uuid> {
         self.restore_bootstrap_id
     }
+
+    /// Explicit status-presentation admission policy for Enforce only.
+    pub const fn client_status_admission_policy(&self) -> Option<ClientStatusAdmissionPolicy> {
+        self.client_status_admission
+    }
 }
 
 impl fmt::Debug for BaseV1AuthorizationConfiguration {
@@ -249,6 +316,7 @@ enum InstalledDomain {
         publication: ProtectedPublicationAuthorizationHandle,
         enrollment: ProviderFreeEnrollmentRuntime,
         status: ProductionClientStatusRuntime,
+        status_admission: ClientStatusAdmissionPolicy,
         restore: OperationRestoreRuntime,
         enrollment_mode: BaseV1EnrollmentMode,
         policy_revision: u64,
@@ -346,6 +414,9 @@ impl ProviderFreeV1Composition {
                     let enrollment_policy = configuration
                         .enrollment_policy
                         .ok_or(ProviderFreeV1CompositionError::IncompleteConfiguration)?;
+                    let status_admission = configuration
+                        .client_status_admission
+                        .ok_or(ProviderFreeV1CompositionError::IncompleteConfiguration)?;
                     let enrollment_mode =
                         BaseV1EnrollmentMode::from_database(enrollment_policy.enrollment_mode());
                     let policy_revision = enrollment_policy.policy_revision();
@@ -363,6 +434,7 @@ impl ProviderFreeV1Composition {
                             relay_keys.clone(),
                             restore.clone(),
                         ),
+                        status_admission,
                         restore,
                         enrollment_mode,
                         policy_revision,
@@ -410,6 +482,22 @@ impl ProviderFreeV1Composition {
             Some(InstalledDomain::Enforce {
                 status, restore, ..
             }) if status.is_healthy() && restore.is_healthy() => Ok(status.clone()),
+            Some(InstalledDomain::Enforce { .. }) => Err(ProviderFreeV1CompositionError::Unhealthy),
+            _ => Err(ProviderFreeV1CompositionError::NotEnforced),
+        }
+    }
+
+    /// Exact validated admission policy for one Enforce domain.
+    pub fn client_status_admission_policy(
+        &self,
+        authorization_domain: CommunityId,
+    ) -> Result<ClientStatusAdmissionPolicy, ProviderFreeV1CompositionError> {
+        match self.domains.get(&authorization_domain) {
+            Some(InstalledDomain::Enforce {
+                status_admission,
+                restore,
+                ..
+            }) if restore.is_healthy() => Ok(*status_admission),
             Some(InstalledDomain::Enforce { .. }) => Err(ProviderFreeV1CompositionError::Unhealthy),
             _ => Err(ProviderFreeV1CompositionError::NotEnforced),
         }
@@ -613,6 +701,7 @@ fn validate_configuration(
         NipFiMode::Off => Err(ProviderFreeV1CompositionError::IncompleteConfiguration),
         NipFiMode::DenyProtected
             if configuration.event_capacity.is_none()
+                && configuration.client_status_admission.is_none()
                 && configuration.assertion_verifier.is_none()
                 && configuration.enrollment_policy.is_none()
                 && configuration.maximum_lease.is_zero()
@@ -622,6 +711,7 @@ fn validate_configuration(
         }
         NipFiMode::Enforce
             if configuration.event_capacity.is_some()
+                && configuration.client_status_admission.is_some()
                 && configuration.assertion_verifier.is_some()
                 && configuration.enrollment_policy.is_some()
                 && !configuration.maximum_lease.is_zero()
@@ -733,9 +823,11 @@ mod tests {
         };
         let nostr_key_claim = claim_override.unwrap_or(default_claim);
         let risk_acknowledgement = acknowledgement_override.unwrap_or(default_acknowledgement);
+        let status_admission = ClientStatusAdmissionPolicy::new(capacity, 100, 5, 20)?;
         BaseV1AuthorizationConfiguration::enforce_direct(
             domain,
             capacity,
+            status_admission,
             1,
             enrollment_mode,
             "https://issuer.example",
@@ -813,6 +905,32 @@ mod tests {
             .expect("valid deny configuration");
         assert_eq!(configuration.mode(), NipFiMode::DenyProtected);
         assert!(!format!("{configuration:?}").contains(&domain.as_uuid().to_string()));
+        assert!(configuration.client_status_admission_policy().is_none());
+    }
+
+    #[test]
+    fn client_status_admission_is_explicit_bounded_and_redacted() {
+        let capacity =
+            AuthorizationEventCapacityPolicy::new(100, 1 << 20, 16 << 10).expect("capacity");
+        let policy =
+            ClientStatusAdmissionPolicy::new(capacity, 100, 5, 20).expect("complete admission");
+        assert_eq!(policy.max_presentations_per_domain(), 100);
+        assert_eq!(policy.max_presentations_per_actor(), 5);
+        assert_eq!(policy.max_presentations_per_peer(), 20);
+        let debug = format!("{policy:?}");
+        assert_eq!(debug, "ClientStatusAdmissionPolicy([REDACTED])");
+
+        for rejected in [
+            ClientStatusAdmissionPolicy::new(capacity, 0, 1, 1),
+            ClientStatusAdmissionPolicy::new(capacity, 101, 1, 1),
+            ClientStatusAdmissionPolicy::new(capacity, 10, 11, 1),
+            ClientStatusAdmissionPolicy::new(capacity, 10, 1, 11),
+        ] {
+            assert!(matches!(
+                rejected,
+                Err(ProviderFreeV1CompositionError::IncompleteConfiguration)
+            ));
+        }
     }
 
     #[test]
@@ -833,10 +951,16 @@ mod tests {
             assert_eq!(configuration.enrollment_mode(), Some(mode));
             assert_eq!(configuration.policy_revision(), Some(1));
         }
+        let invalid_capacity =
+            AuthorizationEventCapacityPolicy::new(100, 1 << 20, 16 << 10).expect("capacity");
+        let invalid_status_admission =
+            ClientStatusAdmissionPolicy::new(invalid_capacity, 100, 5, 20)
+                .expect("status admission");
         assert!(matches!(
             BaseV1AuthorizationConfiguration::enforce_direct(
                 CommunityId::from_uuid(Uuid::new_v4()),
-                AuthorizationEventCapacityPolicy::new(100, 1 << 20, 16 << 10).expect("capacity"),
+                invalid_capacity,
+                invalid_status_admission,
                 0,
                 BaseV1EnrollmentMode::AttestedKey,
                 "https://issuer.example",

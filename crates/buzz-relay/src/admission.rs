@@ -1,6 +1,11 @@
+use std::net::IpAddr;
+
 use buzz_auth::{LimitType, RateLimiter};
 use buzz_core::TenantContext;
+use buzz_pubsub::rate_limiter::RedisRateLimiter;
 use nostr::PublicKey;
+
+use crate::authorization_runtime::ClientStatusAdmissionPolicy;
 
 // Desktop startup establishes several independent live subscriptions at once.
 // Preserve the configured average rate while allowing that bounded burst. This
@@ -32,6 +37,46 @@ pub(crate) async fn check_principal<L: RateLimiter>(
         }),
         Err(error) => {
             tracing::warn!(error = %error, "shared rate-limit admission unavailable");
+            Err(AdmissionError::Unavailable)
+        }
+    }
+}
+
+/// Canonicalize peer identity before any shared admission key is derived.
+pub(crate) fn canonical_peer_ip(peer: IpAddr) -> IpAddr {
+    match peer {
+        IpAddr::V6(peer) => peer.to_ipv4_mapped().map_or(IpAddr::V6(peer), IpAddr::V4),
+        peer => peer,
+    }
+}
+
+/// Admit optional status presentation without changing the completed AUTH
+/// decision. A Redis denial or failure silently withholds presentation and is
+/// never mapped to authorization/runtime health.
+pub(crate) async fn check_client_status_presentation(
+    limiter: &RedisRateLimiter,
+    tenant: &TenantContext,
+    actor: &PublicKey,
+    peer: IpAddr,
+    policy: ClientStatusAdmissionPolicy,
+) -> Result<(), AdmissionError> {
+    match limiter
+        .check_client_status_admission(
+            tenant.community(),
+            actor,
+            canonical_peer_ip(peer),
+            policy.max_presentations_per_domain(),
+            policy.max_presentations_per_actor(),
+            policy.max_presentations_per_peer(),
+        )
+        .await
+    {
+        Ok(result) if result.allowed => Ok(()),
+        Ok(result) => Err(AdmissionError::Exceeded {
+            reset_in_secs: result.reset_in_secs,
+        }),
+        Err(error) => {
+            tracing::warn!(error = %error, "client status admission unavailable");
             Err(AdmissionError::Unavailable)
         }
     }
@@ -110,6 +155,15 @@ mod tests {
     #[test]
     fn websocket_budget_saturates_on_overflow() {
         assert_eq!(ws_admission_budget(u64::MAX), (5, u64::MAX));
+    }
+
+    #[test]
+    fn ipv4_and_mapped_ipv6_share_one_canonical_peer() {
+        let ipv4 = "192.0.2.44".parse::<IpAddr>().expect("IPv4 fixture");
+        let mapped = "::ffff:192.0.2.44"
+            .parse::<IpAddr>()
+            .expect("mapped IPv6 fixture");
+        assert_eq!(canonical_peer_ip(ipv4), canonical_peer_ip(mapped));
     }
 
     #[tokio::test]

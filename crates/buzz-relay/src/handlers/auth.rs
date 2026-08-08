@@ -406,6 +406,31 @@ async fn deliver_current_binding_status(
             return;
         }
     };
+    let admission_policy = match composition.client_status_admission_policy(authorization_domain) {
+        Ok(policy) => policy,
+        Err(error) => {
+            debug!(conn_id = %conn.conn_id, error = %error, "client-binding status admission unavailable");
+            return;
+        }
+    };
+    let Some(admission_result) = await_optional_status_presentation(
+        &conn.cancel,
+        crate::admission::check_client_status_presentation(
+            state.admission_rate_limiter.as_ref(),
+            &conn.tenant,
+            &event_author_pubkey,
+            conn.remote_addr.ip(),
+            admission_policy,
+        ),
+    )
+    .await
+    else {
+        return;
+    };
+    match admission_result {
+        Ok(Ok(())) => {}
+        Ok(Err(_)) | Err(_) => return,
+    }
     let Some(current_result) = await_optional_status_presentation(
         &conn.cancel,
         runtime.current(authorization_domain, event_author_pubkey),
@@ -626,6 +651,17 @@ mod tests {
         domain: CommunityId,
         restore_bootstrap_id: Uuid,
     ) -> BaseV1AuthorizationConfiguration {
+        direct_status_configuration_with_limits(domain, restore_bootstrap_id, 100, 100, 5, 20)
+    }
+
+    fn direct_status_configuration_with_limits(
+        domain: CommunityId,
+        restore_bootstrap_id: Uuid,
+        max_events_per_domain: u64,
+        max_presentations_per_domain: u64,
+        max_presentations_per_actor: u64,
+        max_presentations_per_peer: u64,
+    ) -> BaseV1AuthorizationConfiguration {
         let jwk: Jwk = serde_json::from_value(serde_json::json!({
             "kty": "OKP",
             "crv": "Ed25519",
@@ -636,10 +672,20 @@ mod tests {
             "alg": "EdDSA"
         }))
         .expect("fixture JWK");
+        let capacity =
+            AuthorizationEventCapacityPolicy::new(max_events_per_domain, 1 << 20, 16 << 10)
+                .expect("valid status audit capacity");
+        let admission = crate::authorization_runtime::ClientStatusAdmissionPolicy::new(
+            capacity,
+            max_presentations_per_domain,
+            max_presentations_per_actor,
+            max_presentations_per_peer,
+        )
+        .expect("valid status admission policy");
         BaseV1AuthorizationConfiguration::enforce_direct(
             domain,
-            AuthorizationEventCapacityPolicy::new(100, 1 << 20, 16 << 10)
-                .expect("valid status audit capacity"),
+            capacity,
+            admission,
             1,
             BaseV1EnrollmentMode::AttestedKey,
             "https://issuer.example",
@@ -761,9 +807,23 @@ mod tests {
         scratch_url: String,
         relay_keys: Keys,
     ) -> Arc<AppState> {
+        let redis_url = std::env::var("TEST_REDIS_URL")
+            .or_else(|_| std::env::var("REDIS_URL"))
+            .unwrap_or_else(|_| "redis://127.0.0.1:6379".to_owned());
+        status_auth_state_with_redis(pool, db, scratch_url, relay_keys, redis_url, None).await
+    }
+
+    async fn status_auth_state_with_redis(
+        pool: PgPool,
+        db: Db,
+        scratch_url: String,
+        relay_keys: Keys,
+        redis_url: String,
+        admission_redis_url: Option<String>,
+    ) -> Arc<AppState> {
         let mut config = Config::from_env().expect("default relay config loads");
         config.database_url = scratch_url;
-        config.redis_url = "redis://127.0.0.1:1".to_owned();
+        config.redis_url = redis_url;
         config.relay_url = "ws://config-host.invalid".to_owned();
         config.pubkey_allowlist_enabled = false;
         config.require_relay_membership = false;
@@ -788,7 +848,7 @@ mod tests {
         ));
         let media_storage =
             buzz_media::MediaStorage::new(&config.media).expect("create inert media storage");
-        let (state, _audit_shutdown) = AppState::new(
+        let (mut state, _audit_shutdown) = AppState::new(
             config,
             db,
             redis_pool,
@@ -800,6 +860,14 @@ mod tests {
             relay_keys,
             media_storage,
         );
+        if let Some(admission_redis_url) = admission_redis_url {
+            let admission_pool = deadpool_redis::Config::from_url(admission_redis_url)
+                .create_pool(Some(deadpool_redis::Runtime::Tokio1))
+                .expect("create independent status-admission pool");
+            state.admission_rate_limiter = Arc::new(
+                buzz_pubsub::rate_limiter::RedisRateLimiter::new(admission_pool),
+            );
+        }
         Arc::new(state)
     }
 
@@ -825,6 +893,84 @@ mod tests {
             .custom_created_at(Timestamp::now())
             .sign_with_keys(author)
             .expect("sign scoped AUTH event")
+    }
+
+    fn unscoped_auth_event(author: &Keys, challenge: &str, relay_url: &str) -> Event {
+        EventBuilder::new(Kind::Authentication, "")
+            .tags([
+                Tag::parse(["challenge", challenge]).expect("valid challenge tag"),
+                Tag::parse(["relay", relay_url]).expect("valid relay tag"),
+            ])
+            .custom_created_at(Timestamp::now())
+            .sign_with_keys(author)
+            .expect("sign unscoped AUTH event")
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct StatusAuditSnapshot {
+        revisions: i64,
+        receipts: i64,
+        events: i64,
+        manifests: i64,
+        deltas: i64,
+        retained_events: i64,
+        retained_bytes: i64,
+        health_state: i16,
+        failure_code: Option<i16>,
+    }
+
+    async fn status_audit_snapshot(pool: &PgPool, domain: CommunityId) -> StatusAuditSnapshot {
+        let row: (i64, i64, i64, i64, i64, i64, i64, i16, Option<i16>) = sqlx::query_as(
+            "SELECT \
+                    (SELECT count(*) FROM client_status_revisions s \
+                     WHERE s.community_id=$1), \
+                    (SELECT count(*) FROM authorization_operation_receipts r \
+                     WHERE r.community_id=$1 AND r.operation_kind=13), \
+                    (SELECT count(*) FROM authorization_events e \
+                     WHERE e.community_id=$1 AND e.event_kind IN (12,13)), \
+                    (SELECT count(*) FROM authorization_operation_version_delta_manifests m \
+                     JOIN authorization_operation_receipts r \
+                       ON r.community_id=m.community_id AND r.operation_id=m.operation_id \
+                     WHERE m.community_id=$1 AND r.operation_kind=13), \
+                    (SELECT count(*) FROM authorization_operation_version_deltas d \
+                     JOIN authorization_operation_receipts r \
+                       ON r.community_id=d.community_id AND r.operation_id=d.operation_id \
+                     WHERE d.community_id=$1 AND r.operation_kind=13), \
+                    c.retained_event_count,c.retained_envelope_bytes,c.health_state,c.failure_code \
+                 FROM authorization_event_capacity c WHERE c.community_id=$1",
+        )
+        .bind(domain.as_uuid())
+        .fetch_one(pool)
+        .await
+        .expect("read exact status/audit snapshot");
+        StatusAuditSnapshot {
+            revisions: row.0,
+            receipts: row.1,
+            events: row.2,
+            manifests: row.3,
+            deltas: row.4,
+            retained_events: row.5,
+            retained_bytes: row.6,
+            health_state: row.7,
+            failure_code: row.8,
+        }
+    }
+
+    async fn status_admission_key_count(redis_url: &str, domain: CommunityId) -> usize {
+        let redis_pool = deadpool_redis::Config::from_url(redis_url)
+            .create_pool(Some(deadpool_redis::Runtime::Tokio1))
+            .expect("create status admission inspection pool");
+        let mut connection = redis_pool
+            .get()
+            .await
+            .expect("connect status admission inspection pool");
+        let pattern = format!("buzz:{{{domain}}}:ratelimit:client-status:*");
+        let keys: Vec<String> = redis::cmd("KEYS")
+            .arg(pattern)
+            .query_async(&mut *connection)
+            .await
+            .expect("inspect isolated status admission keys");
+        keys.len()
     }
 
     async fn next_relay_text(
@@ -983,6 +1129,275 @@ mod tests {
         assert!(!current.content.contains("connection_epoch"));
 
         socket.close(None).await.expect("close loopback socket");
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres and Redis"]
+    async fn postgres_excess_scoped_reconnects_are_auth_neutral_and_zero_write() {
+        let (pool, db, domain, scratch_url) = scratch_status_database().await;
+        let relay_keys = Keys::generate();
+        let author = Keys::generate();
+        let restore_bootstrap_id = Uuid::new_v4();
+        let restore =
+            OperationRestoreRuntime::for_tests(db.clone(), [(domain, restore_bootstrap_id)])
+                .with_database_fences_for_test(pool.clone());
+        restore
+            .provision_domain(domain)
+            .await
+            .expect("provision status restore baseline");
+        let composition = ProviderFreeV1Composition::build(
+            db.clone(),
+            relay_keys.clone(),
+            vec![direct_status_configuration_with_limits(
+                domain,
+                restore_bootstrap_id,
+                1,
+                1,
+                1,
+                1,
+            )],
+            Some(restore),
+        )
+        .await
+        .expect("build bounded production status composition");
+        let status_runtime = composition
+            .client_status_runtime(domain)
+            .expect("healthy status runtime");
+        seed_current_binding(&pool, domain, &author).await;
+
+        let state = status_auth_state(pool.clone(), db, scratch_url, relay_keys.clone()).await;
+        state
+            .install_provider_free_authorization(composition)
+            .expect("install bounded status composition");
+        let host = format!("status-{}.example", domain.as_uuid().simple());
+        let relay_url = format!("ws://{host}");
+
+        let (server, mut socket, challenge) = connect_status_relay(state.clone(), &host).await;
+        let first_epoch = ClientBindingEpoch::new_v4();
+        let first_auth =
+            scoped_auth_event(&author, &challenge, &relay_url, &first_epoch, &relay_keys);
+        let first_event_id = first_auth.id.to_hex();
+        socket
+            .send(Message::Text(
+                serde_json::json!(["AUTH", first_auth]).to_string().into(),
+            ))
+            .await
+            .expect("send first admitted AUTH");
+        let first_ok: Value = serde_json::from_str(&next_relay_text(&mut socket).await)
+            .expect("first AUTH acknowledgement parses");
+        assert_eq!(
+            first_ok,
+            serde_json::json!(["OK", first_event_id, true, ""])
+        );
+        let first_bootstrap = next_relay_text(&mut socket).await;
+        let first_current = next_relay_text(&mut socket).await;
+        let _ = reserved_event(&first_bootstrap, CLIENT_BINDING_BOOTSTRAP_SUB_ID);
+        let _ = reserved_event(&first_current, CLIENT_BINDING_STATUS_SUB_ID);
+        socket.close(None).await.expect("close admitted socket");
+        server.abort();
+        let _ = server.await;
+
+        let admitted = status_audit_snapshot(&pool, domain).await;
+        assert_eq!(admitted.revisions, 1);
+        assert_eq!(admitted.receipts, 1);
+        assert_eq!(admitted.events, 1);
+        assert_eq!(admitted.manifests, 1);
+        assert_eq!(admitted.deltas, 1);
+        assert_eq!(admitted.retained_events, 1);
+        assert_eq!(admitted.health_state, 1);
+        assert_eq!(admitted.failure_code, None);
+
+        for _ in 0..3 {
+            let (server, mut socket, challenge) = connect_status_relay(state.clone(), &host).await;
+            let epoch = ClientBindingEpoch::new_v4();
+            let auth_event =
+                scoped_auth_event(&author, &challenge, &relay_url, &epoch, &relay_keys);
+            let event_id = auth_event.id.to_hex();
+            socket
+                .send(Message::Text(
+                    serde_json::json!(["AUTH", auth_event]).to_string().into(),
+                ))
+                .await
+                .expect("send excess scoped AUTH");
+            let ok: Value = serde_json::from_str(&next_relay_text(&mut socket).await)
+                .expect("excess AUTH acknowledgement parses");
+            assert_eq!(ok, serde_json::json!(["OK", event_id, true, ""]));
+            socket
+                .send(Message::Text(r#"["UNKNOWN"]"#.into()))
+                .await
+                .expect("send post-admission probe");
+            let notice: Value = serde_json::from_str(&next_relay_text(&mut socket).await)
+                .expect("post-admission notice parses");
+            assert_eq!(
+                notice.as_array().and_then(|fields| fields[0].as_str()),
+                Some("NOTICE"),
+                "denied optional presentation emits no reserved frame",
+            );
+            socket.close(None).await.expect("close excess socket");
+            server.abort();
+            let _ = server.await;
+        }
+
+        tokio::time::sleep(CLIENT_BINDING_STATUS_PRESENTATION_TIMEOUT + Duration::from_millis(100))
+            .await;
+        assert_eq!(status_audit_snapshot(&pool, domain).await, admitted);
+        assert!(status_runtime.is_healthy());
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres and Redis"]
+    async fn postgres_missing_scope_performs_no_status_or_admission_io() {
+        let (pool, db, domain, scratch_url) = scratch_status_database().await;
+        let relay_keys = Keys::generate();
+        let author = Keys::generate();
+        let restore_bootstrap_id = Uuid::new_v4();
+        let restore =
+            OperationRestoreRuntime::for_tests(db.clone(), [(domain, restore_bootstrap_id)])
+                .with_database_fences_for_test(pool.clone());
+        restore
+            .provision_domain(domain)
+            .await
+            .expect("provision status restore baseline");
+        let composition = ProviderFreeV1Composition::build(
+            db.clone(),
+            relay_keys.clone(),
+            vec![direct_status_configuration(domain, restore_bootstrap_id)],
+            Some(restore),
+        )
+        .await
+        .expect("build production status composition");
+        seed_current_binding(&pool, domain, &author).await;
+        let redis_url = std::env::var("TEST_REDIS_URL")
+            .or_else(|_| std::env::var("REDIS_URL"))
+            .unwrap_or_else(|_| "redis://127.0.0.1:6379".to_owned());
+        let state = status_auth_state_with_redis(
+            pool.clone(),
+            db,
+            scratch_url,
+            relay_keys,
+            redis_url.clone(),
+            None,
+        )
+        .await;
+        state
+            .install_provider_free_authorization(composition)
+            .expect("install production status composition");
+        let baseline = status_audit_snapshot(&pool, domain).await;
+        assert_eq!(status_admission_key_count(&redis_url, domain).await, 0);
+
+        let host = format!("status-{}.example", domain.as_uuid().simple());
+        let (server, mut socket, challenge) = connect_status_relay(state, &host).await;
+        let auth_event = unscoped_auth_event(&author, &challenge, &format!("ws://{host}"));
+        let event_id = auth_event.id.to_hex();
+        socket
+            .send(Message::Text(
+                serde_json::json!(["AUTH", auth_event]).to_string().into(),
+            ))
+            .await
+            .expect("send unscoped AUTH");
+        let ok: Value = serde_json::from_str(&next_relay_text(&mut socket).await)
+            .expect("unscoped AUTH acknowledgement parses");
+        assert_eq!(ok, serde_json::json!(["OK", event_id, true, ""]));
+        socket
+            .send(Message::Text(r#"["UNKNOWN"]"#.into()))
+            .await
+            .expect("send unscoped post-AUTH probe");
+        let notice: Value = serde_json::from_str(&next_relay_text(&mut socket).await)
+            .expect("unscoped post-AUTH notice parses");
+        assert_eq!(
+            notice.as_array().and_then(|fields| fields[0].as_str()),
+            Some("NOTICE")
+        );
+        assert_eq!(status_admission_key_count(&redis_url, domain).await, 0);
+        assert_eq!(status_audit_snapshot(&pool, domain).await, baseline);
+        socket.close(None).await.expect("close unscoped socket");
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn postgres_unavailable_admission_is_auth_neutral_and_zero_write() {
+        let (pool, db, domain, scratch_url) = scratch_status_database().await;
+        let relay_keys = Keys::generate();
+        let author = Keys::generate();
+        let restore_bootstrap_id = Uuid::new_v4();
+        let restore =
+            OperationRestoreRuntime::for_tests(db.clone(), [(domain, restore_bootstrap_id)])
+                .with_database_fences_for_test(pool.clone());
+        restore
+            .provision_domain(domain)
+            .await
+            .expect("provision status restore baseline");
+        let composition = ProviderFreeV1Composition::build(
+            db.clone(),
+            relay_keys.clone(),
+            vec![direct_status_configuration(domain, restore_bootstrap_id)],
+            Some(restore),
+        )
+        .await
+        .expect("build production status composition");
+        let status_runtime = composition
+            .client_status_runtime(domain)
+            .expect("healthy status runtime");
+        seed_current_binding(&pool, domain, &author).await;
+        let healthy_redis_url = std::env::var("TEST_REDIS_URL")
+            .or_else(|_| std::env::var("REDIS_URL"))
+            .unwrap_or_else(|_| "redis://127.0.0.1:6379".to_owned());
+        let state = status_auth_state_with_redis(
+            pool.clone(),
+            db,
+            scratch_url,
+            relay_keys.clone(),
+            healthy_redis_url,
+            Some("redis://127.0.0.1:1".to_owned()),
+        )
+        .await;
+        state
+            .install_provider_free_authorization(composition)
+            .expect("install production status composition");
+        let baseline = status_audit_snapshot(&pool, domain).await;
+
+        let host = format!("status-{}.example", domain.as_uuid().simple());
+        let (server, mut socket, challenge) = connect_status_relay(state, &host).await;
+        let epoch = ClientBindingEpoch::new_v4();
+        let auth_event = scoped_auth_event(
+            &author,
+            &challenge,
+            &format!("ws://{host}"),
+            &epoch,
+            &relay_keys,
+        );
+        let event_id = auth_event.id.to_hex();
+        socket
+            .send(Message::Text(
+                serde_json::json!(["AUTH", auth_event]).to_string().into(),
+            ))
+            .await
+            .expect("send scoped AUTH with unavailable admission");
+        let ok: Value = serde_json::from_str(&next_relay_text(&mut socket).await)
+            .expect("unavailable admission AUTH acknowledgement parses");
+        assert_eq!(ok, serde_json::json!(["OK", event_id, true, ""]));
+        socket
+            .send(Message::Text(r#"["UNKNOWN"]"#.into()))
+            .await
+            .expect("send unavailable-admission probe");
+        let notice: Value = serde_json::from_str(&next_relay_text(&mut socket).await)
+            .expect("unavailable-admission notice parses");
+        assert_eq!(
+            notice.as_array().and_then(|fields| fields[0].as_str()),
+            Some("NOTICE")
+        );
+        tokio::time::sleep(CLIENT_BINDING_STATUS_PRESENTATION_TIMEOUT + Duration::from_millis(100))
+            .await;
+        assert_eq!(status_audit_snapshot(&pool, domain).await, baseline);
+        assert!(status_runtime.is_healthy());
+        socket
+            .close(None)
+            .await
+            .expect("close unavailable-admission socket");
         server.abort();
         let _ = server.await;
     }

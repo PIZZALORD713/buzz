@@ -404,11 +404,20 @@ struct RawNipFiEnforceConfiguration {
     max_events_per_domain: u64,
     max_bytes_per_domain: u64,
     max_envelope_bytes: u32,
+    client_status_admission: RawClientStatusAdmissionConfiguration,
     policy_revision: u64,
     enrollment_mode: crate::authorization_runtime::BaseV1EnrollmentMode,
     nostr_key_claim: Option<String>,
     risk_acknowledgement: Option<String>,
     restore_bootstrap_id: uuid::Uuid,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawClientStatusAdmissionConfiguration {
+    max_presentations_per_domain: u64,
+    max_presentations_per_actor: u64,
+    max_presentations_per_peer: u64,
 }
 
 fn parse_nip_fi_authorization(
@@ -453,6 +462,7 @@ fn parse_nip_fi_authorization(
                     max_events_per_domain,
                     max_bytes_per_domain,
                     max_envelope_bytes,
+                    client_status_admission,
                     policy_revision,
                     enrollment_mode,
                     nostr_key_claim,
@@ -470,9 +480,18 @@ fn parse_nip_fi_authorization(
                     max_envelope_bytes,
                 )
                 .map_err(|error| ConfigError::InvalidValue(error.to_string()))?;
+                let status_admission =
+                    crate::authorization_runtime::ClientStatusAdmissionPolicy::new(
+                        capacity,
+                        client_status_admission.max_presentations_per_domain,
+                        client_status_admission.max_presentations_per_actor,
+                        client_status_admission.max_presentations_per_peer,
+                    )
+                    .map_err(|error| ConfigError::InvalidValue(error.to_string()))?;
                 crate::authorization_runtime::BaseV1AuthorizationConfiguration::enforce_direct(
                     buzz_core::CommunityId::from_uuid(authorization_domain),
                     capacity,
+                    status_admission,
                     policy_revision,
                     enrollment_mode,
                     issuer,
@@ -1662,7 +1681,7 @@ mod tests {
         );
         let deny = parse_nip_fi_authorization().expect("complete deny configuration");
 
-        let enforce = serde_json::json!([{
+        let enforce_entry = serde_json::json!({
             "mode": "enforce",
             "authorization_domain": domain,
             "issuer": "https://issuer.example",
@@ -1686,13 +1705,59 @@ mod tests {
             "max_events_per_domain": 100,
             "max_bytes_per_domain": 1 << 20,
             "max_envelope_bytes": 16 << 10,
+            "client_status_admission": {
+                "max_presentations_per_domain": 100,
+                "max_presentations_per_actor": 5,
+                "max_presentations_per_peer": 20
+            },
             "policy_revision": 1,
             "enrollment_mode": "attested_key",
             "nostr_key_claim": "nostr_pubkey",
             "restore_bootstrap_id": uuid::Uuid::new_v4()
-        }]);
-        std::env::set_var("BUZZ_NIP_FI_V1_CONFIG_JSON", enforce.to_string());
+        });
+        std::env::set_var(
+            "BUZZ_NIP_FI_V1_CONFIG_JSON",
+            serde_json::json!([enforce_entry.clone()]).to_string(),
+        );
         let enforce = parse_nip_fi_authorization().expect("complete Enforce configuration");
+
+        let mut missing_admission = enforce_entry.clone();
+        missing_admission
+            .as_object_mut()
+            .expect("Enforce fixture object")
+            .remove("client_status_admission");
+        std::env::set_var(
+            "BUZZ_NIP_FI_V1_CONFIG_JSON",
+            serde_json::json!([missing_admission]).to_string(),
+        );
+        let missing_admission = parse_nip_fi_authorization();
+
+        let mut zero_admission = enforce_entry.clone();
+        zero_admission["client_status_admission"]["max_presentations_per_actor"] =
+            serde_json::json!(0);
+        std::env::set_var(
+            "BUZZ_NIP_FI_V1_CONFIG_JSON",
+            serde_json::json!([zero_admission]).to_string(),
+        );
+        let zero_admission = parse_nip_fi_authorization();
+
+        let mut actor_over_domain = enforce_entry.clone();
+        actor_over_domain["client_status_admission"]["max_presentations_per_actor"] =
+            serde_json::json!(101);
+        std::env::set_var(
+            "BUZZ_NIP_FI_V1_CONFIG_JSON",
+            serde_json::json!([actor_over_domain]).to_string(),
+        );
+        let actor_over_domain = parse_nip_fi_authorization();
+
+        let mut domain_over_capacity = enforce_entry;
+        domain_over_capacity["client_status_admission"]["max_presentations_per_domain"] =
+            serde_json::json!(101);
+        std::env::set_var(
+            "BUZZ_NIP_FI_V1_CONFIG_JSON",
+            serde_json::json!([domain_over_capacity]).to_string(),
+        );
+        let domain_over_capacity = parse_nip_fi_authorization();
 
         std::env::set_var(
             "BUZZ_NIP_FI_V1_CONFIG_JSON",
@@ -1710,10 +1775,32 @@ mod tests {
         assert_eq!(deny[0].mode(), buzz_auth::NipFiMode::DenyProtected);
         assert_eq!(enforce.len(), 1);
         assert_eq!(enforce[0].mode(), buzz_auth::NipFiMode::Enforce);
+        let status_admission = enforce[0]
+            .client_status_admission_policy()
+            .expect("Enforce status admission");
+        assert_eq!(status_admission.max_presentations_per_domain(), 100);
+        assert_eq!(status_admission.max_presentations_per_actor(), 5);
+        assert_eq!(status_admission.max_presentations_per_peer(), 20);
+        let debug = format!("{:?}", enforce[0]);
+        assert!(!debug.contains("100"));
+        assert!(!debug.contains("20"));
         assert_eq!(
             enforce[0].enrollment_mode(),
             Some(crate::authorization_runtime::BaseV1EnrollmentMode::AttestedKey)
         );
+        assert!(matches!(
+            missing_admission,
+            Err(ConfigError::InvalidValue(_))
+        ));
+        assert!(matches!(zero_admission, Err(ConfigError::InvalidValue(_))));
+        assert!(matches!(
+            actor_over_domain,
+            Err(ConfigError::InvalidValue(_))
+        ));
+        assert!(matches!(
+            domain_over_capacity,
+            Err(ConfigError::InvalidValue(_))
+        ));
         assert!(matches!(incomplete, Err(ConfigError::InvalidValue(_))));
     }
 
