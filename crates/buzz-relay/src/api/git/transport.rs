@@ -25,6 +25,7 @@ use base64::Engine;
 use hex;
 use serde::Deserialize;
 use tokio::process::Command;
+use tokio_util::sync::CancellationToken;
 use tower_http::limit::RequestBodyLimitLayer;
 use tracing::{error, info, warn};
 
@@ -32,8 +33,8 @@ use super::binding::{resolve_repo_binding, RepoBinding};
 use super::cas_publish::{cas_publish, CasError, ParentState, PublishLimits};
 use super::hook::install_hook;
 use super::hydrate::{
-    hydrate_for_read, hydrate_for_write, load_manifest_for_read, HydrateError, HydratedRepo,
-    HydrationOptions,
+    hydrate_authoritative_read, hydrate_for_read, hydrate_for_write, load_authoritative_manifest,
+    load_manifest_for_read, HydrateError, HydratedRepo, HydrationOptions,
 };
 use super::manifest_event::{build_ref_state_event, RefStateInputs};
 use crate::state::AppState;
@@ -79,6 +80,81 @@ pub struct GitAuth {
     identity_proof: crate::corporate_identity::CorporateIdentityProof,
 }
 
+/// Temporary adapter for a sealed joined publication witness.
+struct ProvisionalGitPublicationWitness {
+    tenant: TenantContext,
+    owner: String,
+    repo: String,
+    result_digest: [u8; 32],
+    cancellation: CancellationToken,
+}
+
+#[allow(dead_code)]
+impl ProvisionalGitPublicationWitness {
+    fn from_joined_witness_parts(
+        tenant: TenantContext,
+        owner: impl Into<String>,
+        repo: impl Into<String>,
+        result_digest: [u8; 32],
+        cancellation: CancellationToken,
+    ) -> Option<Self> {
+        let owner = owner.into();
+        let repo = repo.into();
+        let canonical_repo = validate_repo_id(&owner, &repo).ok()?.to_owned();
+        if result_digest == [0; 32] {
+            return None;
+        }
+        Some(Self {
+            tenant,
+            owner,
+            repo: canonical_repo,
+            result_digest,
+            cancellation,
+        })
+    }
+}
+
+impl std::fmt::Debug for ProvisionalGitPublicationWitness {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("ProvisionalGitPublicationWitness([REDACTED])")
+    }
+}
+
+fn git_witness_invalid_response() -> Response {
+    (StatusCode::SERVICE_UNAVAILABLE, "repository unavailable").into_response()
+}
+
+async fn final_git_witness_recheck<F, Fut, E>(
+    cancellation: &CancellationToken,
+    final_recheck: F,
+) -> Result<(), Response>
+where
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = Result<(), E>>,
+{
+    if cancellation.is_cancelled() {
+        return Err(git_witness_invalid_response());
+    }
+    final_recheck()
+        .await
+        .map_err(|_| git_witness_invalid_response())?;
+    if cancellation.is_cancelled() {
+        return Err(git_witness_invalid_response());
+    }
+    Ok(())
+}
+
+fn exact_git_nostr_token(headers: &axum::http::HeaderMap) -> Result<String, &'static str> {
+    let header = buzz_auth::ExactSingleHttpHeader::from_headers(headers, &header::AUTHORIZATION)
+        .map_err(|_| "missing or ambiguous Authorization header")?;
+    header
+        .as_str()
+        .strip_prefix("Nostr ")
+        .filter(|token| !token.is_empty())
+        .map(str::to_owned)
+        .ok_or("expected Authorization: Nostr <base64>")
+}
+
 impl axum::extract::FromRequestParts<Arc<AppState>> for GitAuth {
     type Rejection = Response;
 
@@ -88,35 +164,20 @@ impl axum::extract::FromRequestParts<Arc<AppState>> for GitAuth {
     ) -> Result<Self, Self::Rejection> {
         let method = parts.method.as_str();
 
-        let auth_header = parts
-            .headers
-            .get(header::AUTHORIZATION)
-            .and_then(|v| v.to_str().ok())
-            .ok_or_else(|| {
-                Response::builder()
-                    .status(StatusCode::UNAUTHORIZED)
-                    .header(
-                        "WWW-Authenticate",
-                        format!("Nostr realm=\"buzz\", method=\"{method}\""),
-                    )
-                    .body(Body::from("missing Authorization header"))
-                    .unwrap()
-            })?;
-
-        let token = auth_header.strip_prefix("Nostr ").ok_or_else(|| {
+        let token = exact_git_nostr_token(&parts.headers).map_err(|message| {
             Response::builder()
                 .status(StatusCode::UNAUTHORIZED)
                 .header(
                     "WWW-Authenticate",
                     format!("Nostr realm=\"buzz\", method=\"{method}\""),
                 )
-                .body(Body::from("expected Authorization: Nostr <base64>"))
+                .body(Body::from(message))
                 .unwrap()
         })?;
 
         let event_bytes = base64::engine::general_purpose::STANDARD
-            .decode(token)
-            .or_else(|_| base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(token))
+            .decode(&token)
+            .or_else(|_| base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(&token))
             .map_err(|_| (StatusCode::UNAUTHORIZED, "invalid base64").into_response())?;
         let event_json = String::from_utf8(event_bytes)
             .map_err(|_| (StatusCode::UNAUTHORIZED, "invalid utf-8").into_response())?;
@@ -766,6 +827,45 @@ fn build_upload_pack_advertisement(manifest: &super::manifest::Manifest) -> Vec<
     // 4. Trailing flush.
     out.extend_from_slice(b"0000");
     out
+}
+
+/// Build a fast ref advertisement only from the exact DB-witnessed manifest.
+///
+/// The immutable manifest is fully digest-verified before `final_recheck` and
+/// no response is constructed until that recheck succeeds. An ineligible
+/// tagged manifest returns `Ok(None)` for the witnessed subprocess fallback.
+#[allow(dead_code)] // Activated by the pending high-level S5 read witness.
+async fn witnessed_fast_upload_pack_advertisement<F, Fut, E>(
+    state: &AppState,
+    witness: &ProvisionalGitPublicationWitness,
+    final_recheck: F,
+) -> Result<Option<Response>, Response>
+where
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = Result<(), E>>,
+{
+    if witness.tenant.community().as_uuid().is_nil() {
+        return Err(git_witness_invalid_response());
+    }
+    let manifest = load_authoritative_manifest(&state.git_store, witness.result_digest)
+        .await
+        .map_err(|error| hydrate_error_to_response(&witness.owner, &witness.repo, error))?;
+    if !fast_path_eligible(&manifest) {
+        return Ok(None);
+    }
+    let body = build_upload_pack_advertisement(&manifest);
+    final_git_witness_recheck(&witness.cancellation, final_recheck).await?;
+    Ok(Some(
+        Response::builder()
+            .status(StatusCode::OK)
+            .header(
+                header::CONTENT_TYPE,
+                "application/x-git-upload-pack-advertisement",
+            )
+            .header(header::CACHE_CONTROL, "no-cache")
+            .body(Body::from(body))
+            .expect("static witnessed git advertisement response"),
+    ))
 }
 
 /// `GET /git/{owner}/{repo}/info/refs?service={service}`
@@ -1586,6 +1686,57 @@ struct GitPermitStream<S> {
     _permit: tokio::sync::OwnedSemaphorePermit,
 }
 
+struct CancellationCheckedGitStream<S> {
+    inner: std::pin::Pin<Box<S>>,
+    cancellation: CancellationToken,
+    finished: bool,
+}
+
+impl<S> CancellationCheckedGitStream<S> {
+    fn new(inner: S, cancellation: CancellationToken) -> Self {
+        Self {
+            inner: Box::pin(inner),
+            cancellation,
+            finished: false,
+        }
+    }
+}
+
+impl<S> futures_util::Stream for CancellationCheckedGitStream<S>
+where
+    S: futures_util::Stream<Item = Result<bytes::Bytes, std::io::Error>>,
+{
+    type Item = Result<bytes::Bytes, std::io::Error>;
+
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        context: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        if self.finished {
+            return std::task::Poll::Ready(None);
+        }
+        if self.cancellation.is_cancelled() {
+            self.finished = true;
+            return std::task::Poll::Ready(Some(Err(std::io::Error::other(
+                "protected git witness is no longer current",
+            ))));
+        }
+        match self.inner.as_mut().poll_next(context) {
+            std::task::Poll::Ready(Some(Ok(_bytes))) if self.cancellation.is_cancelled() => {
+                self.finished = true;
+                std::task::Poll::Ready(Some(Err(std::io::Error::other(
+                    "protected git witness is no longer current",
+                ))))
+            }
+            std::task::Poll::Ready(None) => {
+                self.finished = true;
+                std::task::Poll::Ready(None)
+            }
+            other => other,
+        }
+    }
+}
+
 impl<S> futures_util::Stream for GitPermitStream<S>
 where
     S: futures_util::Stream,
@@ -1711,6 +1862,86 @@ fn stream_git_read(
     prefix: Vec<u8>,
     content_type: String,
 ) -> Result<Response, Response> {
+    spawn_git_read_stream(GitReadStreamInput {
+        repo,
+        permit,
+        service,
+        extra_args,
+        body,
+        prefix,
+        content_type,
+        cancellation: None,
+    })
+}
+
+/// Stream clone/fetch bytes only from the exact DB-witnessed manifest.
+///
+/// Hydration verifies every immutable manifest/pack digest. The authoritative
+/// callback runs afterward, immediately before subprocess/response creation;
+/// its sticky cancellation signal is then checked before every emitted chunk.
+#[allow(dead_code)] // Activated by the pending high-level S5 read witness.
+async fn stream_witnessed_upload_pack<F, Fut, E>(
+    state: &Arc<AppState>,
+    witness: ProvisionalGitPublicationWitness,
+    permit: tokio::sync::OwnedSemaphorePermit,
+    body: Body,
+    final_recheck: F,
+) -> Result<Response, Response>
+where
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = Result<(), E>>,
+{
+    if witness.tenant.community().as_uuid().is_nil() {
+        return Err(git_witness_invalid_response());
+    }
+    let repo = hydrate_authoritative_read(
+        &state.git_store,
+        witness.result_digest,
+        HydrationOptions {
+            pack_cache: &state.git_pack_cache,
+            scratch_dir: &state.config.git_repo_path,
+            max_pack_bytes: state.config.git_max_pack_bytes,
+            max_repo_bytes: state.config.git_max_repo_bytes,
+        },
+    )
+    .await
+    .map_err(|error| hydrate_error_to_response(&witness.owner, &witness.repo, error))?;
+    final_git_witness_recheck(&witness.cancellation, final_recheck).await?;
+    spawn_git_read_stream(GitReadStreamInput {
+        repo,
+        permit,
+        service: "upload-pack",
+        extra_args: &[],
+        body,
+        prefix: Vec::new(),
+        content_type: "application/x-git-upload-pack-result".to_owned(),
+        cancellation: Some(witness.cancellation),
+    })
+}
+
+struct GitReadStreamInput<'a> {
+    repo: HydratedRepo,
+    permit: tokio::sync::OwnedSemaphorePermit,
+    service: &'static str,
+    extra_args: &'a [&'a str],
+    body: Body,
+    prefix: Vec<u8>,
+    content_type: String,
+    cancellation: Option<CancellationToken>,
+}
+
+#[allow(clippy::result_large_err)]
+fn spawn_git_read_stream(input: GitReadStreamInput<'_>) -> Result<Response, Response> {
+    let GitReadStreamInput {
+        repo,
+        permit,
+        service,
+        extra_args,
+        body,
+        prefix,
+        content_type,
+        cancellation,
+    } = input;
     let mut cmd = Command::new("git");
     cmd.arg(service).arg("--stateless-rpc");
     for a in extra_args {
@@ -1776,11 +2007,17 @@ fn stream_git_read(
         _permit: permit,
     };
 
+    let body = match cancellation {
+        Some(cancellation) => {
+            Body::from_stream(CancellationCheckedGitStream::new(body_stream, cancellation))
+        }
+        None => Body::from_stream(body_stream),
+    };
     Ok(Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, content_type)
         .header(header::CACHE_CONTROL, "no-cache")
-        .body(Body::from_stream(body_stream))
+        .body(body)
         .unwrap())
 }
 
@@ -2578,6 +2815,109 @@ mod track_c_tests {
             buzz_auth::nip98::verify_nip98_event(&event_json, &expected_for_a, "GET", None)
                 .expect("matching-host git NIP-98 token must verify");
         assert_eq!(pubkey, keys.public_key());
+    }
+
+    #[test]
+    fn git_authorization_requires_one_unambiguous_header_occurrence() {
+        use axum::http::HeaderMap;
+
+        let mut headers = HeaderMap::new();
+        headers.append(
+            header::AUTHORIZATION,
+            "Nostr first".parse().expect("header"),
+        );
+        headers.append(
+            header::AUTHORIZATION,
+            "Nostr second".parse().expect("header"),
+        );
+        assert!(exact_git_nostr_token(&headers).is_err());
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            "Nostr first, Nostr second".parse().expect("header"),
+        );
+        assert!(exact_git_nostr_token(&headers).is_err());
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            "Nostr exact".parse().expect("header"),
+        );
+        assert_eq!(
+            exact_git_nostr_token(&headers).expect("single exact header"),
+            "exact"
+        );
+    }
+
+    #[test]
+    fn provisional_git_witness_keeps_domain_target_and_digest_joined() {
+        let tenant = TenantContext::resolved(
+            CommunityId::from_uuid(uuid::Uuid::from_u128(9)),
+            "git.example",
+        );
+        let owner = "a".repeat(64);
+        let witness = ProvisionalGitPublicationWitness::from_joined_witness_parts(
+            tenant.clone(),
+            &owner,
+            "project.git",
+            [0x55; 32],
+            CancellationToken::new(),
+        )
+        .expect("joined witness");
+        assert_eq!(witness.tenant, tenant);
+        assert_eq!(witness.owner, owner);
+        assert_eq!(witness.repo, "project");
+        assert_eq!(witness.result_digest, [0x55; 32]);
+        assert_eq!(
+            format!("{witness:?}"),
+            "ProvisionalGitPublicationWitness([REDACTED])"
+        );
+
+        assert!(ProvisionalGitPublicationWitness::from_joined_witness_parts(
+            witness.tenant.clone(),
+            "a".repeat(64),
+            "project",
+            [0; 32],
+            CancellationToken::new(),
+        )
+        .is_none());
+    }
+
+    #[tokio::test]
+    async fn witnessed_git_stream_stops_before_next_chunk_after_cancellation() {
+        use futures_util::StreamExt;
+
+        let source = futures_util::stream::iter([
+            Ok::<_, std::io::Error>(bytes::Bytes::from_static(b"first")),
+            Ok(bytes::Bytes::from_static(b"second")),
+        ]);
+        let cancellation = CancellationToken::new();
+        let mut stream = CancellationCheckedGitStream::new(source, cancellation.clone());
+        assert_eq!(
+            stream.next().await.expect("first chunk").expect("bytes"),
+            bytes::Bytes::from_static(b"first")
+        );
+        cancellation.cancel();
+        assert!(stream.next().await.expect("closed chunk").is_err());
+        assert!(stream.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn final_git_recheck_fails_closed_before_invoking_stale_callback() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed = calls.clone();
+        let result = final_git_witness_recheck(&cancellation, move || async move {
+            observed.fetch_add(1, Ordering::SeqCst);
+            Ok::<_, ()>(())
+        })
+        .await;
+        assert!(result.is_err());
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
     }
 
     /// Split a pkt-line stream into `(len_prefix, payload)` frames, validating

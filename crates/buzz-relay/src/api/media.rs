@@ -6,7 +6,10 @@
 //!   GET  /media/{sha256_ext}    — BUD-01 serve blob
 //!   HEAD /media/{sha256_ext}    — BUD-01 existence check
 
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
 use axum::http::header;
@@ -20,6 +23,7 @@ use base64::Engine;
 use buzz_audit::{AuditAction, NewAuditEntry};
 use buzz_core::tenant::TenantContext;
 use buzz_media::{BlobDescriptor, MediaError, UploadAttribution, UploadNetworkInfo};
+use tokio_util::sync::CancellationToken;
 
 use crate::state::AppState;
 
@@ -804,6 +808,232 @@ pub(crate) async fn serve_blob_for_tenant(
     }
 }
 
+/// Serve only bytes named by a sealed PostgreSQL publication witness.
+///
+/// The immutable manifest and complete object are fetched and hash-verified
+/// first. `final_recheck` is then consumed immediately before response headers
+/// or bytes are constructed. The callback is the provisional boundary for
+/// S5's typed joined-witness recheck; an error fails closed without falling
+/// back to a sidecar or raw object-store pointer.
+struct ProvisionalMediaPublicationWitness {
+    tenant: TenantContext,
+    result_digest: [u8; 32],
+    requested_path: String,
+    cancellation: CancellationToken,
+}
+
+#[allow(dead_code)] // Constructed only by the pending S5 joined-witness adapter.
+impl ProvisionalMediaPublicationWitness {
+    fn from_joined_witness_parts(
+        tenant: TenantContext,
+        result_digest: [u8; 32],
+        requested_path: impl Into<String>,
+        cancellation: CancellationToken,
+    ) -> Result<Self, MediaError> {
+        let requested_path = requested_path.into();
+        if result_digest == [0; 32] {
+            return Err(media_witness_invalid());
+        }
+        validate_media_path(&requested_path)?;
+        Ok(Self {
+            tenant,
+            result_digest,
+            requested_path,
+            cancellation,
+        })
+    }
+}
+
+#[allow(dead_code)] // Activated by the pending high-level S5 publication witness.
+async fn serve_witnessed_blob_for_tenant<F, Fut, E>(
+    state: &AppState,
+    witness: ProvisionalMediaPublicationWitness,
+    req_headers: &HeaderMap,
+    head_only: bool,
+    final_recheck: F,
+) -> Result<Response, MediaError>
+where
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = Result<(), E>>,
+{
+    let object = state
+        .media_storage
+        .verify_media_object(
+            &witness.tenant,
+            witness.result_digest,
+            &witness.requested_path,
+        )
+        .await?;
+
+    let content_type = object.content_type().to_owned();
+    let total = object.size();
+    let cache_control = blob_cache_control(state.config.require_media_get_auth);
+    let disposition = if buzz_media::serve_inline(&content_type) {
+        "inline"
+    } else {
+        "attachment"
+    };
+
+    if head_only {
+        final_media_witness_recheck(&witness.cancellation, final_recheck).await?;
+        return axum::response::Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, content_type)
+            .header(header::CONTENT_LENGTH, total.to_string())
+            .header(header::CONTENT_DISPOSITION, disposition)
+            .header(header::CACHE_CONTROL, cache_control)
+            .header(header::CONTENT_SECURITY_POLICY, "default-src 'none'")
+            .header(header::X_CONTENT_TYPE_OPTIONS, "nosniff")
+            .header(header::ACCEPT_RANGES, "bytes")
+            .body(axum::body::Body::empty())
+            .map_err(|_| MediaError::Internal);
+    }
+
+    let single_range = req_headers
+        .get(header::RANGE)
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| !value.contains(','));
+    let Some(range) = single_range else {
+        final_media_witness_recheck(&witness.cancellation, final_recheck).await?;
+        let stream = object.into_stream()?;
+        let stream = CancellationCheckedMediaStream::new(stream, witness.cancellation);
+        return axum::response::Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, content_type)
+            .header(header::CONTENT_LENGTH, total.to_string())
+            .header(header::CONTENT_DISPOSITION, disposition)
+            .header(header::CACHE_CONTROL, cache_control)
+            .header(header::CONTENT_SECURITY_POLICY, "default-src 'none'")
+            .header(header::X_CONTENT_TYPE_OPTIONS, "nosniff")
+            .header(header::ACCEPT_RANGES, "bytes")
+            .body(axum::body::Body::from_stream(stream))
+            .map_err(|_| MediaError::Internal);
+    };
+
+    let Some((start, end)) = parse_byte_range(range, total) else {
+        return witnessed_range_not_satisfiable_response(
+            range,
+            total,
+            &witness.cancellation,
+            final_recheck,
+        )
+        .await;
+    };
+    if start >= total {
+        return witnessed_range_not_satisfiable_response(
+            range,
+            total,
+            &witness.cancellation,
+            final_recheck,
+        )
+        .await;
+    }
+    let end = end
+        .min(start.saturating_add(MAX_RANGE_CHUNK - 1))
+        .min(total.saturating_sub(1));
+    let bytes = object.read_range(start, end).await?;
+    final_media_witness_recheck(&witness.cancellation, final_recheck).await?;
+    axum::response::Response::builder()
+        .status(StatusCode::PARTIAL_CONTENT)
+        .header(header::CONTENT_TYPE, content_type)
+        .header(
+            header::CONTENT_RANGE,
+            format!("bytes {start}-{end}/{total}"),
+        )
+        .header(header::CONTENT_LENGTH, bytes.len().to_string())
+        .header(header::CONTENT_DISPOSITION, disposition)
+        .header(header::CACHE_CONTROL, cache_control)
+        .header(header::CONTENT_SECURITY_POLICY, "default-src 'none'")
+        .header(header::X_CONTENT_TYPE_OPTIONS, "nosniff")
+        .header(header::ACCEPT_RANGES, "bytes")
+        .body(axum::body::Body::from(bytes))
+        .map_err(|_| MediaError::Internal)
+}
+
+async fn witnessed_range_not_satisfiable_response<F, Fut, E>(
+    range: &str,
+    total: u64,
+    cancellation: &CancellationToken,
+    final_recheck: F,
+) -> Result<Response, MediaError>
+where
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = Result<(), E>>,
+{
+    if parse_byte_range(range, total).is_some_and(|(start, _)| start < total) {
+        return Err(MediaError::Internal);
+    }
+    final_media_witness_recheck(cancellation, final_recheck).await?;
+    axum::response::Response::builder()
+        .status(StatusCode::RANGE_NOT_SATISFIABLE)
+        .header(header::CONTENT_RANGE, format!("bytes */{total}"))
+        .body(axum::body::Body::empty())
+        .map_err(|_| MediaError::Internal)
+}
+
+async fn final_media_witness_recheck<F, Fut, E>(
+    cancellation: &CancellationToken,
+    final_recheck: F,
+) -> Result<(), MediaError>
+where
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = Result<(), E>>,
+{
+    if cancellation.is_cancelled() {
+        return Err(media_witness_invalid());
+    }
+    final_recheck().await.map_err(|_| media_witness_invalid())?;
+    if cancellation.is_cancelled() {
+        return Err(media_witness_invalid());
+    }
+    Ok(())
+}
+
+fn media_witness_invalid() -> MediaError {
+    MediaError::StorageError("protected media witness is no longer current".to_owned())
+}
+
+struct CancellationCheckedMediaStream {
+    inner: buzz_media::ByteStream,
+    cancellation: CancellationToken,
+    finished: bool,
+}
+
+impl CancellationCheckedMediaStream {
+    fn new(inner: buzz_media::ByteStream, cancellation: CancellationToken) -> Self {
+        Self {
+            inner,
+            cancellation,
+            finished: false,
+        }
+    }
+}
+
+impl futures_util::Stream for CancellationCheckedMediaStream {
+    type Item = Result<bytes::Bytes, MediaError>;
+
+    fn poll_next(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        if self.finished {
+            return Poll::Ready(None);
+        }
+        if self.cancellation.is_cancelled() {
+            self.finished = true;
+            return Poll::Ready(Some(Err(media_witness_invalid())));
+        }
+        match self.inner.as_mut().poll_next(context) {
+            Poll::Ready(Some(Ok(_bytes))) if self.cancellation.is_cancelled() => {
+                self.finished = true;
+                Poll::Ready(Some(Err(media_witness_invalid())))
+            }
+            Poll::Ready(None) => {
+                self.finished = true;
+                Poll::Ready(None)
+            }
+            other => other,
+        }
+    }
+}
+
 /// Parse a `Range: bytes=START-END` header value.
 ///
 /// Returns `Some((start, end))` for a valid absolute or suffix range.
@@ -939,12 +1169,11 @@ async fn resolve_s3_key(
 fn extract_blossom_auth(headers: &HeaderMap) -> Result<nostr::Event, MediaError> {
     use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 
-    let header = headers
-        .get("authorization")
-        .and_then(|v| v.to_str().ok())
-        .ok_or(MediaError::MissingAuth)?;
+    let header = buzz_auth::ExactSingleHttpHeader::from_headers(headers, &header::AUTHORIZATION)
+        .map_err(|_| MediaError::MissingAuth)?;
 
     let token = header
+        .as_str()
         .strip_prefix("Nostr ")
         .ok_or(MediaError::InvalidAuthScheme)?;
 
@@ -1094,6 +1323,34 @@ mod tests {
             tags.push(Tag::parse(["x", sha256]).expect("x tag"));
         }
         tags
+    }
+
+    #[test]
+    fn blossom_authorization_requires_one_unambiguous_header_occurrence() {
+        let keys = Keys::generate();
+        let auth = media_get_auth_header(&keys, media_get_tags_for("relay.example", None));
+
+        let mut duplicated = HeaderMap::new();
+        duplicated.append(header::AUTHORIZATION, auth.parse().expect("header"));
+        duplicated.append(header::AUTHORIZATION, auth.parse().expect("header"));
+        assert!(matches!(
+            extract_blossom_auth(&duplicated),
+            Err(MediaError::MissingAuth)
+        ));
+
+        let mut comma_joined = HeaderMap::new();
+        comma_joined.insert(
+            header::AUTHORIZATION,
+            format!("{auth}, {auth}").parse().expect("header"),
+        );
+        assert!(matches!(
+            extract_blossom_auth(&comma_joined),
+            Err(MediaError::MissingAuth)
+        ));
+
+        let mut exact = HeaderMap::new();
+        exact.insert(header::AUTHORIZATION, auth.parse().expect("header"));
+        assert!(extract_blossom_auth(&exact).is_ok());
     }
 
     fn media_request(method: &str, auth: Option<String>) -> Request<Body> {
@@ -1382,6 +1639,132 @@ mod tests {
             descriptor.thumb,
             Some(format!("https://tenant-b.example/media/{hash}.thumb.jpg"))
         );
+    }
+
+    #[tokio::test]
+    async fn witnessed_media_stream_stops_before_next_chunk_after_cancellation() {
+        use futures_util::StreamExt;
+
+        let source: buzz_media::ByteStream = Box::pin(futures_util::stream::iter([
+            Ok(bytes::Bytes::from_static(b"first")),
+            Ok(bytes::Bytes::from_static(b"second")),
+        ]));
+        let cancellation = CancellationToken::new();
+        let mut stream = CancellationCheckedMediaStream::new(source, cancellation.clone());
+
+        assert_eq!(
+            stream.next().await.expect("first chunk").expect("bytes"),
+            bytes::Bytes::from_static(b"first")
+        );
+        cancellation.cancel();
+        assert!(stream.next().await.expect("closed chunk").is_err());
+        assert!(stream.next().await.is_none());
+    }
+
+    #[test]
+    fn provisional_media_witness_keeps_domain_target_and_digest_joined() {
+        let tenant = TenantContext::resolved(
+            buzz_core::CommunityId::from_uuid(Uuid::from_u128(7)),
+            "media.example",
+        );
+        let witness = ProvisionalMediaPublicationWitness::from_joined_witness_parts(
+            tenant.clone(),
+            [0x44; 32],
+            VALID_HASH,
+            CancellationToken::new(),
+        )
+        .expect("joined witness");
+        assert_eq!(witness.tenant, tenant);
+        assert_eq!(witness.result_digest, [0x44; 32]);
+        assert_eq!(witness.requested_path, VALID_HASH);
+
+        assert!(
+            ProvisionalMediaPublicationWitness::from_joined_witness_parts(
+                tenant.clone(),
+                [0; 32],
+                VALID_HASH,
+                CancellationToken::new(),
+            )
+            .is_err()
+        );
+        assert!(
+            ProvisionalMediaPublicationWitness::from_joined_witness_parts(
+                tenant,
+                [0x44; 32],
+                "../other",
+                CancellationToken::new(),
+            )
+            .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn final_media_recheck_fails_closed_before_invoking_stale_callback() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed = calls.clone();
+        let result = final_media_witness_recheck(&cancellation, move || async move {
+            observed.fetch_add(1, Ordering::SeqCst);
+            Ok::<_, ()>(())
+        })
+        .await;
+        assert!(result.is_err());
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    async fn assert_invalid_witnessed_range_rechecks_before_size_response(range: &str) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let success_calls = Arc::new(AtomicUsize::new(0));
+        let observed_success = success_calls.clone();
+        let response = witnessed_range_not_satisfiable_response(
+            range,
+            10,
+            &CancellationToken::new(),
+            move || async move {
+                observed_success.fetch_add(1, Ordering::SeqCst);
+                Ok::<_, ()>(())
+            },
+        )
+        .await
+        .expect("current witness may disclose the size response");
+        assert_eq!(success_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(response.status(), StatusCode::RANGE_NOT_SATISFIABLE);
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CONTENT_RANGE)
+                .and_then(|value| value.to_str().ok()),
+            Some("bytes */10")
+        );
+
+        let stale_calls = Arc::new(AtomicUsize::new(0));
+        let observed_stale = stale_calls.clone();
+        let result = witnessed_range_not_satisfiable_response(
+            range,
+            10,
+            &CancellationToken::new(),
+            move || async move {
+                observed_stale.fetch_add(1, Ordering::SeqCst);
+                Err::<(), _>("stale")
+            },
+        )
+        .await;
+        assert!(result.is_err(), "stale authority must suppress the 416");
+        assert_eq!(stale_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn malformed_witnessed_range_rechecks_before_disclosing_size() {
+        assert_invalid_witnessed_range_rechecks_before_size_response("bytes=malformed").await;
+    }
+
+    #[tokio::test]
+    async fn unsatisfiable_witnessed_range_rechecks_before_disclosing_size() {
+        assert_invalid_witnessed_range_rechecks_before_size_response("bytes=10-").await;
     }
 
     #[test]
