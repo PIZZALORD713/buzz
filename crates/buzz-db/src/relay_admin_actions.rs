@@ -1184,8 +1184,11 @@ pub async fn claim_pending_outbox_batch(
 
     // Step 2: assign a unique token to each row via individual UPDATE statements.
     // Dynamic SQL (format!-built VALUES list) is rejected by the SqlSafeStr trait,
-    // so we iterate. Each row is already SELECT-FOR-UPDATE locked from step 1;
-    // the per-row UPDATE WHERE clause re-verifies state to handle races.
+    // so we iterate. The FOR UPDATE SKIP LOCKED in step 1 ends with that SELECT
+    // statement — the locks are not retained here. The UPDATE's own WHERE clause
+    // (state = 'pending' AND lease_expires_at < now()) re-verifies ownership;
+    // a concurrent pod that wins the race for the same row gets zero rows updated
+    // and we skip it below.
     let mut records = Vec::with_capacity(candidate_ids.len());
     for id in candidate_ids {
         let token = Uuid::new_v4();
@@ -1268,9 +1271,11 @@ pub async fn claim_stranded_action_batch(
 
     // Step 2: assign a unique token to each row via individual UPDATE statements.
     // We cannot use a shared VALUES-list without dynamic SQL, so we iterate.
-    // Each row is already SELECT-FOR-UPDATE locked from step 1 (same connection
-    // is implicit in the pool transaction context — or we re-lock with FOR UPDATE
-    // in the UPDATE WHERE clause, which is safe).
+    // The FOR UPDATE SKIP LOCKED in step 1 ends with that SELECT statement —
+    // the locks are not retained here. The UPDATE's own WHERE clause
+    // (state IN ('pending','enforcing') AND lease_expires_at < now()) re-verifies
+    // ownership; a concurrent pod that wins the same row gets zero rows updated
+    // and we skip it below.
     let mut claims = Vec::with_capacity(candidate_ids.len());
     for id in candidate_ids {
         let token = Uuid::new_v4();

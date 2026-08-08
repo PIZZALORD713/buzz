@@ -266,6 +266,7 @@ async fn deliver_reporter_notice(state: &Arc<AppState>, row: &OutboxRecord) -> R
             status: "resolved".to_string(),
             summary,
         },
+        row.created_at,
     )
     .await
     .map_err(|e| format!("reporter_notice: send failed: {e}"))

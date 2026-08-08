@@ -211,6 +211,7 @@ async fn handle_ban(
             kind: "ban".to_string(),
             public_reason,
         },
+        chrono::Utc::now(),
     )
     .await
     {
@@ -316,6 +317,7 @@ async fn handle_timeout(
             kind: "timeout".to_string(),
             public_reason,
         },
+        chrono::Utc::now(),
     )
     .await
     {

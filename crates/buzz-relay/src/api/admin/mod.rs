@@ -3475,6 +3475,75 @@ mod tests {
             outbox_rows.len() as i64,
             "idempotent re-drive must not create duplicate outbox rows"
         );
+
+        // Step 3: deliver the tombstone outbox row via deliver_one — the real
+        // outbox worker delivery entry point. Requirement: DELETE with tombstone delivery.
+        let tombstone_outbox: (uuid::Uuid, serde_json::Value) = sqlx::query_as(
+            "SELECT id, payload FROM relay_admin_outbox WHERE action_id = $1 AND task_type = 'tombstone'",
+        )
+        .bind(action_id)
+        .fetch_one(&pool)
+        .await
+        .expect("fetch tombstone outbox row");
+        let tombstone_outbox_id = tombstone_outbox.0;
+
+        // Claim the tombstone row so deliver_one has a token.
+        let outbox_lease_until = chrono::Utc::now() + chrono::Duration::seconds(30);
+        let mut outbox_batch = state
+            .db
+            .claim_pending_admin_outbox_batch("tombstone-delivery-worker", outbox_lease_until, 100)
+            .await
+            .expect("claim tombstone outbox batch");
+        let outbox_row_idx = outbox_batch
+            .iter()
+            .position(|r| r.id == tombstone_outbox_id)
+            .expect("tombstone outbox row must be in batch");
+        let outbox_row = outbox_batch.remove(outbox_row_idx);
+
+        crate::handlers::admin_outbox_worker::deliver_one(&state, &outbox_row).await;
+
+        // Assert: tombstone system message event is durably persisted.
+        // emit_system_message writes a kind:40099 event into the target channel.
+        let tombstone_event_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM events WHERE community_id = $1 AND channel_id = $2 AND kind = 40099",
+        )
+        .bind(community_id)
+        .bind(channel_id)
+        .fetch_one(&pool)
+        .await
+        .expect("count tombstone events");
+        assert_eq!(
+            tombstone_event_count, 1,
+            "tombstone system message event must be durably persisted after deliver_one"
+        );
+
+        // Assert: tombstone outbox row is now delivered.
+        let tombstone_state: String =
+            sqlx::query_scalar("SELECT state FROM relay_admin_outbox WHERE id = $1")
+                .bind(tombstone_outbox_id)
+                .fetch_one(&pool)
+                .await
+                .expect("tombstone outbox state");
+        assert_eq!(
+            tombstone_state, "delivered",
+            "tombstone outbox row must be marked delivered after deliver_one"
+        );
+
+        // Assert: target event has deleted_at set (the delete mutation committed
+        // it when execute_delete_with_marker ran).
+        // `deleted_at` is a nullable column — fetch_optional on a nullable column
+        // yields Option<Option<T>>: outer None = row not found, inner None = NULL.
+        let deleted_at: Option<Option<chrono::DateTime<chrono::Utc>>> =
+            sqlx::query_scalar("SELECT deleted_at FROM events WHERE community_id = $1 AND id = $2")
+                .bind(community_id)
+                .bind(target_event_id.as_slice())
+                .fetch_optional(&pool)
+                .await
+                .expect("fetch deleted_at");
+        assert!(
+            deleted_at.flatten().is_some(),
+            "target event must have deleted_at set after DELETE action"
+        );
     }
 
     // ── 2. kick retry after this action removed the member ────────────────────
@@ -3938,10 +4007,17 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires Postgres — lease-expiry action takeover"]
     async fn lease_expiry_action_takeover_by_worker() {
-        // A stranded action (pending, lease expired) must be claimed and re-driven
-        // by the action recovery worker via `recover_one` (the actual production
-        // entry point, not `drive_enforcement_pub` directly). This exercises the
-        // full worker path including community lookup and the lease-token handoff.
+        // Two-phase test for the C1-liveness fix:
+        //
+        // Phase 1: `drive_enforcement_pub` is called with an expired lease token
+        //   (simulating a worker whose lease expired mid-mutation). The new
+        //   `LeaseLost` path must terminate — not loop — and return an Err.
+        //   The action stays in `enforcing` with no step_marker so the recovery
+        //   worker can pick it up.
+        //
+        // Phase 2: `recover_one` (the actual production worker entry point) is
+        //   called with a freshly-claimed live token. It must converge the action
+        //   to `succeeded`.
         let pool = e2e_pool().await;
         let (community_id, _host) = e2e_community(&pool, "lease-expiry").await;
         let target = vec![10u8; 32];
@@ -3949,7 +4025,7 @@ mod tests {
         let report_id = e2e_report_pubkey(&pool, community_id, &target).await;
         let cid = buzz_core::CommunityId::from_uuid(community_id);
 
-        // Claim: creates pending action with no lease (stranded from birth).
+        // Claim: creates pending action.
         let action_id = match buzz_db::relay_admin_actions::claim_report(
             &pool,
             cid,
@@ -3973,19 +4049,91 @@ mod tests {
             other => panic!("expected Claimed, got {other:?}"),
         };
 
-        // Set a fake expired lease so it appears stranded.
+        // Advance to enforcing so drive_enforcement_pub sees the right state.
+        buzz_db::relay_admin_actions::begin_enforcing(&pool, action_id)
+            .await
+            .expect("begin_enforcing");
+
+        // Assign an expired lease token: simulates a worker that acquired a lease
+        // but it has since expired (e.g. pod stalled for > 60 s).
+        let expired_token = uuid::Uuid::new_v4();
         let expired_at = chrono::Utc::now() - chrono::Duration::seconds(300);
         sqlx::query(
             "UPDATE relay_admin_actions SET action_lease_token = $2, action_lease_expires_at = $3 WHERE id = $1",
         )
         .bind(action_id)
-        .bind(uuid::Uuid::new_v4())
+        .bind(expired_token)
         .bind(expired_at)
         .execute(&pool)
         .await
-        .expect("set expired lease");
+        .expect("install expired lease");
 
-        // Worker claim: action is stranded (pending with expired lease).
+        // Phase 1: call drive_enforcement_pub with the expired token.
+        // With the C1-liveness fix, this must return an error (LeaseLost) rather
+        // than spinning in a tight loop with the expired token.
+        let state = state_from_pool(pool.clone()).await;
+        let rec = buzz_db::relay_admin_actions::get_action(&pool, action_id)
+            .await
+            .expect("get")
+            .expect("exists");
+        let host = state
+            .db
+            .lookup_community_host(cid)
+            .await
+            .expect("lookup")
+            .expect("host");
+        let tenant = buzz_core::tenant::TenantContext::resolved(cid, host);
+        let result = crate::handlers::report_resolution::drive_enforcement_pub(
+            &state,
+            &tenant,
+            cid,
+            report_id,
+            &rec.action.clone(),
+            rec.reason.as_deref(),
+            rec.timeout_until,
+            &rec.actor_pubkey.clone(),
+            Some(target.as_slice()),
+            None,
+            None,
+            &rec,
+            Some(expired_token), // expired caller-supplied token
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "drive_enforcement_pub with an expired token must return Err (LeaseLost), not loop"
+        );
+        let err_msg = format!("{:?}", result.unwrap_err());
+        assert!(
+            err_msg.contains("lease lost")
+                || err_msg.contains("lease_lost")
+                || err_msg.contains("LeaseLost"),
+            "error must name the lease-lost cause; got: {err_msg}"
+        );
+
+        // Action must still be in `enforcing` with step_marker NULL — nothing was committed.
+        let after_phase1 = buzz_db::relay_admin_actions::get_action(&pool, action_id)
+            .await
+            .expect("get after phase1")
+            .expect("exists");
+        assert_eq!(
+            after_phase1.state, "enforcing",
+            "action must still be enforcing after LeaseLost"
+        );
+        assert!(
+            after_phase1.step_marker.is_none(),
+            "step_marker must be NULL after LeaseLost"
+        );
+
+        // Phase 2: recovery worker re-claims and converges the action.
+        // Expire the DB-side lease so claim_stranded_action_batch can pick it up.
+        sqlx::query("UPDATE relay_admin_actions SET action_lease_expires_at = $2 WHERE id = $1")
+            .bind(action_id)
+            .bind(chrono::Utc::now() - chrono::Duration::seconds(1))
+            .execute(&pool)
+            .await
+            .expect("expire lease for batch");
+
         let lease_until = chrono::Utc::now() + chrono::Duration::seconds(120);
         let batch = buzz_db::relay_admin_actions::claim_stranded_action_batch(
             &pool,
@@ -3998,12 +4146,8 @@ mod tests {
         let claim = batch
             .into_iter()
             .find(|c| c.record.id == action_id)
-            .expect("stranded action must appear in batch");
+            .expect("stranded action must appear in batch after lease expiry");
 
-        // Re-drive via recover_one — the actual production worker entry point.
-        // This exercises the community-lookup + lease-token handoff path that
-        // `drive_enforcement_pub` alone does not cover.
-        let state = state_from_pool(pool.clone()).await;
         crate::handlers::admin_action_worker::recover_one(&state, claim).await;
 
         // Action must be succeeded and report resolved.
@@ -4656,23 +4800,38 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires Postgres — failed emit_system_message insert is not marked delivered"]
     async fn failed_system_message_insert_not_marked_delivered() {
-        // `emit_system_message` now returns `Err` when the durable event insert
-        // fails (previously it swallowed the error and returned `Ok`). This test
-        // verifies that `deliver_one` correctly calls `fail_outbox_row` (not
-        // `mark_outbox_delivered`) when the delivery primitive returns an error —
-        // so nothing is durably persisted yet, but the row is NOT marked delivered.
+        // `emit_system_message` propagates durable event insert failures (previously
+        // it swallowed them). This test verifies that `deliver_one` correctly calls
+        // `fail_outbox_row` (not `mark_outbox_delivered`) when the insert itself
+        // fails — so nothing is durably persisted, and the row is NOT marked delivered.
         //
-        // We trigger the failure via a bogus community_id in the payload — the same
-        // propagation path that a real durable-insert failure follows:
-        //   deliver_tombstone → resolve_tenant (returns Err) → Err propagated up
-        //   → deliver_one sees Err → fail_outbox_row, NOT mark_outbox_delivered.
+        // The failure is induced AFTER tenant resolution, inside `emit_system_message`'s
+        // `insert_event` call, by:
+        //  1. Setting the `buzz.created_at_floor` replica-fence GUC at DB level.
+        //  2. Backdating the outbox row's `created_at` beyond that floor.
+        //  `emit_system_message` derives the Nostr event's `created_at` from
+        //  `row.created_at` (the idempotency timestamp). With the floor active, the
+        //  deferrable trigger fires on INSERT and raises a check_violation, which
+        //  `insert_event` propagates as `Err`. The `?` in `emit_system_message` then
+        //  propagates it up through `deliver_tombstone → deliver_one → fail_outbox_row`.
         let pool = e2e_pool().await;
         let (community_id, _host) = e2e_community(&pool, "race-c3").await;
         let target = vec![24u8; 32];
         let actor = vec![25u8; 32];
         let report_id = e2e_report_pubkey(&pool, community_id, &target).await;
         let cid = buzz_core::CommunityId::from_uuid(community_id);
-        let state = state_from_pool(pool.clone()).await;
+
+        // Build a real community + channel so resolve_tenant succeeds and
+        // deliver_tombstone has a channel_id to pass to emit_system_message.
+        let channel_id: uuid::Uuid = sqlx::query_scalar(
+            r#"INSERT INTO channels (community_id, name, channel_type, created_by)
+               VALUES ($1, 'c3-test', 'stream', $2) RETURNING id"#,
+        )
+        .bind(community_id)
+        .bind(actor.as_slice())
+        .fetch_one(&pool)
+        .await
+        .expect("create test channel");
 
         // Finalize an action so we have a real action_id to attach the outbox row to.
         let action_id = match buzz_db::relay_admin_actions::claim_report(
@@ -4739,19 +4898,16 @@ mod tests {
         .await
         .expect("finalize");
 
-        // Insert a tombstone outbox row whose payload has a bogus community_id.
-        // resolve_tenant will fail → deliver_tombstone returns Err → deliver_one
-        // calls fail_outbox_row (not mark_outbox_delivered).
-        let bogus_community = uuid::Uuid::new_v4();
-        let bogus_channel = uuid::Uuid::new_v4();
+        // Insert a tombstone outbox row with a real channel_id so resolve_tenant
+        // and all payload parsing succeed; deliver_tombstone reaches emit_system_message.
         let fail_outbox_id: uuid::Uuid = sqlx::query_scalar(
             r#"INSERT INTO relay_admin_outbox (action_id, task_type, payload, dedup_key)
                VALUES ($1, 'tombstone', $2, $3) RETURNING id"#,
         )
         .bind(action_id)
         .bind(serde_json::json!({
-            "community_id": bogus_community.to_string(),
-            "channel_id": bogus_channel.to_string(),
+            "community_id": community_id.to_string(),
+            "channel_id": channel_id.to_string(),
             "target_event_id": hex::encode(vec![0u8; 32]),
             "action_id": action_id.to_string(),
         }))
@@ -4760,9 +4916,33 @@ mod tests {
         .await
         .expect("insert fail-outbox row");
 
+        // Backdate the outbox row's created_at so emit_system_message uses an old
+        // idempotency_ts. The events_created_at_floor trigger will reject the INSERT
+        // once we arm the GUC below.
+        sqlx::query(
+            "UPDATE relay_admin_outbox SET created_at = now() - interval '10 seconds' WHERE id = $1",
+        )
+        .bind(fail_outbox_id)
+        .execute(&pool)
+        .await
+        .expect("backdate outbox created_at");
+
+        // Arm the replica-fence GUC at DB level so new connections from the pool
+        // inherit it. A floor of 5 s means any event with created_at > 5 s ago
+        // is rejected. Our event's created_at will be ~10 s ago → trigger fires.
+        sqlx::query("ALTER DATABASE buzz SET \"buzz.created_at_floor\" TO 5")
+            .execute(&pool)
+            .await
+            .expect("set floor GUC");
+
+        // Build a fresh AppState (new pool). New connections from this pool inherit
+        // the DB-level GUC we just set, so `deliver_one`'s `insert_event` call will
+        // use a connection where the deferrable trigger is active.
+        let fresh_state = state_from_pool(e2e_pool().await).await;
+
         // Claim it so deliver_one has a real claim token.
         let lease_until = chrono::Utc::now() + chrono::Duration::seconds(30);
-        let mut batch = state
+        let mut batch = fresh_state
             .db
             .claim_pending_admin_outbox_batch("race-c3-worker", lease_until, 100)
             .await
@@ -4773,9 +4953,30 @@ mod tests {
             .expect("fail_outbox_id must be in batch");
         let row = batch.remove(row_idx);
 
-        // deliver_one fails (bogus community → resolve_tenant error) and must call
-        // fail_outbox_row — NOT mark_outbox_delivered.
-        crate::handlers::admin_outbox_worker::deliver_one(&state, &row).await;
+        // deliver_one fails inside emit_system_message at insert_event (deferrable
+        // floor-guard trigger → check_violation) and must call fail_outbox_row —
+        // NOT mark_outbox_delivered.
+        crate::handlers::admin_outbox_worker::deliver_one(&fresh_state, &row).await;
+
+        // Reset the floor GUC so subsequent tests are not affected.
+        sqlx::query("ALTER DATABASE buzz RESET \"buzz.created_at_floor\"")
+            .execute(&pool)
+            .await
+            .expect("reset floor GUC");
+
+        // No tombstone event was persisted — the failure was inside insert_event.
+        let post_event_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM events WHERE community_id = $1 AND channel_id = $2 AND kind = 40099",
+        )
+        .bind(community_id)
+        .bind(channel_id)
+        .fetch_one(&pool)
+        .await
+        .expect("post-delivery event count");
+        assert_eq!(
+            post_event_count, 0,
+            "no tombstone event must be persisted when insert_event failed"
+        );
 
         // Row must be `pending` (retryable), not `delivered` (nothing was persisted).
         let (row_state, attempt): (String, i32) =
@@ -4794,5 +4995,180 @@ mod tests {
             "failed delivery must leave row pending (retryable), not delivered"
         );
         assert_eq!(attempt, 1, "attempt_count must be 1 after one failure");
+    }
+
+    // ── 10. reporter notice overlap: concurrent deliveries persist exactly one ─
+
+    #[tokio::test]
+    #[ignore = "requires Postgres — reporter notice idempotency under concurrent delivery"]
+    async fn reporter_notice_duplicate_delivery_persists_exactly_one() {
+        // Two workers race to deliver the same reporter_notice outbox row. The
+        // C3 fix makes notices deterministic (stable event ID from outbox created_at),
+        // so both workers produce byte-identical Nostr events. insert_event's
+        // ON CONFLICT DO NOTHING deduplicates at the DB level: exactly one notice
+        // is persisted regardless of which worker inserts first.
+        let pool = e2e_pool().await;
+        let (community_id, _host) = e2e_community(&pool, "notice-overlap").await;
+        let target = vec![31u8; 32];
+        let actor = vec![32u8; 32];
+        let cid = buzz_core::CommunityId::from_uuid(community_id);
+
+        // Insert a report using the standard helper (handles correct column names
+        // and types for `moderation_reports`).
+        let report_id = e2e_report_pubkey(&pool, community_id, &target).await;
+
+        // Finalize an action so we have an action_id.
+        let action_id = match buzz_db::relay_admin_actions::claim_report(
+            &pool,
+            cid,
+            report_id,
+            uuid::Uuid::new_v4(),
+            &actor,
+            "operator",
+            "ban",
+            None,
+            None,
+            "resolve:ban",
+            "relay_operator",
+            Some(&target),
+            None,
+            None,
+        )
+        .await
+        .expect("claim")
+        {
+            buzz_db::relay_admin_actions::ClaimResult::Claimed(a) => a.id,
+            other => panic!("expected Claimed, got {other:?}"),
+        };
+        let _ = buzz_db::relay_admin_actions::begin_enforcing(&pool, action_id)
+            .await
+            .expect("begin_enforcing");
+        let lt = match buzz_db::relay_admin_actions::acquire_action_lease(
+            &pool,
+            action_id,
+            chrono::Utc::now() + chrono::Duration::seconds(60),
+        )
+        .await
+        .expect("lease")
+        {
+            buzz_db::relay_admin_actions::LeaseResult::Acquired(t) => t,
+            other => panic!("{other:?}"),
+        };
+        let _ = buzz_db::relay_admin_actions::execute_ban_with_marker(
+            &pool, action_id, lt, cid, &target, &actor, None,
+        )
+        .await
+        .expect("execute_ban");
+        let _ = buzz_db::relay_admin_actions::finalize_success(
+            &pool,
+            action_id,
+            cid,
+            report_id,
+            "resolved",
+            &actor,
+            "ban",
+            Some(&target),
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("finalize");
+
+        // Find the reporter_notice outbox row created by finalize_success.
+        let notice_outbox_id: uuid::Uuid = sqlx::query_scalar(
+            "SELECT id FROM relay_admin_outbox WHERE action_id = $1 AND task_type = 'reporter_notice'",
+        )
+        .bind(action_id)
+        .fetch_one(&pool)
+        .await
+        .expect("reporter_notice outbox row");
+
+        // Simulate worker A and worker B: claim two copies with different tokens
+        // by manually inserting a second outbox row pointing to the same action
+        // (simulates two pods each claiming and delivering the same logical notice).
+        // In practice the fencing prevents double-completion, but we want to test
+        // that TWO concurrent insert_event calls produce only ONE durable notice.
+        //
+        // To drive this through deliver_one without depending on claim-token races,
+        // we build TWO OutboxRecords with the same created_at (same idempotency_ts)
+        // and different claim_tokens, then call deliver_one with each sequentially.
+        let notice_record: buzz_db::relay_admin_actions::OutboxRecord = {
+            let lease_until = chrono::Utc::now() + chrono::Duration::seconds(30);
+            let batch = {
+                let state_a = state_from_pool(pool.clone()).await;
+                state_a
+                    .db
+                    .claim_pending_admin_outbox_batch("notice-worker-a", lease_until, 100)
+                    .await
+                    .expect("claim batch a")
+            };
+            batch
+                .into_iter()
+                .find(|r| r.id == notice_outbox_id)
+                .expect("notice row in batch a")
+        };
+
+        let state = state_from_pool(pool.clone()).await;
+
+        // Worker A delivers.
+        crate::handlers::admin_outbox_worker::deliver_one(&state, &notice_record).await;
+
+        // Manually reset the outbox row to `pending` so worker B can claim it.
+        // Expire the lease so claim_pending_admin_outbox_batch sees it as available.
+        sqlx::query(
+            "UPDATE relay_admin_outbox SET state = 'pending', outbox_claim_token = NULL, \
+             held_by = 'notice-worker-b', lease_expires_at = now() - interval '1 second' \
+             WHERE id = $1",
+        )
+        .bind(notice_outbox_id)
+        .execute(&pool)
+        .await
+        .expect("reset row for worker b");
+
+        // Build worker B's OutboxRecord (same created_at, different token).
+        // We re-claim via the batch helper so we get the canonical record shape.
+        let record_b: buzz_db::relay_admin_actions::OutboxRecord = {
+            let batch_b = state
+                .db
+                .claim_pending_admin_outbox_batch(
+                    "notice-worker-b2",
+                    chrono::Utc::now() + chrono::Duration::seconds(30),
+                    100,
+                )
+                .await
+                .expect("claim batch b2");
+            batch_b
+                .into_iter()
+                .find(|r| r.id == notice_outbox_id)
+                .expect("notice row in batch b2")
+        };
+
+        // Worker B delivers — same created_at → same Nostr event ID → ON CONFLICT DO NOTHING.
+        crate::handlers::admin_outbox_worker::deliver_one(&state, &record_b).await;
+
+        // Assert: exactly one notice event (kind:9) with the specific report_id
+        // source tag is persisted. The moderation_source tag carries report_id
+        // (from ModerationNotice::ReportResolved). Filter by kind and tag to
+        // isolate the notice from profile/discovery events emitted by the same worker.
+        let report_id_str = report_id.to_string();
+        let relay_pubkey_bytes = state.relay_keypair.public_key().to_bytes();
+        let total_notices: i64 = sqlx::query_scalar(
+            r#"SELECT COUNT(*) FROM events
+               WHERE community_id = $1
+                 AND kind = 9
+                 AND pubkey = $2
+                 AND tags @> jsonb_build_array(jsonb_build_array('moderation_source', $3::text))"#,
+        )
+        .bind(community_id)
+        .bind(relay_pubkey_bytes.as_slice())
+        .bind(&report_id_str)
+        .fetch_one(&pool)
+        .await
+        .expect("count notice events");
+        assert_eq!(
+            total_notices, 1,
+            "exactly one notice event must be persisted after two concurrent deliveries (ON CONFLICT DO NOTHING dedup)"
+        );
     }
 }

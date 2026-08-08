@@ -225,6 +225,7 @@ pub async fn resolve_report_decision_only(
             status: terminal_status.to_string(),
             summary,
         },
+        chrono::Utc::now(),
     )
     .await
     {
@@ -492,7 +493,7 @@ async fn drive_enforcement(
             }
 
             match mutation_result {
-                Ok(false) => {
+                Ok(MutationOutcome::AlreadyCommitted) => {
                     // step_marker already set by a concurrent driver;
                     // reload and advance to finalization.
                     rec = state
@@ -507,7 +508,17 @@ async fn drive_enforcement(
                         })?;
                     continue;
                 }
-                Ok(true) => {
+                Ok(MutationOutcome::LeaseLost) => {
+                    // This driver's lease has expired. Another pod has reclaimed
+                    // (or will reclaim) the action. Do NOT loop with the same
+                    // expired token — that would spin the recovery worker in a
+                    // tight DB loop forever on a single-pod deployment. Return a
+                    // retryable error; the recovery worker owns convergence.
+                    return Err(ResolutionError::Internal(format!(
+                        "action {action_id} lease lost mid-mutation; recovery worker will complete"
+                    )));
+                }
+                Ok(MutationOutcome::Committed) => {
                     // Marker committed. Fall through to finalization below.
                 }
                 Err(e) => {
@@ -564,19 +575,37 @@ async fn drive_enforcement(
     }
 }
 
+/// Outcome of an atomic mutation attempt.
+enum MutationOutcome {
+    /// This driver committed the domain mutation and the step marker.
+    Committed,
+    /// Another driver already set the step marker; no domain writes occurred.
+    AlreadyCommitted,
+    /// The caller's lease token is expired or no longer owned by this driver.
+    /// The caller must stop driving this action — the recovery worker will pick
+    /// it up once the new owner's lease expires.
+    LeaseLost,
+}
+
 /// Execute the enforcement mutation AND commit `step_marker = 'mutation_committed'`
 /// in a single DB transaction, fenced by `action_id` AND `lease_token`.
 ///
-/// Returns `Ok(true)` if this driver committed the marker (successful mutation),
-/// `Ok(false)` if the marker was already committed or the lease was lost (another
-/// driver raced us), `Err` if the mutation itself failed.
+/// Returns:
+/// - [`MutationOutcome::Committed`] — this driver committed the marker.
+/// - [`MutationOutcome::AlreadyCommitted`] — another driver set the marker first.
+/// - [`MutationOutcome::LeaseLost`] — the caller's lease has expired; the caller
+///   must stop and let the recovery worker take over.
+/// - `Err` — the mutation itself failed (DB or validation error).
 async fn run_atomic_mutation(
     state: &Arc<AppState>,
     action_id: Uuid,
     lease_token: Uuid,
     ctx: &EnforcementCtx<'_>,
-) -> anyhow::Result<bool> {
-    match ctx.action {
+) -> anyhow::Result<MutationOutcome> {
+    // Returns Ok(true) if this driver set the marker, Ok(false) if the lease
+    // ownership fence rejected the transaction (lease lost or marker already set
+    // by a concurrent driver). We classify Ok(false) by reloading the row.
+    let raw: anyhow::Result<bool> = match ctx.action {
         "ban" => {
             let target = ctx
                 .target_pubkey
@@ -667,6 +696,25 @@ async fn run_atomic_mutation(
                 .map_err(|e| anyhow::anyhow!("delete failed: {e}"))
         }
         other => Err(anyhow::anyhow!("unexpected enforcement action: {other}")),
+    };
+
+    match raw? {
+        true => Ok(MutationOutcome::Committed),
+        false => {
+            // Reload to distinguish "step_marker already set by another driver"
+            // (AlreadyCommitted — safe to proceed to finalization) from "this
+            // driver's lease expired" (LeaseLost — must stop, recovery worker
+            // will take over after expiry).
+            let rec = state
+                .db
+                .get_admin_action(action_id)
+                .await
+                .map_err(|e| anyhow::anyhow!("classify mutation result: {e}"))?;
+            match rec {
+                Some(r) if r.step_marker.is_some() => Ok(MutationOutcome::AlreadyCommitted),
+                _ => Ok(MutationOutcome::LeaseLost),
+            }
+        }
     }
 }
 
