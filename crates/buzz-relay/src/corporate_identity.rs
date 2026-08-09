@@ -1244,6 +1244,7 @@ mod tests {
     use jsonwebtoken::jwk::JwkSet;
     use jsonwebtoken::{encode, EncodingKey, Header};
     use nostr::Keys;
+    use rsa::{pkcs1::EncodeRsaPrivateKey, rand_core::OsRng, RsaPrivateKey};
     use sqlx::PgPool;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
@@ -1549,7 +1550,7 @@ mod tests {
 
     #[tokio::test]
     async fn validate_jwt_accepts_matching_rs256_jwk() {
-        let key = rsa_private_key(include_str!("testdata/rsa_private_key_1.der.b64"));
+        let key = rsa_private_key(0);
         let token = rsa_test_jwt(&key, "rsa-key");
         let claims = validate_rsa_jwt(&token, rsa_test_jwk(&key, "rsa-key"))
             .await
@@ -1561,8 +1562,8 @@ mod tests {
 
     #[tokio::test]
     async fn validate_jwt_rejects_rs256_token_signed_by_wrong_key() {
-        let signing_key = rsa_private_key(include_str!("testdata/rsa_private_key_1.der.b64"));
-        let advertised_key = rsa_private_key(include_str!("testdata/rsa_private_key_2.der.b64"));
+        let signing_key = rsa_private_key(0);
+        let advertised_key = rsa_private_key(1);
         let token = rsa_test_jwt(&signing_key, "rsa-key");
 
         let error = validate_rsa_jwt(&token, rsa_test_jwk(&advertised_key, "rsa-key"))
@@ -1573,7 +1574,7 @@ mod tests {
 
     #[tokio::test]
     async fn validate_jwt_rejects_jwk_advertised_algorithm_mismatch() {
-        let key = rsa_private_key(include_str!("testdata/rsa_private_key_1.der.b64"));
+        let key = rsa_private_key(0);
         let token = rsa_test_jwt(&key, "rsa-key");
         let mut jwk = rsa_test_jwk(&key, "rsa-key");
         jwk.common.key_algorithm = Some(KeyAlgorithm::RS512);
@@ -1590,7 +1591,7 @@ mod tests {
 
     #[tokio::test]
     async fn validate_jwt_accepts_jwk_with_omitted_algorithm() {
-        let key = rsa_private_key(include_str!("testdata/rsa_private_key_1.der.b64"));
+        let key = rsa_private_key(0);
         let token = rsa_test_jwt(&key, "rsa-key");
         let mut jwk = rsa_test_jwk(&key, "rsa-key");
         jwk.common.key_algorithm = None;
@@ -1602,7 +1603,7 @@ mod tests {
 
     #[test]
     fn validate_jwk_requires_signature_use_and_verify_operation_when_present() {
-        let key = rsa_private_key(include_str!("testdata/rsa_private_key_1.der.b64"));
+        let key = rsa_private_key(0);
         let mut jwk = rsa_test_jwk(&key, "rsa-key");
         jwk.common.public_key_use = Some(PublicKeyUse::Encryption);
         assert!(matches!(
@@ -1960,7 +1961,7 @@ mod tests {
         signing_key: &[u8],
         verification_key: &[u8],
     ) -> Result<(), CanonicalVerifierError> {
-        let private_key = rsa_private_key(include_str!("testdata/rsa_private_key_1.der.b64"));
+        let private_key = rsa_private_key(0);
         let token = if signing_algorithm == Algorithm::RS256 {
             let mut header = Header::new(Algorithm::RS256);
             header.kid = Some("canonical-test-key".to_owned());
@@ -1975,7 +1976,7 @@ mod tests {
         let verification_material = if signing_key == verification_key {
             private_key
         } else {
-            rsa_private_key(include_str!("testdata/rsa_private_key_2.der.b64"))
+            rsa_private_key(1)
         };
         let key_set = CanonicalVerifierKeySet::new(
             VerifierKeyGeneration::new(1).expect("generation"),
@@ -2005,10 +2006,19 @@ mod tests {
             .map(|_| ())
     }
 
-    fn rsa_private_key(encoded: &str) -> Vec<u8> {
-        base64::engine::general_purpose::STANDARD
-            .decode(encoded.trim())
-            .expect("decode RSA test key")
+    fn rsa_private_key(index: usize) -> Vec<u8> {
+        static KEYS: std::sync::OnceLock<[Vec<u8>; 2]> = std::sync::OnceLock::new();
+        KEYS.get_or_init(|| {
+            std::array::from_fn(|_| {
+                RsaPrivateKey::new(&mut OsRng, 2_048)
+                    .expect("generate RSA test key")
+                    .to_pkcs1_der()
+                    .expect("encode generated RSA test key")
+                    .as_bytes()
+                    .to_vec()
+            })
+        })[index]
+            .clone()
     }
 
     fn rsa_test_jwk(private_key: &[u8], kid: &str) -> Jwk {
