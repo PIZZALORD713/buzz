@@ -247,7 +247,7 @@ CREATE TABLE IF NOT EXISTS authorization_operation_receipts (
     CONSTRAINT authorization_operation_receipts_community_id_fkey FOREIGN KEY (community_id) REFERENCES communities (id),
     CONSTRAINT authorization_operation_receipts_actor_fingerprint_check CHECK (octet_length(actor_fingerprint) = 32),
     CONSTRAINT authorization_operation_receipts_operation_id_check CHECK (operation_id <> '00000000-0000-0000-0000-000000000000'::uuid),
-    CONSTRAINT authorization_operation_receipts_operation_kind_check CHECK (operation_kind IN (1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13)),
+    CONSTRAINT authorization_operation_receipts_operation_kind_check CHECK (operation_kind IN (1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12)),
     CONSTRAINT authorization_operation_receipts_outcome_code_check CHECK (outcome_code IN (1, 2, 3)),
     CONSTRAINT authorization_operation_receipts_request_fingerprint_check CHECK (octet_length(request_fingerprint) = 32),
     CONSTRAINT authorization_operation_receipts_result_digest_check CHECK (octet_length(result_digest) = 32)
@@ -273,7 +273,7 @@ CREATE TABLE IF NOT EXISTS authorization_authority_epochs (
     CONSTRAINT authorization_authority_epochs_authority_epoch_check CHECK (authority_epoch > 0),
     CONSTRAINT authorization_authority_epochs_fence_check CHECK (octet_length(fence) = 32 AND fence <> decode(repeat('00'::text, 32), 'hex'::text)),
     CONSTRAINT authorization_authority_epochs_object_key_check CHECK (octet_length(object_key) = 32),
-    CONSTRAINT authorization_authority_epochs_object_kind_check CHECK (object_kind IN (1, 2, 3, 4, 5, 6, 7)),
+    CONSTRAINT authorization_authority_epochs_object_kind_check CHECK (object_kind IN (1, 2, 3, 4, 5, 6)),
     CONSTRAINT authorization_authority_epochs_request_fingerprint_check CHECK (octet_length(request_fingerprint) = 32)
 );
 
@@ -312,7 +312,7 @@ CREATE TABLE IF NOT EXISTS authorization_events (
     CONSTRAINT authorization_events_envelope_digest_check CHECK (octet_length(envelope_digest) = 32),
     CONSTRAINT authorization_events_envelope_size CHECK (octet_length(canonical_envelope) >= 1 AND octet_length(canonical_envelope) <= 16384),
     CONSTRAINT authorization_events_event_id_check CHECK (event_id <> '00000000-0000-0000-0000-000000000000'::uuid),
-    CONSTRAINT authorization_events_event_kind_check CHECK (event_kind IN (1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14)),
+    CONSTRAINT authorization_events_event_kind_check CHECK (event_kind IN (1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 14)),
     CONSTRAINT authorization_events_operation_id_check CHECK (operation_id <> '00000000-0000-0000-0000-000000000000'::uuid),
     CONSTRAINT authorization_events_outcome_code_check CHECK (outcome_code IN (1, 2, 3, 4, 5)),
     CONSTRAINT authorization_events_reason_code_check CHECK (reason_code IN (1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16)),
@@ -419,7 +419,7 @@ CREATE TABLE IF NOT EXISTS authorization_operation_version_deltas (
     CONSTRAINT authorization_operation_version_deltas_check CHECK (after_version > before_version),
     CONSTRAINT authorization_operation_version_deltas_component_digest_check CHECK (octet_length(component_digest) = 32),
     CONSTRAINT authorization_operation_version_deltas_component_key_check CHECK (octet_length(component_key) = 32),
-    CONSTRAINT authorization_operation_version_deltas_component_kind_check CHECK (component_kind IN (1, 2, 3, 4, 5, 6, 7))
+    CONSTRAINT authorization_operation_version_deltas_component_kind_check CHECK (component_kind IN (1, 2, 3, 4, 6, 7))
 );
 
 --
@@ -2446,52 +2446,6 @@ CREATE INDEX IF NOT EXISTS idx_workflow_approvals_status ON workflow_approvals (
 CREATE INDEX IF NOT EXISTS idx_workflow_approvals_workflow ON workflow_approvals (community_id, workflow_id);
 
 --
--- Name: client_status_revisions; Type: TABLE; Schema: -; Owner: -
---
-
-CREATE TABLE IF NOT EXISTS client_status_revisions (
-    community_id uuid,
-    event_author_pubkey bytea,
-    revision bigint,
-    disposition smallint NOT NULL,
-    binding_id uuid,
-    binding_version bigint,
-    policy_revision bigint,
-    invalidation_generation bigint,
-    authority_epoch bigint,
-    fence bytea,
-    observed_at timestamptz,
-    fresh_until timestamptz,
-    supersedes_revision bigint,
-    receipt_digest bytea NOT NULL,
-    operation_id uuid NOT NULL,
-    request_fingerprint bytea NOT NULL,
-    recorded_at timestamptz DEFAULT transaction_timestamp() NOT NULL,
-    CONSTRAINT client_status_revisions_pkey PRIMARY KEY (community_id, event_author_pubkey, revision),
-    CONSTRAINT client_status_revisions_community_id_operation_id_key UNIQUE (community_id, operation_id),
-    CONSTRAINT client_status_revisions_community_id_event_author_pubkey_s_fkey FOREIGN KEY (community_id, event_author_pubkey, supersedes_revision) REFERENCES client_status_revisions (community_id, event_author_pubkey, revision) DEFERRABLE INITIALLY DEFERRED,
-    CONSTRAINT client_status_revisions_community_id_fkey FOREIGN KEY (community_id) REFERENCES communities (id),
-    CONSTRAINT client_status_revisions_community_id_operation_id_request__fkey FOREIGN KEY (community_id, operation_id, request_fingerprint) REFERENCES authorization_operation_receipts (community_id, operation_id, request_fingerprint) DEFERRABLE INITIALLY DEFERRED,
-    CONSTRAINT client_status_revisions_authority_epoch_check CHECK (authority_epoch IS NULL OR authority_epoch > 0),
-    CONSTRAINT client_status_revisions_binding_version_check CHECK (binding_version IS NULL OR binding_version > 0),
-    CONSTRAINT client_status_revisions_disposition_check CHECK (disposition IN (1, 2)),
-    CONSTRAINT client_status_revisions_event_author_pubkey_check CHECK (octet_length(event_author_pubkey) = 32),
-    CONSTRAINT client_status_revisions_fence_check CHECK (fence IS NULL OR octet_length(fence) = 32 AND fence <> decode(repeat('00'::text, 32), 'hex'::text)),
-    CONSTRAINT client_status_revisions_invalidation_generation_check CHECK (invalidation_generation IS NULL OR invalidation_generation >= 0),
-    CONSTRAINT client_status_revisions_policy_revision_check CHECK (policy_revision IS NULL OR policy_revision > 0),
-    CONSTRAINT client_status_revisions_receipt_digest_check CHECK (octet_length(receipt_digest) = 32),
-    CONSTRAINT client_status_revisions_request_fingerprint_check CHECK (octet_length(request_fingerprint) = 32),
-    CONSTRAINT client_status_revisions_revision_check CHECK (revision > 0),
-    CONSTRAINT client_status_revisions_supersedes_revision_check CHECK (supersedes_revision IS NULL OR supersedes_revision > 0)
-);
-
---
--- Name: client_status_revisions_current_lookup; Type: INDEX; Schema: -; Owner: -
---
-
-CREATE INDEX IF NOT EXISTS client_status_revisions_current_lookup ON client_status_revisions (community_id, event_author_pubkey, revision DESC);
-
---
 -- Name: identity_bindings; Type: TABLE; Schema: -; Owner: -
 --
 
@@ -2777,7 +2731,7 @@ CREATE TABLE IF NOT EXISTS protected_object_authority (
     CONSTRAINT protected_object_authority_fence_check CHECK (octet_length(fence) = 32 AND fence <> decode(repeat('00'::text, 32), 'hex'::text)),
     CONSTRAINT protected_object_authority_invalidation_generation_check CHECK (invalidation_generation >= 0),
     CONSTRAINT protected_object_authority_object_key_check CHECK (octet_length(object_key) = 32),
-    CONSTRAINT protected_object_authority_object_kind_check CHECK (object_kind IN (1, 2, 3, 4, 5, 6, 7)),
+    CONSTRAINT protected_object_authority_object_kind_check CHECK (object_kind IN (1, 2, 3, 4, 5, 6)),
     CONSTRAINT protected_object_authority_owner_pubkey_check CHECK (owner_pubkey IS NULL OR octet_length(owner_pubkey) = 32),
     CONSTRAINT protected_object_authority_policy_revision_check CHECK (policy_revision > 0),
     CONSTRAINT protected_object_authority_request_fingerprint_check CHECK (octet_length(request_fingerprint) = 32)
@@ -3957,13 +3911,6 @@ END
 $$;
 
 --
--- Name: client_status_revisions_community_id_binding_id_binding_ve_fkey; Type: CONSTRAINT; Schema: -; Owner: -
---
-
-ALTER TABLE client_status_revisions
-ADD CONSTRAINT client_status_revisions_community_id_binding_id_binding_ve_fkey FOREIGN KEY (community_id, binding_id, binding_version) REFERENCES identity_bindings (community_id, binding_id, binding_version) DEFERRABLE INITIALLY DEFERRED;
-
---
 -- Name: identity_bindings_exact_birth_history_fk; Type: CONSTRAINT; Schema: -; Owner: -
 --
 
@@ -4215,59 +4162,11 @@ CREATE OR REPLACE TRIGGER authorization_operation_version_deltas_no_truncate
     EXECUTE FUNCTION nip_fi_reject_truncate_v1();
 
 --
--- Name: client_status_revisions_immutable; Type: TRIGGER; Schema: -; Owner: -
---
-
-CREATE OR REPLACE TRIGGER client_status_revisions_immutable
-    BEFORE UPDATE OR DELETE ON client_status_revisions
-    FOR EACH ROW
-    EXECUTE FUNCTION nip_fi_reject_row_mutation_v1();
-
---
--- Name: client_status_revisions_no_truncate; Type: TRIGGER; Schema: -; Owner: -
---
-
-CREATE OR REPLACE TRIGGER client_status_revisions_no_truncate
-    BEFORE TRUNCATE ON client_status_revisions
-    FOR EACH STATEMENT
-    EXECUTE FUNCTION nip_fi_reject_truncate_v1();
-
---
 -- Name: events_created_at_floor; Type: TRIGGER; Schema: -; Owner: -
 --
 
 CREATE CONSTRAINT TRIGGER events_created_at_floor
-    AFTER INSERT OR UPDATE OF created_at, channel_id ON events_p2026_04
-    DEFERRABLE INITIALLY DEFERRED
-    FOR EACH ROW
-    EXECUTE FUNCTION events_created_at_floor_guard();
-
---
--- Name: events_created_at_floor; Type: TRIGGER; Schema: -; Owner: -
---
-
-CREATE CONSTRAINT TRIGGER events_created_at_floor
-    AFTER INSERT OR UPDATE OF created_at, channel_id ON events
-    DEFERRABLE INITIALLY DEFERRED
-    FOR EACH ROW
-    EXECUTE FUNCTION events_created_at_floor_guard();
-
---
--- Name: events_created_at_floor; Type: TRIGGER; Schema: -; Owner: -
---
-
-CREATE CONSTRAINT TRIGGER events_created_at_floor
-    AFTER INSERT OR UPDATE OF created_at, channel_id ON events_p2026_06
-    DEFERRABLE INITIALLY DEFERRED
-    FOR EACH ROW
-    EXECUTE FUNCTION events_created_at_floor_guard();
-
---
--- Name: events_created_at_floor; Type: TRIGGER; Schema: -; Owner: -
---
-
-CREATE CONSTRAINT TRIGGER events_created_at_floor
-    AFTER INSERT OR UPDATE OF created_at, channel_id ON events_p_past
+    AFTER INSERT OR UPDATE OF created_at, channel_id ON events_p2026_01
     DEFERRABLE INITIALLY DEFERRED
     FOR EACH ROW
     EXECUTE FUNCTION events_created_at_floor_guard();
@@ -4287,7 +4186,27 @@ CREATE CONSTRAINT TRIGGER events_created_at_floor
 --
 
 CREATE CONSTRAINT TRIGGER events_created_at_floor
-    AFTER INSERT OR UPDATE OF created_at, channel_id ON events_p_future
+    AFTER INSERT OR UPDATE OF created_at, channel_id ON events_p_past
+    DEFERRABLE INITIALLY DEFERRED
+    FOR EACH ROW
+    EXECUTE FUNCTION events_created_at_floor_guard();
+
+--
+-- Name: events_created_at_floor; Type: TRIGGER; Schema: -; Owner: -
+--
+
+CREATE CONSTRAINT TRIGGER events_created_at_floor
+    AFTER INSERT OR UPDATE OF created_at, channel_id ON events
+    DEFERRABLE INITIALLY DEFERRED
+    FOR EACH ROW
+    EXECUTE FUNCTION events_created_at_floor_guard();
+
+--
+-- Name: events_created_at_floor; Type: TRIGGER; Schema: -; Owner: -
+--
+
+CREATE CONSTRAINT TRIGGER events_created_at_floor
+    AFTER INSERT OR UPDATE OF created_at, channel_id ON events_p2026_04
     DEFERRABLE INITIALLY DEFERRED
     FOR EACH ROW
     EXECUTE FUNCTION events_created_at_floor_guard();
@@ -4307,7 +4226,7 @@ CREATE CONSTRAINT TRIGGER events_created_at_floor
 --
 
 CREATE CONSTRAINT TRIGGER events_created_at_floor
-    AFTER INSERT OR UPDATE OF created_at, channel_id ON events_p2026_01
+    AFTER INSERT OR UPDATE OF created_at, channel_id ON events_p_future
     DEFERRABLE INITIALLY DEFERRED
     FOR EACH ROW
     EXECUTE FUNCTION events_created_at_floor_guard();
@@ -4323,13 +4242,14 @@ CREATE CONSTRAINT TRIGGER events_created_at_floor
     EXECUTE FUNCTION events_created_at_floor_guard();
 
 --
--- Name: events_enqueue_push_match; Type: TRIGGER; Schema: -; Owner: -
+-- Name: events_created_at_floor; Type: TRIGGER; Schema: -; Owner: -
 --
 
-CREATE OR REPLACE TRIGGER events_enqueue_push_match
-    AFTER INSERT ON events
+CREATE CONSTRAINT TRIGGER events_created_at_floor
+    AFTER INSERT OR UPDATE OF created_at, channel_id ON events_p2026_06
+    DEFERRABLE INITIALLY DEFERRED
     FOR EACH ROW
-    EXECUTE FUNCTION enqueue_push_match_job();
+    EXECUTE FUNCTION events_created_at_floor_guard();
 
 --
 -- Name: events_enqueue_push_match; Type: TRIGGER; Schema: -; Owner: -
@@ -4363,15 +4283,6 @@ CREATE OR REPLACE TRIGGER events_enqueue_push_match
 --
 
 CREATE OR REPLACE TRIGGER events_enqueue_push_match
-    AFTER INSERT ON events_p2026_04
-    FOR EACH ROW
-    EXECUTE FUNCTION enqueue_push_match_job();
-
---
--- Name: events_enqueue_push_match; Type: TRIGGER; Schema: -; Owner: -
---
-
-CREATE OR REPLACE TRIGGER events_enqueue_push_match
     AFTER INSERT ON events_p_future
     FOR EACH ROW
     EXECUTE FUNCTION enqueue_push_match_job();
@@ -4381,7 +4292,25 @@ CREATE OR REPLACE TRIGGER events_enqueue_push_match
 --
 
 CREATE OR REPLACE TRIGGER events_enqueue_push_match
-    AFTER INSERT ON events_p2026_02
+    AFTER INSERT ON events_p2026_04
+    FOR EACH ROW
+    EXECUTE FUNCTION enqueue_push_match_job();
+
+--
+-- Name: events_enqueue_push_match; Type: TRIGGER; Schema: -; Owner: -
+--
+
+CREATE OR REPLACE TRIGGER events_enqueue_push_match
+    AFTER INSERT ON events
+    FOR EACH ROW
+    EXECUTE FUNCTION enqueue_push_match_job();
+
+--
+-- Name: events_enqueue_push_match; Type: TRIGGER; Schema: -; Owner: -
+--
+
+CREATE OR REPLACE TRIGGER events_enqueue_push_match
+    AFTER INSERT ON events_p2026_03
     FOR EACH ROW
     EXECUTE FUNCTION enqueue_push_match_job();
 
@@ -4399,7 +4328,7 @@ CREATE OR REPLACE TRIGGER events_enqueue_push_match
 --
 
 CREATE OR REPLACE TRIGGER events_enqueue_push_match
-    AFTER INSERT ON events_p2026_03
+    AFTER INSERT ON events_p2026_02
     FOR EACH ROW
     EXECUTE FUNCTION enqueue_push_match_job();
 
@@ -4409,6 +4338,16 @@ CREATE OR REPLACE TRIGGER events_enqueue_push_match
 
 CREATE CONSTRAINT TRIGGER events_refresh_channel_ttl
     AFTER INSERT ON events_p2026_04
+    DEFERRABLE INITIALLY DEFERRED
+    FOR EACH ROW
+    EXECUTE FUNCTION refresh_channel_ttl_after_event_insert();
+
+--
+-- Name: events_refresh_channel_ttl; Type: TRIGGER; Schema: -; Owner: -
+--
+
+CREATE CONSTRAINT TRIGGER events_refresh_channel_ttl
+    AFTER INSERT ON events_p_future
     DEFERRABLE INITIALLY DEFERRED
     FOR EACH ROW
     EXECUTE FUNCTION refresh_channel_ttl_after_event_insert();
@@ -4428,6 +4367,16 @@ CREATE CONSTRAINT TRIGGER events_refresh_channel_ttl
 --
 
 CREATE CONSTRAINT TRIGGER events_refresh_channel_ttl
+    AFTER INSERT ON events_p2026_06
+    DEFERRABLE INITIALLY DEFERRED
+    FOR EACH ROW
+    EXECUTE FUNCTION refresh_channel_ttl_after_event_insert();
+
+--
+-- Name: events_refresh_channel_ttl; Type: TRIGGER; Schema: -; Owner: -
+--
+
+CREATE CONSTRAINT TRIGGER events_refresh_channel_ttl
     AFTER INSERT ON events_p_past
     DEFERRABLE INITIALLY DEFERRED
     FOR EACH ROW
@@ -4438,7 +4387,7 @@ CREATE CONSTRAINT TRIGGER events_refresh_channel_ttl
 --
 
 CREATE CONSTRAINT TRIGGER events_refresh_channel_ttl
-    AFTER INSERT ON events_p_future
+    AFTER INSERT ON events_p2026_02
     DEFERRABLE INITIALLY DEFERRED
     FOR EACH ROW
     EXECUTE FUNCTION refresh_channel_ttl_after_event_insert();
@@ -4448,7 +4397,7 @@ CREATE CONSTRAINT TRIGGER events_refresh_channel_ttl
 --
 
 CREATE CONSTRAINT TRIGGER events_refresh_channel_ttl
-    AFTER INSERT ON events_p2026_06
+    AFTER INSERT ON events
     DEFERRABLE INITIALLY DEFERRED
     FOR EACH ROW
     EXECUTE FUNCTION refresh_channel_ttl_after_event_insert();
@@ -4469,26 +4418,6 @@ CREATE CONSTRAINT TRIGGER events_refresh_channel_ttl
 
 CREATE CONSTRAINT TRIGGER events_refresh_channel_ttl
     AFTER INSERT ON events_p2026_01
-    DEFERRABLE INITIALLY DEFERRED
-    FOR EACH ROW
-    EXECUTE FUNCTION refresh_channel_ttl_after_event_insert();
-
---
--- Name: events_refresh_channel_ttl; Type: TRIGGER; Schema: -; Owner: -
---
-
-CREATE CONSTRAINT TRIGGER events_refresh_channel_ttl
-    AFTER INSERT ON events
-    DEFERRABLE INITIALLY DEFERRED
-    FOR EACH ROW
-    EXECUTE FUNCTION refresh_channel_ttl_after_event_insert();
-
---
--- Name: events_refresh_channel_ttl; Type: TRIGGER; Schema: -; Owner: -
---
-
-CREATE CONSTRAINT TRIGGER events_refresh_channel_ttl
-    AFTER INSERT ON events_p2026_02
     DEFERRABLE INITIALLY DEFERRED
     FOR EACH ROW
     EXECUTE FUNCTION refresh_channel_ttl_after_event_insert();
@@ -4758,27 +4687,7 @@ CREATE OR REPLACE TRIGGER trg_event_mentions_require_live_event
 --
 
 CREATE OR REPLACE TRIGGER trg_events_guard_nip_rs_hard_delete
-    BEFORE DELETE ON events_p2026_01
-    FOR EACH ROW
-    WHEN ((((OLD.kind = 30078) AND (OLD.d_tag ~ '^read-state:[0-9a-f]{32}$'::text))))
-    EXECUTE FUNCTION guard_nip_rs_hard_delete();
-
---
--- Name: trg_events_guard_nip_rs_hard_delete; Type: TRIGGER; Schema: -; Owner: -
---
-
-CREATE OR REPLACE TRIGGER trg_events_guard_nip_rs_hard_delete
-    BEFORE DELETE ON events_p_future
-    FOR EACH ROW
-    WHEN ((((OLD.kind = 30078) AND (OLD.d_tag ~ '^read-state:[0-9a-f]{32}$'::text))))
-    EXECUTE FUNCTION guard_nip_rs_hard_delete();
-
---
--- Name: trg_events_guard_nip_rs_hard_delete; Type: TRIGGER; Schema: -; Owner: -
---
-
-CREATE OR REPLACE TRIGGER trg_events_guard_nip_rs_hard_delete
-    BEFORE DELETE ON events_p2026_02
+    BEFORE DELETE ON events_p2026_04
     FOR EACH ROW
     WHEN ((((OLD.kind = 30078) AND (OLD.d_tag ~ '^read-state:[0-9a-f]{32}$'::text))))
     EXECUTE FUNCTION guard_nip_rs_hard_delete();
@@ -4798,7 +4707,7 @@ CREATE OR REPLACE TRIGGER trg_events_guard_nip_rs_hard_delete
 --
 
 CREATE OR REPLACE TRIGGER trg_events_guard_nip_rs_hard_delete
-    BEFORE DELETE ON events_p_past
+    BEFORE DELETE ON events_p2026_05
     FOR EACH ROW
     WHEN ((((OLD.kind = 30078) AND (OLD.d_tag ~ '^read-state:[0-9a-f]{32}$'::text))))
     EXECUTE FUNCTION guard_nip_rs_hard_delete();
@@ -4808,7 +4717,37 @@ CREATE OR REPLACE TRIGGER trg_events_guard_nip_rs_hard_delete
 --
 
 CREATE OR REPLACE TRIGGER trg_events_guard_nip_rs_hard_delete
-    BEFORE DELETE ON events_p2026_04
+    BEFORE DELETE ON events_p2026_02
+    FOR EACH ROW
+    WHEN ((((OLD.kind = 30078) AND (OLD.d_tag ~ '^read-state:[0-9a-f]{32}$'::text))))
+    EXECUTE FUNCTION guard_nip_rs_hard_delete();
+
+--
+-- Name: trg_events_guard_nip_rs_hard_delete; Type: TRIGGER; Schema: -; Owner: -
+--
+
+CREATE OR REPLACE TRIGGER trg_events_guard_nip_rs_hard_delete
+    BEFORE DELETE ON events_p_future
+    FOR EACH ROW
+    WHEN ((((OLD.kind = 30078) AND (OLD.d_tag ~ '^read-state:[0-9a-f]{32}$'::text))))
+    EXECUTE FUNCTION guard_nip_rs_hard_delete();
+
+--
+-- Name: trg_events_guard_nip_rs_hard_delete; Type: TRIGGER; Schema: -; Owner: -
+--
+
+CREATE OR REPLACE TRIGGER trg_events_guard_nip_rs_hard_delete
+    BEFORE DELETE ON events_p2026_01
+    FOR EACH ROW
+    WHEN ((((OLD.kind = 30078) AND (OLD.d_tag ~ '^read-state:[0-9a-f]{32}$'::text))))
+    EXECUTE FUNCTION guard_nip_rs_hard_delete();
+
+--
+-- Name: trg_events_guard_nip_rs_hard_delete; Type: TRIGGER; Schema: -; Owner: -
+--
+
+CREATE OR REPLACE TRIGGER trg_events_guard_nip_rs_hard_delete
+    BEFORE DELETE ON events_p_past
     FOR EACH ROW
     WHEN ((((OLD.kind = 30078) AND (OLD.d_tag ~ '^read-state:[0-9a-f]{32}$'::text))))
     EXECUTE FUNCTION guard_nip_rs_hard_delete();
@@ -4828,74 +4767,10 @@ CREATE OR REPLACE TRIGGER trg_events_guard_nip_rs_hard_delete
 --
 
 CREATE OR REPLACE TRIGGER trg_events_guard_nip_rs_hard_delete
-    BEFORE DELETE ON events_p2026_05
-    FOR EACH ROW
-    WHEN ((((OLD.kind = 30078) AND (OLD.d_tag ~ '^read-state:[0-9a-f]{32}$'::text))))
-    EXECUTE FUNCTION guard_nip_rs_hard_delete();
-
---
--- Name: trg_events_guard_nip_rs_hard_delete; Type: TRIGGER; Schema: -; Owner: -
---
-
-CREATE OR REPLACE TRIGGER trg_events_guard_nip_rs_hard_delete
     BEFORE DELETE ON events_p2026_06
     FOR EACH ROW
     WHEN ((((OLD.kind = 30078) AND (OLD.d_tag ~ '^read-state:[0-9a-f]{32}$'::text))))
     EXECUTE FUNCTION guard_nip_rs_hard_delete();
-
---
--- Name: trg_events_nip_rs_watermark; Type: TRIGGER; Schema: -; Owner: -
---
-
-CREATE OR REPLACE TRIGGER trg_events_nip_rs_watermark
-    BEFORE INSERT ON events_p2026_04
-    FOR EACH ROW
-    EXECUTE FUNCTION guard_nip_rs_watermark();
-
---
--- Name: trg_events_nip_rs_watermark; Type: TRIGGER; Schema: -; Owner: -
---
-
-CREATE OR REPLACE TRIGGER trg_events_nip_rs_watermark
-    BEFORE INSERT ON events_p2026_01
-    FOR EACH ROW
-    EXECUTE FUNCTION guard_nip_rs_watermark();
-
---
--- Name: trg_events_nip_rs_watermark; Type: TRIGGER; Schema: -; Owner: -
---
-
-CREATE OR REPLACE TRIGGER trg_events_nip_rs_watermark
-    BEFORE INSERT ON events_p_past
-    FOR EACH ROW
-    EXECUTE FUNCTION guard_nip_rs_watermark();
-
---
--- Name: trg_events_nip_rs_watermark; Type: TRIGGER; Schema: -; Owner: -
---
-
-CREATE OR REPLACE TRIGGER trg_events_nip_rs_watermark
-    BEFORE INSERT ON events_p2026_02
-    FOR EACH ROW
-    EXECUTE FUNCTION guard_nip_rs_watermark();
-
---
--- Name: trg_events_nip_rs_watermark; Type: TRIGGER; Schema: -; Owner: -
---
-
-CREATE OR REPLACE TRIGGER trg_events_nip_rs_watermark
-    BEFORE INSERT ON events_p2026_03
-    FOR EACH ROW
-    EXECUTE FUNCTION guard_nip_rs_watermark();
-
---
--- Name: trg_events_nip_rs_watermark; Type: TRIGGER; Schema: -; Owner: -
---
-
-CREATE OR REPLACE TRIGGER trg_events_nip_rs_watermark
-    BEFORE INSERT ON events_p2026_06
-    FOR EACH ROW
-    EXECUTE FUNCTION guard_nip_rs_watermark();
 
 --
 -- Name: trg_events_nip_rs_watermark; Type: TRIGGER; Schema: -; Owner: -
@@ -4920,7 +4795,61 @@ CREATE OR REPLACE TRIGGER trg_events_nip_rs_watermark
 --
 
 CREATE OR REPLACE TRIGGER trg_events_nip_rs_watermark
+    BEFORE INSERT ON events_p2026_02
+    FOR EACH ROW
+    EXECUTE FUNCTION guard_nip_rs_watermark();
+
+--
+-- Name: trg_events_nip_rs_watermark; Type: TRIGGER; Schema: -; Owner: -
+--
+
+CREATE OR REPLACE TRIGGER trg_events_nip_rs_watermark
+    BEFORE INSERT ON events_p_past
+    FOR EACH ROW
+    EXECUTE FUNCTION guard_nip_rs_watermark();
+
+--
+-- Name: trg_events_nip_rs_watermark; Type: TRIGGER; Schema: -; Owner: -
+--
+
+CREATE OR REPLACE TRIGGER trg_events_nip_rs_watermark
+    BEFORE INSERT ON events_p2026_03
+    FOR EACH ROW
+    EXECUTE FUNCTION guard_nip_rs_watermark();
+
+--
+-- Name: trg_events_nip_rs_watermark; Type: TRIGGER; Schema: -; Owner: -
+--
+
+CREATE OR REPLACE TRIGGER trg_events_nip_rs_watermark
+    BEFORE INSERT ON events_p2026_01
+    FOR EACH ROW
+    EXECUTE FUNCTION guard_nip_rs_watermark();
+
+--
+-- Name: trg_events_nip_rs_watermark; Type: TRIGGER; Schema: -; Owner: -
+--
+
+CREATE OR REPLACE TRIGGER trg_events_nip_rs_watermark
+    BEFORE INSERT ON events_p2026_04
+    FOR EACH ROW
+    EXECUTE FUNCTION guard_nip_rs_watermark();
+
+--
+-- Name: trg_events_nip_rs_watermark; Type: TRIGGER; Schema: -; Owner: -
+--
+
+CREATE OR REPLACE TRIGGER trg_events_nip_rs_watermark
     BEFORE INSERT ON events_p2026_05
+    FOR EACH ROW
+    EXECUTE FUNCTION guard_nip_rs_watermark();
+
+--
+-- Name: trg_events_nip_rs_watermark; Type: TRIGGER; Schema: -; Owner: -
+--
+
+CREATE OR REPLACE TRIGGER trg_events_nip_rs_watermark
+    BEFORE INSERT ON events_p2026_06
     FOR EACH ROW
     EXECUTE FUNCTION guard_nip_rs_watermark();
 
@@ -4929,7 +4858,7 @@ CREATE OR REPLACE TRIGGER trg_events_nip_rs_watermark
 --
 
 CREATE OR REPLACE TRIGGER trg_events_purge_soft_deleted_buzz_mesh_status
-    AFTER UPDATE OF deleted_at ON events_p2026_05
+    AFTER UPDATE OF deleted_at ON events_p2026_06
     FOR EACH ROW
     EXECUTE FUNCTION purge_soft_deleted_buzz_mesh_status();
 
@@ -4947,7 +4876,16 @@ CREATE OR REPLACE TRIGGER trg_events_purge_soft_deleted_buzz_mesh_status
 --
 
 CREATE OR REPLACE TRIGGER trg_events_purge_soft_deleted_buzz_mesh_status
-    AFTER UPDATE OF deleted_at ON events_p2026_06
+    AFTER UPDATE OF deleted_at ON events_p_past
+    FOR EACH ROW
+    EXECUTE FUNCTION purge_soft_deleted_buzz_mesh_status();
+
+--
+-- Name: trg_events_purge_soft_deleted_buzz_mesh_status; Type: TRIGGER; Schema: -; Owner: -
+--
+
+CREATE OR REPLACE TRIGGER trg_events_purge_soft_deleted_buzz_mesh_status
+    AFTER UPDATE OF deleted_at ON events_p2026_05
     FOR EACH ROW
     EXECUTE FUNCTION purge_soft_deleted_buzz_mesh_status();
 
@@ -4965,7 +4903,7 @@ CREATE OR REPLACE TRIGGER trg_events_purge_soft_deleted_buzz_mesh_status
 --
 
 CREATE OR REPLACE TRIGGER trg_events_purge_soft_deleted_buzz_mesh_status
-    AFTER UPDATE OF deleted_at ON events_p2026_01
+    AFTER UPDATE OF deleted_at ON events
     FOR EACH ROW
     EXECUTE FUNCTION purge_soft_deleted_buzz_mesh_status();
 
@@ -4992,16 +4930,7 @@ CREATE OR REPLACE TRIGGER trg_events_purge_soft_deleted_buzz_mesh_status
 --
 
 CREATE OR REPLACE TRIGGER trg_events_purge_soft_deleted_buzz_mesh_status
-    AFTER UPDATE OF deleted_at ON events_p_past
-    FOR EACH ROW
-    EXECUTE FUNCTION purge_soft_deleted_buzz_mesh_status();
-
---
--- Name: trg_events_purge_soft_deleted_buzz_mesh_status; Type: TRIGGER; Schema: -; Owner: -
---
-
-CREATE OR REPLACE TRIGGER trg_events_purge_soft_deleted_buzz_mesh_status
-    AFTER UPDATE OF deleted_at ON events
+    AFTER UPDATE OF deleted_at ON events_p2026_01
     FOR EACH ROW
     EXECUTE FUNCTION purge_soft_deleted_buzz_mesh_status();
 
@@ -5019,7 +4948,7 @@ CREATE OR REPLACE TRIGGER trg_events_purge_soft_deleted_nip_rs
 --
 
 CREATE OR REPLACE TRIGGER trg_events_purge_soft_deleted_nip_rs
-    AFTER UPDATE OF deleted_at ON events_p2026_01
+    AFTER UPDATE OF deleted_at ON events_p2026_06
     FOR EACH ROW
     EXECUTE FUNCTION purge_soft_deleted_nip_rs();
 
@@ -5046,6 +4975,33 @@ CREATE OR REPLACE TRIGGER trg_events_purge_soft_deleted_nip_rs
 --
 
 CREATE OR REPLACE TRIGGER trg_events_purge_soft_deleted_nip_rs
+    AFTER UPDATE OF deleted_at ON events_p_future
+    FOR EACH ROW
+    EXECUTE FUNCTION purge_soft_deleted_nip_rs();
+
+--
+-- Name: trg_events_purge_soft_deleted_nip_rs; Type: TRIGGER; Schema: -; Owner: -
+--
+
+CREATE OR REPLACE TRIGGER trg_events_purge_soft_deleted_nip_rs
+    AFTER UPDATE OF deleted_at ON events_p2026_01
+    FOR EACH ROW
+    EXECUTE FUNCTION purge_soft_deleted_nip_rs();
+
+--
+-- Name: trg_events_purge_soft_deleted_nip_rs; Type: TRIGGER; Schema: -; Owner: -
+--
+
+CREATE OR REPLACE TRIGGER trg_events_purge_soft_deleted_nip_rs
+    AFTER UPDATE OF deleted_at ON events_p2026_02
+    FOR EACH ROW
+    EXECUTE FUNCTION purge_soft_deleted_nip_rs();
+
+--
+-- Name: trg_events_purge_soft_deleted_nip_rs; Type: TRIGGER; Schema: -; Owner: -
+--
+
+CREATE OR REPLACE TRIGGER trg_events_purge_soft_deleted_nip_rs
     AFTER UPDATE OF deleted_at ON events_p_past
     FOR EACH ROW
     EXECUTE FUNCTION purge_soft_deleted_nip_rs();
@@ -5059,29 +5015,40 @@ CREATE OR REPLACE TRIGGER trg_events_purge_soft_deleted_nip_rs
     FOR EACH ROW
     EXECUTE FUNCTION purge_soft_deleted_nip_rs();
 
---
--- Name: trg_events_purge_soft_deleted_nip_rs; Type: TRIGGER; Schema: -; Owner: -
---
+-- pgschema 1.7.4 omits disjunctive CHECK constraints from dumps. The
+-- post-apply catalog-closure script installs and verifies these exact checks.
+ALTER TABLE ONLY authorization_event_capacity
+    ADD CONSTRAINT authorization_event_capacity_check3 CHECK (((health_state = 1) AND (failure_code IS NULL) AND (failure_observed_at IS NULL)) OR ((health_state = 2) AND (failure_code IS NOT NULL) AND (failure_observed_at IS NOT NULL)));
 
-CREATE OR REPLACE TRIGGER trg_events_purge_soft_deleted_nip_rs
-    AFTER UPDATE OF deleted_at ON events_p_future
-    FOR EACH ROW
-    EXECUTE FUNCTION purge_soft_deleted_nip_rs();
+ALTER TABLE ONLY authorization_events
+    ADD CONSTRAINT authorization_events_check CHECK ((((actor_kind = 4) AND (event_kind = 9) AND (request_fingerprint IS NULL)) OR ((actor_kind = ANY (ARRAY[1, 2, 3])) AND (request_fingerprint IS NOT NULL))));
 
---
--- Name: trg_events_purge_soft_deleted_nip_rs; Type: TRIGGER; Schema: -; Owner: -
---
+ALTER TABLE ONLY authorization_events
+    ADD CONSTRAINT authorization_events_check1 CHECK ((((actor_kind = 4) AND (actor_fingerprint IS NULL) AND (subject_fingerprint IS NULL)) OR ((actor_kind = ANY (ARRAY[1, 2, 3])) AND (actor_fingerprint IS NOT NULL))));
 
-CREATE OR REPLACE TRIGGER trg_events_purge_soft_deleted_nip_rs
-    AFTER UPDATE OF deleted_at ON events_p2026_06
-    FOR EACH ROW
-    EXECUTE FUNCTION purge_soft_deleted_nip_rs();
+ALTER TABLE ONLY authorization_invalidation_floors
+    ADD CONSTRAINT authorization_invalidation_floors_check CHECK ((((selector_kind = 3) AND (binding_version_floor IS NOT NULL) AND (relationship_revision_floor IS NULL)) OR ((selector_kind = 7) AND (binding_version_floor IS NULL) AND (relationship_revision_floor IS NOT NULL)) OR ((selector_kind <> ALL (ARRAY[3, 7])) AND (binding_version_floor IS NULL) AND (relationship_revision_floor IS NULL))));
 
---
--- Name: trg_events_purge_soft_deleted_nip_rs; Type: TRIGGER; Schema: -; Owner: -
---
+ALTER TABLE ONLY identity_bindings
+    ADD CONSTRAINT identity_bindings_check1 CHECK ((((binding_state = 1) AND (lifecycle_revision = 1) AND (retirement_history_id IS NULL)) OR ((binding_state = 2) AND (lifecycle_revision = 2) AND (retirement_history_id IS NOT NULL))));
 
-CREATE OR REPLACE TRIGGER trg_events_purge_soft_deleted_nip_rs
-    AFTER UPDATE OF deleted_at ON events_p2026_02
-    FOR EACH ROW
-    EXECUTE FUNCTION purge_soft_deleted_nip_rs();
+ALTER TABLE ONLY identity_lifecycle_history
+    ADD CONSTRAINT identity_lifecycle_history_check CHECK ((((old_binding_id IS NULL) AND (old_binding_version IS NULL) AND (old_prior_lifecycle_revision IS NULL) AND (old_prior_state IS NULL) AND (old_resulting_lifecycle_revision IS NULL) AND (old_resulting_state IS NULL)) OR ((old_binding_id IS NOT NULL) AND (old_binding_version IS NOT NULL) AND (old_prior_lifecycle_revision IS NOT NULL) AND (old_prior_state IS NOT NULL) AND (old_resulting_lifecycle_revision IS NOT NULL) AND (old_resulting_state IS NOT NULL))));
+
+ALTER TABLE ONLY identity_lifecycle_history
+    ADD CONSTRAINT identity_lifecycle_history_check1 CHECK ((((successor_binding_id IS NULL) AND (successor_binding_version IS NULL) AND (successor_lifecycle_revision IS NULL) AND (successor_state IS NULL)) OR ((successor_binding_id IS NOT NULL) AND (successor_binding_version IS NOT NULL) AND (successor_lifecycle_revision = 1) AND (successor_state = 1))));
+
+ALTER TABLE ONLY identity_lifecycle_history
+    ADD CONSTRAINT identity_lifecycle_history_check5 CHECK ((((outcome_code = 3) AND (old_binding_id IS NULL) AND (successor_binding_id IS NULL)) OR ((outcome_code = 1) AND ((((transition_kind = ANY (ARRAY[1, 2])) AND (old_binding_id IS NULL) AND (successor_binding_id IS NOT NULL)) OR ((transition_kind = 3) AND (old_binding_id IS NOT NULL) AND (successor_binding_id IS NULL)) OR ((transition_kind = ANY (ARRAY[4, 5])) AND (successor_binding_id IS NULL)) OR ((transition_kind = 6) AND (old_binding_id IS NOT NULL) AND (successor_binding_id IS NOT NULL)) OR ((transition_kind = 7) AND (old_binding_id IS NOT NULL) AND (successor_binding_id IS NOT NULL)) OR ((transition_kind = 8) AND (successor_binding_id IS NOT NULL)) OR ((transition_kind = 9) AND (old_binding_id IS NOT NULL) AND (successor_binding_id IS NULL)))))));
+
+ALTER TABLE ONLY identity_lifecycle_selectors
+    ADD CONSTRAINT identity_lifecycle_selectors_check CHECK ((((selector_kind = 1) AND (fact_generation = 1) AND (principal_fingerprint IS NOT NULL) AND (event_author_pubkey IS NOT NULL) AND (binding_id IS NOT NULL) AND (binding_version IS NOT NULL)) OR ((selector_kind = 2) AND (principal_fingerprint IS NOT NULL) AND (event_author_pubkey IS NULL) AND (binding_id IS NULL) AND (binding_version IS NULL)) OR ((selector_kind = 3) AND (fact_generation = 1) AND (principal_fingerprint IS NULL) AND (event_author_pubkey IS NOT NULL) AND (binding_id IS NULL) AND (binding_version IS NULL)) OR ((selector_kind = 4) AND (principal_fingerprint IS NOT NULL) AND (event_author_pubkey IS NOT NULL) AND (binding_id IS NOT NULL) AND (binding_version IS NOT NULL))));
+
+ALTER TABLE ONLY moderation_reports
+    ADD CONSTRAINT moderation_reports_check CHECK ((((target_kind = 'event'::text) AND (target_event_id IS NOT NULL) AND (target_pubkey IS NULL) AND (target_blob_sha256 IS NULL)) OR ((target_kind = 'pubkey'::text) AND (target_event_id IS NULL) AND (target_pubkey IS NOT NULL) AND (target_blob_sha256 IS NULL)) OR ((target_kind = 'blob'::text) AND (target_event_id IS NULL) AND (target_pubkey IS NULL) AND (target_blob_sha256 IS NOT NULL))));
+
+ALTER TABLE ONLY protected_object_authority
+    ADD CONSTRAINT protected_object_authority_check1 CHECK ((((owner_pubkey IS NULL) AND (delegated_relationship_id IS NULL) AND (delegated_relationship_revision IS NULL) AND (delegation_conditions_fingerprint IS NULL)) OR ((owner_pubkey IS NOT NULL) AND (delegated_relationship_id IS NOT NULL) AND (delegated_relationship_revision IS NOT NULL) AND (delegation_conditions_fingerprint IS NOT NULL))));
+
+ALTER TABLE ONLY push_leases
+    ADD CONSTRAINT push_leases_check CHECK (((active AND (app_profile IS NOT NULL) AND (endpoint_hash IS NOT NULL) AND (endpoint_grant IS NOT NULL) AND (max_class IS NOT NULL) AND (subscriptions IS NOT NULL)) OR ((NOT active) AND (app_profile IS NULL) AND (endpoint_hash IS NULL) AND (endpoint_grant IS NULL) AND (max_class IS NULL) AND (subscriptions IS NULL))));

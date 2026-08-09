@@ -969,7 +969,6 @@ mod tests {
             "CREATE TABLE authorization_invalidation_floors",
             "CREATE TABLE protected_object_authority",
             "CREATE TABLE authorization_events",
-            "CREATE TABLE client_status_revisions",
             "28, 29",
         ] {
             assert!(
@@ -977,6 +976,15 @@ mod tests {
                 "migration 0030 missing direct-final authorization surface: {required}",
             );
         }
+        assert!(
+            !authorization_foundation.contains("client_status_revisions"),
+            "kind 24244 status must remain connection-local and ephemeral",
+        );
+        assert!(
+            !desired_schema.contains("CREATE TABLE IF NOT EXISTS client_status_revisions")
+                && !desired_schema.contains("CREATE TABLE client_status_revisions"),
+            "desired schema must not persist kind 24244 presentation history",
+        );
     }
 
     #[test]

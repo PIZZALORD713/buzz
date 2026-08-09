@@ -316,3 +316,19 @@ SELECT pg_temp.ensure_exact_check_constraint(
     $definition$CHECK (owner_pubkey IS NULL AND delegated_relationship_id IS NULL AND delegated_relationship_revision IS NULL AND delegation_conditions_fingerprint IS NULL OR owner_pubkey IS NOT NULL AND delegated_relationship_id IS NOT NULL AND delegated_relationship_revision IS NOT NULL AND delegation_conditions_fingerprint IS NOT NULL)$definition$,
     $expression$owner_pubkey IS NULL AND delegated_relationship_id IS NULL AND delegated_relationship_revision IS NULL AND delegation_conditions_fingerprint IS NULL OR owner_pubkey IS NOT NULL AND delegated_relationship_id IS NOT NULL AND delegated_relationship_revision IS NOT NULL AND delegation_conditions_fingerprint IS NOT NULL$expression$
 );
+
+-- These two disjunctive checks predate NIP-FI but are omitted by the same
+-- pgschema dump path, so M0 closes them through the shared exact verifier.
+SELECT pg_temp.ensure_exact_check_constraint(
+    'moderation_reports',
+    'moderation_reports_check',
+    $definition$CHECK (target_kind = 'event'::text AND target_event_id IS NOT NULL AND target_pubkey IS NULL AND target_blob_sha256 IS NULL OR target_kind = 'pubkey'::text AND target_event_id IS NULL AND target_pubkey IS NOT NULL AND target_blob_sha256 IS NULL OR target_kind = 'blob'::text AND target_event_id IS NULL AND target_pubkey IS NULL AND target_blob_sha256 IS NOT NULL)$definition$,
+    $expression$target_kind = 'event'::text AND target_event_id IS NOT NULL AND target_pubkey IS NULL AND target_blob_sha256 IS NULL OR target_kind = 'pubkey'::text AND target_event_id IS NULL AND target_pubkey IS NOT NULL AND target_blob_sha256 IS NULL OR target_kind = 'blob'::text AND target_event_id IS NULL AND target_pubkey IS NULL AND target_blob_sha256 IS NOT NULL$expression$
+);
+
+SELECT pg_temp.ensure_exact_check_constraint(
+    'push_leases',
+    'push_leases_check',
+    $definition$CHECK (active AND app_profile IS NOT NULL AND endpoint_hash IS NOT NULL AND endpoint_grant IS NOT NULL AND max_class IS NOT NULL AND subscriptions IS NOT NULL OR NOT active AND app_profile IS NULL AND endpoint_hash IS NULL AND endpoint_grant IS NULL AND max_class IS NULL AND subscriptions IS NULL)$definition$,
+    $expression$active AND app_profile IS NOT NULL AND endpoint_hash IS NOT NULL AND endpoint_grant IS NOT NULL AND max_class IS NOT NULL AND subscriptions IS NOT NULL OR NOT active AND app_profile IS NULL AND endpoint_hash IS NULL AND endpoint_grant IS NULL AND max_class IS NULL AND subscriptions IS NULL$expression$
+);
