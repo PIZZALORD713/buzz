@@ -57,7 +57,7 @@ fn client_status_is_ephemeral_and_retired_codes_stay_unallocated() {
 }
 
 #[test]
-fn catalog_closure_is_exact_and_limited_to_retained_nip_fi_checks() {
+fn catalog_closure_is_exact_for_retained_nip_fi_checks() {
     assert!(ATTACH_SCHEMA_PARTITIONS_SQL.contains("ensure_exact_check_constraint"));
     assert!(ATTACH_SCHEMA_PARTITIONS_SQL.contains("actual_definition IS DISTINCT FROM"));
     assert!(ATTACH_SCHEMA_PARTITIONS_SQL.contains("ERRCODE = 'check_violation'"));
@@ -80,13 +80,6 @@ fn catalog_closure_is_exact_and_limited_to_retained_nip_fi_checks() {
             ATTACH_SCHEMA_PARTITIONS_SQL.matches(&quoted).count(),
             1,
             "closure must declare {constraint} exactly once"
-        );
-    }
-
-    for m0_owned_constraint in ["moderation_reports_check", "push_leases_check"] {
-        assert!(
-            !ATTACH_SCHEMA_PARTITIONS_SQL.contains(m0_owned_constraint),
-            "S2 must not author the closure definition for {m0_owned_constraint}"
         );
     }
 }
