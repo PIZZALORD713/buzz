@@ -7,7 +7,7 @@
 
 /// NIP-AM: Agent Turn Metric — payload type and encrypt/decrypt helpers.
 pub mod agent_turn_metric;
-/// Provider-free authorization values shared across storage and presentation.
+/// Provider-free authorization fences and privacy-safe binding evidence.
 pub mod authorization;
 /// Channel and membership enums shared across crates.
 pub mod channel;

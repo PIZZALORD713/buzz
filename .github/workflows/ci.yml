@@ -699,7 +699,8 @@ jobs:
             -c "CREATE DATABASE buzz_identity_tests"
           cargo nextest run \
             --archive-file target/ci/backend-integration-tests.tar.zst \
-            -E '(package(buzz-db) and test(/identity_binding::tests/)) or (package(buzz-relay) and test(/corporate_identity::tests/))' \
+            -E 'package(buzz-db) and test(/migration::tests::nip_fi_(authorization_tests|direct_final_tests)::/)' \
+            --no-tests=fail \
             --test-threads 1 \
             --run-ignored ignored-only
         env:

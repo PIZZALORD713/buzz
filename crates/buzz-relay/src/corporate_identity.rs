@@ -11,20 +11,31 @@ use axum::{
     http::{HeaderMap, StatusCode},
     response::Json,
 };
+use base64::Engine as _;
+#[cfg(test)]
+use jsonwebtoken::jwk::{KeyAlgorithm, KeyOperations, PublicKeyUse};
 use jsonwebtoken::{
-    decode, decode_header,
-    jwk::{Jwk, JwkSet, KeyAlgorithm, KeyOperations, PublicKeyUse},
-    Algorithm, DecodingKey, Validation,
+    decode_header,
+    jwk::{Jwk, JwkSet},
+    Algorithm,
 };
-use nostr::{Event, EventBuilder, FromBech32, Kind, PublicKey, Tag, Timestamp};
+#[cfg(test)]
+use nostr::{Event, EventBuilder, Kind, Tag};
+use nostr::{FromBech32, PublicKey, Timestamp};
 use serde::Deserialize;
 use serde_json::{Map, Value};
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tokio::sync::{Mutex, RwLock};
 use tracing::{debug, warn};
 
-use buzz_core::{kind::KIND_USER_TRUSTED_ASSERTION, CommunityId};
-use buzz_db::event::EventQuery;
+use buzz_auth::{
+    CanonicalFederatedAssertionVerifier, CanonicalVerifierError, CanonicalVerifierKeySet,
+    CanonicalVerifierPolicy, ProofTransport, VerifierKeyGeneration, VerifierPolicyStamp,
+};
+#[cfg(test)]
+use buzz_core::kind::KIND_USER_TRUSTED_ASSERTION;
+use buzz_core::CommunityId;
 use buzz_db::identity_binding::{BindIdentityResult, SOURCE_DB_BINDING, SOURCE_JWT_NPUB};
 
 use crate::config::{CorporateIdentityAuthPrecedence, CorporateIdentityConfig};
@@ -39,14 +50,71 @@ const JWT_CLOCK_SKEW_LEEWAY_SECS: u64 = 60;
 const IDENTITY_ASSERTION_MAX_TTL_SECS: u64 = 60 * 60;
 const IDENTITY_SESSION_REVALIDATION_INTERVAL: Duration = Duration::from_secs(30);
 
+fn unique_jwk_for_kid<'a>(
+    set: &'a JwkSet,
+    kid: &str,
+) -> Result<Option<&'a Jwk>, CorporateIdentityError> {
+    let mut matches = set
+        .keys
+        .iter()
+        .filter(|jwk| jwk.common.key_id.as_deref() == Some(kid));
+    let first = matches.next();
+    if matches.next().is_some() {
+        return Err(CorporateIdentityError::Jwks(
+            "ambiguous duplicate key identifier".to_owned(),
+        ));
+    }
+    Ok(first)
+}
+
+fn coordinate_digest(domain: &[u8], parts: &[&[u8]]) -> [u8; 32] {
+    let mut digest = Sha256::new();
+    digest.update(domain);
+    for part in parts {
+        digest.update((part.len() as u64).to_be_bytes());
+        digest.update(part);
+    }
+    digest.finalize().into()
+}
+
+fn corporate_identity_coordinates(
+    authorization_domain: CommunityId,
+    signer: PublicKey,
+    token: &str,
+    auth_tag_json: &str,
+) -> ([u8; 32], [u8; 32], [u8; 32]) {
+    let community = authorization_domain.as_uuid();
+    let community_bytes = community.as_bytes();
+    let signer_bytes = signer.as_bytes();
+    let target = coordinate_digest(
+        b"buzz.nip-fi.corporate-identity.target.v1\0",
+        &[community_bytes, signer_bytes],
+    );
+    let request = coordinate_digest(
+        b"buzz.nip-fi.corporate-identity.request.v1\0",
+        &[
+            community_bytes,
+            signer_bytes,
+            token.as_bytes(),
+            auth_tag_json.as_bytes(),
+        ],
+    );
+    let transport = coordinate_digest(
+        b"buzz.nip-fi.corporate-identity.transport.v1\0",
+        &[community_bytes, signer_bytes, b"relay-auth"],
+    );
+    (request, target, transport)
+}
+
 #[derive(Debug, Clone)]
 struct CachedJwks {
     set: JwkSet,
+    generation: VerifierKeyGeneration,
     expires_at: Instant,
 }
 
 /// Validated corporate identity claims used by Buzz.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct CorporateJwtClaims {
     /// Validated identity-provider issuer.
     pub issuer: String,
@@ -54,24 +122,25 @@ pub struct CorporateJwtClaims {
     pub uid: String,
     /// Human-readable verified identity claim.
     pub display_name: String,
-    /// Optional operator-approved label that may be published in NIP-85.
-    pub public_display_name: Option<String>,
     /// Optional pubkey carried by the IdP.
     pub pubkey: Option<PublicKey>,
     /// JWT expiration as a Unix timestamp.
     pub expires_at: u64,
+    verifier_stamp: VerifierPolicyStamp,
+    verified_assertion: buzz_auth::VerifiedFederatedAssertion,
 }
 
-#[derive(Debug, Deserialize)]
-struct RawJwtClaims {
-    #[serde(flatten)]
-    claims: Map<String, Value>,
+impl std::fmt::Debug for CorporateJwtClaims {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("CorporateJwtClaims([REDACTED])")
+    }
 }
 
 /// Service that verifies corporate identity JWTs against configured JWKS.
 #[derive(Debug)]
 pub struct CorporateIdentityService {
     config: CorporateIdentityConfig,
+    verifier: Result<CanonicalFederatedAssertionVerifier, CanonicalVerifierError>,
     http: Result<reqwest::Client, String>,
     jwks: RwLock<Option<CachedJwks>>,
     refresh: Mutex<()>,
@@ -86,8 +155,18 @@ impl CorporateIdentityService {
             .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(|error| error.to_string());
+        let verifier = CanonicalVerifierPolicy::new(
+            config.issuer.clone(),
+            config.audience.clone(),
+            config.uid_claim.clone(),
+            config.npub_claim.clone(),
+            JWT_CLOCK_SKEW_LEEWAY_SECS,
+            IDENTITY_ASSERTION_MAX_TTL_SECS,
+        )
+        .map(CanonicalFederatedAssertionVerifier::new);
         Self {
             config,
+            verifier,
             http,
             jwks: RwLock::new(None),
             refresh: Mutex::new(()),
@@ -98,6 +177,9 @@ impl CorporateIdentityService {
     pub async fn validate_jwt(
         &self,
         token: &str,
+        authorization_domain: CommunityId,
+        signer: PublicKey,
+        auth_tag_json: Option<&str>,
     ) -> Result<CorporateJwtClaims, CorporateIdentityError> {
         let header = decode_header(token)
             .map_err(|e| CorporateIdentityError::InvalidJwt(format!("invalid JWT header: {e}")))?;
@@ -111,52 +193,89 @@ impl CorporateIdentityService {
             .kid
             .as_deref()
             .ok_or(CorporateIdentityError::MissingKid)?;
-        let jwk = self.jwk_for_kid(kid).await?;
-        validate_jwk_signature_metadata(&jwk, header.alg)?;
-        let decoding_key = DecodingKey::from_jwk(&jwk).map_err(|e| {
-            CorporateIdentityError::InvalidJwt(format!("invalid JWK for kid {kid}: {e}"))
-        })?;
+        let (jwk, generation) = self.jwk_snapshot_for_kid(kid).await?;
+        let key_set = CanonicalVerifierKeySet::new(generation, JwkSet { keys: vec![jwk] });
+        let (request_fingerprint, target_fingerprint, transport_fingerprint) =
+            corporate_identity_coordinates(
+                authorization_domain,
+                signer,
+                token,
+                auth_tag_json.unwrap_or_default(),
+            );
+        let verifier = self
+            .verifier
+            .as_ref()
+            .map_err(|error| CorporateIdentityError::InvalidJwt(error.code().to_owned()))?;
+        let assertion = verifier
+            .verify(
+                token,
+                &key_set,
+                authorization_domain,
+                ProofTransport::Nip42,
+                target_fingerprint,
+                request_fingerprint,
+                transport_fingerprint,
+            )
+            .map_err(|error| CorporateIdentityError::InvalidJwt(error.code().to_owned()))?;
 
-        let validation = jwt_validation(header.alg, &self.config);
-
-        let decoded = decode::<RawJwtClaims>(token, &decoding_key, &validation)
-            .map_err(|e| CorporateIdentityError::InvalidJwt(e.to_string()))?;
-
-        let issuer = claim_string(&decoded.claims.claims, "iss")?;
-        let uid = claim_string(&decoded.claims.claims, &self.config.uid_claim)?;
-        let display_name = claim_string(&decoded.claims.claims, &self.config.display_claim)?;
-        let public_display_name = self
-            .config
-            .public_display_claim
-            .as_deref()
-            .map(|claim| claim_string(&decoded.claims.claims, claim))
-            .transpose()?;
-        let pubkey =
-            configured_pubkey_claim(&decoded.claims.claims, self.config.npub_claim.as_deref())?;
-        let expires_at = claim_u64(&decoded.claims.claims, "exp")?;
+        // Projection is deliberately non-authoritative: the canonical verifier
+        // above is the only signature/claim authority. This parser can only be
+        // reached with its origin-sealed evidence and must agree with the
+        // verifier-sealed issuer/subject storage key.
+        let claims = projected_verified_claims(token)?;
+        let issuer = claim_string(&claims, "iss")?;
+        let uid = claim_string(&claims, &self.config.uid_claim)?;
+        let storage_key = assertion.principal_storage_key();
+        if storage_key.issuer() != issuer || storage_key.subject() != uid {
+            return Err(CorporateIdentityError::InvalidJwt(
+                "canonical subject projection mismatch".into(),
+            ));
+        }
+        let display_name = claim_string(&claims, &self.config.display_claim)?;
+        let pubkey = configured_pubkey_claim(&claims, self.config.npub_claim.as_deref())?;
+        let expires_at = claim_u64(&claims, "exp")?;
 
         Ok(CorporateJwtClaims {
             issuer,
             uid,
             display_name,
-            public_display_name,
             pubkey,
             expires_at,
+            verifier_stamp: assertion.verifier_stamp(),
+            verified_assertion: assertion,
         })
     }
 
-    async fn jwk_for_kid(&self, kid: &str) -> Result<Jwk, CorporateIdentityError> {
+    async fn accepts_final_verifier_stamp(&self, stamp: VerifierPolicyStamp) -> bool {
+        let Ok(verifier) = self.verifier.as_ref() else {
+            return false;
+        };
+        if verifier.policy_id() != stamp.policy_id() {
+            return false;
+        }
+        self.jwks
+            .read()
+            .await
+            .as_ref()
+            .is_some_and(|cached| cached.generation == stamp.key_generation())
+    }
+
+    async fn jwk_snapshot_for_kid(
+        &self,
+        kid: &str,
+    ) -> Result<(Jwk, VerifierKeyGeneration), CorporateIdentityError> {
         let now = Instant::now();
+        let observed_generation;
         {
             let cache = self.jwks.read().await;
+            observed_generation = cache.as_ref().map(|cached| cached.generation);
             if let Some(cached) = cache.as_ref() {
                 if cached.expires_at > now {
-                    if let Some(jwk) = cached.set.find(kid) {
-                        return Ok(jwk.clone());
+                    if let Some(jwk) = unique_jwk_for_kid(&cached.set, kid)? {
+                        return Ok((jwk.clone(), cached.generation));
                     }
-                    return Err(CorporateIdentityError::Jwks(format!(
-                        "kid not found in fresh JWKS cache: {kid}"
-                    )));
+                    // An unknown key in an otherwise fresh cache forces one
+                    // single-flight refresh to bound key-rotation denial.
                 }
             }
         }
@@ -169,22 +288,38 @@ impl CorporateIdentityService {
             let cache = self.jwks.read().await;
             if let Some(cached) = cache.as_ref() {
                 if cached.expires_at > now {
-                    return cached.set.find(kid).cloned().ok_or_else(|| {
-                        CorporateIdentityError::Jwks(format!(
-                            "kid not found in fresh JWKS cache: {kid}"
-                        ))
-                    });
+                    if let Some(jwk) = unique_jwk_for_kid(&cached.set, kid)? {
+                        return Ok((jwk.clone(), cached.generation));
+                    }
+                    if observed_generation.is_some()
+                        && observed_generation != Some(cached.generation)
+                    {
+                        return Err(CorporateIdentityError::Jwks(
+                            "kid not found after JWKS refresh".to_owned(),
+                        ));
+                    }
                 }
             }
         }
 
         let set = self.fetch_jwks().await?;
-        let jwk = set.find(kid).cloned();
+        let jwk = unique_jwk_for_kid(&set, kid)?.cloned();
+        let generation = self
+            .jwks
+            .read()
+            .await
+            .as_ref()
+            .map(|cached| cached.generation.get().saturating_add(1))
+            .unwrap_or(1);
+        let generation = VerifierKeyGeneration::new(generation)
+            .ok_or_else(|| CorporateIdentityError::Jwks("key generation exhausted".to_owned()))?;
         *self.jwks.write().await = Some(CachedJwks {
             set,
+            generation,
             expires_at: Instant::now() + JWKS_CACHE_TTL,
         });
-        jwk.ok_or_else(|| CorporateIdentityError::Jwks(format!("kid not found: {kid}")))
+        jwk.map(|jwk| (jwk, generation))
+            .ok_or_else(|| CorporateIdentityError::Jwks("kid not found after JWKS refresh".into()))
     }
 
     async fn fetch_jwks(&self) -> Result<JwkSet, CorporateIdentityError> {
@@ -226,15 +361,31 @@ impl CorporateIdentityService {
     }
 }
 
-fn jwt_validation(algorithm: Algorithm, config: &CorporateIdentityConfig) -> Validation {
-    let mut validation = Validation::new(algorithm);
-    validation.leeway = JWT_CLOCK_SKEW_LEEWAY_SECS;
-    validation.set_issuer(&[config.issuer.as_str()]);
-    validation.set_audience(&[config.audience.as_str()]);
-    validation.set_required_spec_claims(&["exp", "iss", "aud"]);
-    validation.validate_exp = true;
-    validation.validate_nbf = true;
-    validation
+fn projected_verified_claims(token: &str) -> Result<Map<String, Value>, CorporateIdentityError> {
+    let mut segments = token.split('.');
+    let _header = segments.next();
+    let payload = segments
+        .next()
+        .filter(|payload| !payload.is_empty())
+        .ok_or_else(|| CorporateIdentityError::InvalidJwt("malformed JWT payload".into()))?;
+    if segments.next().is_none() || segments.next().is_some() {
+        return Err(CorporateIdentityError::InvalidJwt(
+            "malformed JWT segments".into(),
+        ));
+    }
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(payload)
+        .or_else(|_| base64::engine::general_purpose::URL_SAFE.decode(payload))
+        .map_err(|_| CorporateIdentityError::InvalidJwt("invalid JWT payload encoding".into()))?;
+    serde_json::from_slice::<CanonicalRawProjection>(&bytes)
+        .map(|projection| projection.claims)
+        .map_err(|_| CorporateIdentityError::InvalidJwt("invalid JWT payload JSON".into()))
+}
+
+#[derive(Deserialize)]
+struct CanonicalRawProjection {
+    #[serde(flatten)]
+    claims: Map<String, Value>,
 }
 
 /// Read-only result of cryptographically validating corporate identity.
@@ -242,14 +393,14 @@ fn jwt_validation(algorithm: Algorithm, config: &CorporateIdentityConfig) -> Val
 /// Callers must complete admission/authorization before passing this proof to
 /// [`finalize_corporate_identity`]. This ordering prevents rejected requests
 /// from creating identity bindings or public assertions.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum CorporateIdentityProof {
     /// Corporate identity is disabled for this relay.
     NotRequired,
     /// A JWT was validated, but no binding mutation has occurred yet.
     Direct {
         /// Validated claims staged for post-authorization binding.
-        claims: CorporateJwtClaims,
+        claims: Box<CorporateJwtClaims>,
         /// Binding source selected from the configured npub policy.
         source: &'static str,
     },
@@ -262,6 +413,17 @@ pub enum CorporateIdentityProof {
         /// Expected uid of the owner's active binding.
         owner_uid: String,
     },
+}
+
+impl std::fmt::Debug for CorporateIdentityProof {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let variant = match self {
+            Self::NotRequired => "NotRequired",
+            Self::Direct { .. } => "Direct([REDACTED])",
+            Self::Delegated { .. } => "Delegated([REDACTED])",
+        };
+        formatter.write_str(variant)
+    }
 }
 
 /// Borrow staged direct-identity data for an atomic admission transaction.
@@ -289,7 +451,7 @@ pub fn proof_is_delegated(proof: &CorporateIdentityProof) -> bool {
 }
 
 /// Outcome of corporate identity enforcement.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum CorporateIdentityDecision {
     /// Corporate identity is disabled for this relay.
     NotRequired,
@@ -315,6 +477,17 @@ pub enum CorporateIdentityDecision {
         /// Expected uid of the owner's active binding.
         owner_uid: String,
     },
+}
+
+impl std::fmt::Debug for CorporateIdentityDecision {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let variant = match self {
+            Self::NotRequired => "NotRequired",
+            Self::Direct { .. } => "Direct([REDACTED])",
+            Self::Delegated { .. } => "Delegated([REDACTED])",
+        };
+        formatter.write_str(variant)
+    }
 }
 
 struct SessionRevalidationPlan {
@@ -465,7 +638,7 @@ pub fn spawn_session_revalidation(
 }
 
 /// Errors produced by corporate identity verification.
-#[derive(Debug, Error)]
+#[derive(Error)]
 pub enum CorporateIdentityError {
     /// No JWT was available and delegation did not apply.
     #[error("corporate identity JWT missing")]
@@ -502,6 +675,15 @@ pub enum CorporateIdentityError {
     /// Database operation failed.
     #[error("corporate identity database error: {0}")]
     Db(#[from] buzz_db::DbError),
+    /// Root callers have not yet adopted the direct-final resolver/finalizer.
+    #[error("corporate identity direct-final integration required")]
+    FoundationIntegrationRequired,
+}
+
+impl std::fmt::Debug for CorporateIdentityError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("CorporateIdentityError([REDACTED])")
+    }
 }
 
 impl CorporateIdentityError {
@@ -516,7 +698,7 @@ impl CorporateIdentityError {
             | Self::BindingConflict
             | Self::BindingRevoked
             | Self::DelegationDenied => StatusCode::FORBIDDEN,
-            Self::Db(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            Self::Db(_) | Self::FoundationIntegrationRequired => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
 
@@ -532,7 +714,7 @@ impl CorporateIdentityError {
             Self::BindingConflict => "relay identity binding conflict",
             Self::BindingRevoked => "relay identity binding revoked",
             Self::DelegationDenied => "relay identity delegation denied",
-            Self::Db(_) => "relay identity unavailable",
+            Self::Db(_) | Self::FoundationIntegrationRequired => "relay identity unavailable",
         }
     }
 
@@ -615,9 +797,14 @@ async fn verify_corporate_identity_inner(
     }
 
     if let Some(token) = identity_jwt {
-        let claims = service.validate_jwt(token).await?;
+        let claims = service
+            .validate_jwt(token, community_id, signer, auth_tag_json)
+            .await?;
         let source = binding_source_for_signer(claims.pubkey, signer)?;
-        return Ok(CorporateIdentityProof::Direct { claims, source });
+        return Ok(CorporateIdentityProof::Direct {
+            claims: Box::new(claims),
+            source,
+        });
     }
 
     verify_delegated_corporate_identity(
@@ -650,7 +837,7 @@ pub async fn finalize_corporate_identity(
 pub async fn finalize_atomic_corporate_identity_result(
     state: &AppState,
     community_id: CommunityId,
-    signer: PublicKey,
+    _signer: PublicKey,
     proof: CorporateIdentityProof,
     committed_binding: Option<BindIdentityResult>,
 ) -> Result<CorporateIdentityDecision, CorporateIdentityError> {
@@ -666,13 +853,9 @@ pub async fn finalize_atomic_corporate_identity_result(
             owner_uid,
         }),
         CorporateIdentityProof::Direct { claims, source } => {
-            let binding = committed_binding.ok_or_else(|| {
-                buzz_db::DbError::InvalidData(
-                    "atomic identity admission did not return a binding result".to_string(),
-                )
-            })?;
-            complete_direct_corporate_identity(state, community_id, signer, claims, source, binding)
-                .await
+            let _ = (source, committed_binding);
+            require_final_verifier_stamp(state, community_id, &claims).await?;
+            Err(CorporateIdentityError::FoundationIntegrationRequired)
         }
     };
     if let Err(error) = &result {
@@ -699,130 +882,44 @@ async fn finalize_corporate_identity_inner(
             owner_uid,
         }),
         CorporateIdentityProof::Direct { claims, source } => {
-            let binding = state
-                .db
-                .bind_or_validate_identity(
-                    community_id,
-                    &claims.issuer,
-                    &claims.uid,
-                    signer.as_bytes(),
-                    Some(&claims.display_name),
-                    source,
-                )
-                .await?;
-            complete_direct_corporate_identity(state, community_id, signer, claims, source, binding)
-                .await
+            let _ = (signer, source);
+            require_final_verifier_stamp(state, community_id, &claims).await?;
+            Err(CorporateIdentityError::FoundationIntegrationRequired)
         }
     }
 }
 
-async fn complete_direct_corporate_identity(
+async fn require_final_verifier_stamp(
     state: &AppState,
     community_id: CommunityId,
-    signer: PublicKey,
-    claims: CorporateJwtClaims,
-    source: &'static str,
-    binding: BindIdentityResult,
-) -> Result<CorporateIdentityDecision, CorporateIdentityError> {
-    let binding = match binding {
-        BindIdentityResult::Conflict(conflict) => {
-            metrics::counter!("buzz_corporate_identity_bindings_total", "result" => "conflict")
-                .increment(1);
-            record_identity_binding_audit(
-                state,
-                community_id,
-                buzz_audit::AuditAction::CorporateIdentityBindingConflict,
-                signer,
-                &claims.issuer,
-                &claims.uid,
-                serde_json::json!({
-                    "source": source,
-                    "issuer": claims.issuer,
-                    "existing_uid": conflict.uid,
-                    "existing_issuer": conflict.issuer,
-                    "existing_pubkey": hex::encode(conflict.pubkey),
-                    "existing_source": conflict.source,
-                }),
-            )
-            .await;
-            warn!(
-                uid = %claims.uid,
-                signer = %signer.to_hex(),
-                "corporate identity binding conflict"
-            );
-            return Err(CorporateIdentityError::BindingConflict);
-        }
-        BindIdentityResult::Revoked => {
-            metrics::counter!("buzz_corporate_identity_bindings_total", "result" => "revoked")
-                .increment(1);
-            record_identity_binding_audit(
-                state,
-                community_id,
-                buzz_audit::AuditAction::CorporateIdentityBindingRevokedAttempt,
-                signer,
-                &claims.issuer,
-                &claims.uid,
-                serde_json::json!({ "source": source, "issuer": claims.issuer }),
-            )
-            .await;
-            warn!(
-                uid = %claims.uid,
-                signer = %signer.to_hex(),
-                "corporate identity binding was previously revoked"
-            );
-            return Err(CorporateIdentityError::BindingRevoked);
-        }
-        binding => binding,
-    };
-    record_identity_binding_metric(&binding);
-    if matches!(binding, BindIdentityResult::Created) {
-        record_identity_binding_audit(
-            state,
-            community_id,
-            buzz_audit::AuditAction::CorporateIdentityBindingCreated,
-            signer,
-            &claims.issuer,
-            &claims.uid,
-            serde_json::json!({ "source": source, "issuer": claims.issuer }),
-        )
-        .await;
-    }
-    if let Err(error) = ensure_identity_assertion(
-        state,
-        community_id,
-        signer,
-        claims.public_display_name.as_deref(),
-        claims.expires_at,
-    )
-    .await
+    claims: &CorporateJwtClaims,
+) -> Result<(), CorporateIdentityError> {
+    if claims.verified_assertion.authorization_domain() != community_id
+        || claims.verified_assertion.verifier_stamp() != claims.verifier_stamp
+        || Timestamp::now().as_secs() >= claims.expires_at
     {
-        // The binding remains the authorization authority. A projection
-        // failure removes the verified affordance but must not lock an
-        // otherwise authorized user out of the relay.
-        warn!(
-                signer = %signer.to_hex(),
-                error = %error,
-                "failed to publish corporate identity assertion"
-        );
-        metrics::counter!("buzz_corporate_identity_assertions_total", "result" => "error")
-            .increment(1);
+        return Err(CorporateIdentityError::InvalidJwt(
+            "canonical evidence expired or changed before finalization".to_owned(),
+        ));
     }
-
-    debug!(
-        uid = %claims.uid,
-        signer = %signer.to_hex(),
-        source,
-        "corporate identity verified"
-    );
-    Ok(CorporateIdentityDecision::Direct {
-        issuer: claims.issuer,
-        uid: claims.uid,
-        display_name: claims.display_name,
-        expires_at: claims.expires_at,
-        binding,
-    })
+    let current = match state.corporate_identity.as_ref() {
+        Some(service) => {
+            service
+                .accepts_final_verifier_stamp(claims.verifier_stamp)
+                .await
+        }
+        None => false,
+    };
+    if current {
+        Ok(())
+    } else {
+        Err(CorporateIdentityError::InvalidJwt(
+            "canonical verifier generation changed before finalization".to_owned(),
+        ))
+    }
 }
 
+#[cfg(test)]
 fn build_identity_assertion(
     relay_keypair: &nostr::Keys,
     subject: PublicKey,
@@ -859,6 +956,7 @@ fn build_identity_assertion(
         .map_err(|error| format!("failed to sign corporate identity assertion: {error}"))
 }
 
+#[cfg(test)]
 fn identity_assertion_matches(
     event: &Event,
     subject: &str,
@@ -886,67 +984,7 @@ fn identity_assertion_matches(
         && display_name.is_none_or(|name| has_tag("display_name", name))
 }
 
-async fn ensure_identity_assertion(
-    state: &AppState,
-    community_id: CommunityId,
-    subject: PublicKey,
-    display_name: Option<&str>,
-    jwt_expires_at: u64,
-) -> Result<(), String> {
-    let subject_hex = subject.to_hex();
-    let existing = state
-        .db
-        .query_events(&EventQuery {
-            kinds: Some(vec![KIND_USER_TRUSTED_ASSERTION as i32]),
-            pubkey: Some(state.relay_keypair.public_key().to_bytes().to_vec()),
-            d_tag: Some(subject_hex.clone()),
-            global_only: true,
-            limit: Some(1),
-            ..EventQuery::for_community(community_id)
-        })
-        .await
-        .map_err(|error| error.to_string())?
-        .into_iter()
-        .next();
-
-    // Privacy default: do not publish any assertion unless the operator opted
-    // into a public label. An inactive replacement is emitted only to retire a
-    // previously published assertion after that opt-in is removed.
-    if display_name.is_none() && existing.is_none() {
-        return Ok(());
-    }
-
-    let now = Timestamp::now().as_secs();
-    let expires_at = identity_assertion_expiration(display_name, jwt_expires_at, now);
-    if existing.as_ref().is_some_and(|stored| {
-        identity_assertion_matches(&stored.event, &subject_hex, display_name, expires_at)
-    }) {
-        return Ok(());
-    }
-
-    let created_at = existing
-        .as_ref()
-        .map(|stored| stored.event.created_at.as_secs().saturating_add(1))
-        .unwrap_or(now)
-        .max(now);
-    let event = build_identity_assertion(
-        &state.relay_keypair,
-        subject,
-        display_name,
-        expires_at,
-        Timestamp::from(created_at),
-    )?;
-
-    state
-        .db
-        .replace_parameterized_event(community_id, &event, &subject_hex, None)
-        .await
-        .map_err(|error| error.to_string())?;
-    metrics::counter!("buzz_corporate_identity_assertions_total", "result" => "published")
-        .increment(1);
-    Ok(())
-}
-
+#[cfg(test)]
 fn identity_assertion_expiration(display_name: Option<&str>, jwt_expires_at: u64, now: u64) -> u64 {
     if display_name.is_some() {
         jwt_expires_at.min(now.saturating_add(IDENTITY_ASSERTION_MAX_TTL_SECS))
@@ -1036,6 +1074,7 @@ fn is_allowed_jwt_algorithm(algorithm: Algorithm) -> bool {
     )
 }
 
+#[cfg(test)]
 fn validate_jwk_signature_metadata(
     jwk: &Jwk,
     token_algorithm: Algorithm,
@@ -1072,6 +1111,7 @@ fn validate_jwk_signature_metadata(
     Ok(())
 }
 
+#[cfg(test)]
 fn jwk_algorithm_matches(key: KeyAlgorithm, token: Algorithm) -> bool {
     matches!(
         (key, token),
@@ -1173,16 +1213,6 @@ pub fn service_from_config(
         .then(|| Arc::new(CorporateIdentityService::new(config.clone())))
 }
 
-fn record_identity_binding_metric(binding: &BindIdentityResult) {
-    let result = match binding {
-        BindIdentityResult::Created => "created",
-        BindIdentityResult::Matched => "matched",
-        BindIdentityResult::Conflict(_) => "conflict",
-        BindIdentityResult::Revoked => "revoked",
-    };
-    metrics::counter!("buzz_corporate_identity_bindings_total", "result" => result).increment(1);
-}
-
 fn record_corporate_identity_denial(error: &CorporateIdentityError) {
     let reason = match error {
         CorporateIdentityError::MissingJwt => "missing_jwt",
@@ -1195,37 +1225,11 @@ fn record_corporate_identity_denial(error: &CorporateIdentityError) {
         CorporateIdentityError::BindingRevoked => "binding_revoked",
         CorporateIdentityError::DelegationDenied => "delegation_denied",
         CorporateIdentityError::Db(_) => "db",
+        CorporateIdentityError::FoundationIntegrationRequired => "foundation_integration_required",
     };
     metrics::counter!("buzz_auth_failures_total", "reason" => "corporate_identity_denied")
         .increment(1);
     metrics::counter!("buzz_corporate_identity_denials_total", "reason" => reason).increment(1);
-}
-
-async fn record_identity_binding_audit(
-    state: &AppState,
-    community_id: CommunityId,
-    action: buzz_audit::AuditAction,
-    actor: PublicKey,
-    issuer: &str,
-    uid: &str,
-    detail: serde_json::Value,
-) {
-    let Some(audit_tx) = &state.audit_tx else {
-        return;
-    };
-    if let Err(e) = audit_tx
-        .send(buzz_audit::NewAuditEntry {
-            community_id,
-            action,
-            actor_pubkey: Some(actor.to_bytes().to_vec()),
-            object_id: Some(format!("{issuer}|{uid}")),
-            detail,
-        })
-        .await
-    {
-        warn!("Corporate identity audit channel closed — entry lost: {e}");
-        metrics::counter!("buzz_audit_send_errors_total").increment(1);
-    }
 }
 
 #[cfg(test)]
@@ -1237,10 +1241,10 @@ mod tests {
     };
 
     use axum::http::{HeaderMap, HeaderName, HeaderValue};
-    use base64::Engine as _;
     use jsonwebtoken::jwk::JwkSet;
     use jsonwebtoken::{encode, EncodingKey, Header};
     use nostr::Keys;
+    use rsa::{pkcs1::EncodeRsaPrivateKey, rand_core::OsRng, RsaPrivateKey};
     use sqlx::PgPool;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
@@ -1533,7 +1537,12 @@ mod tests {
         .expect("encode test jwt");
 
         let err = service
-            .validate_jwt(&token)
+            .validate_jwt(
+                &token,
+                CommunityId::from_uuid(Uuid::from_u128(1)),
+                Keys::generate().public_key(),
+                None,
+            )
             .await
             .expect_err("HS256 must be rejected");
         assert!(matches!(err, CorporateIdentityError::InvalidJwt(_)));
@@ -1541,7 +1550,7 @@ mod tests {
 
     #[tokio::test]
     async fn validate_jwt_accepts_matching_rs256_jwk() {
-        let key = rsa_private_key(include_str!("testdata/rsa_private_key_1.der.b64"));
+        let key = rsa_private_key(0);
         let token = rsa_test_jwt(&key, "rsa-key");
         let claims = validate_rsa_jwt(&token, rsa_test_jwk(&key, "rsa-key"))
             .await
@@ -1553,8 +1562,8 @@ mod tests {
 
     #[tokio::test]
     async fn validate_jwt_rejects_rs256_token_signed_by_wrong_key() {
-        let signing_key = rsa_private_key(include_str!("testdata/rsa_private_key_1.der.b64"));
-        let advertised_key = rsa_private_key(include_str!("testdata/rsa_private_key_2.der.b64"));
+        let signing_key = rsa_private_key(0);
+        let advertised_key = rsa_private_key(1);
         let token = rsa_test_jwt(&signing_key, "rsa-key");
 
         let error = validate_rsa_jwt(&token, rsa_test_jwk(&advertised_key, "rsa-key"))
@@ -1565,7 +1574,7 @@ mod tests {
 
     #[tokio::test]
     async fn validate_jwt_rejects_jwk_advertised_algorithm_mismatch() {
-        let key = rsa_private_key(include_str!("testdata/rsa_private_key_1.der.b64"));
+        let key = rsa_private_key(0);
         let token = rsa_test_jwt(&key, "rsa-key");
         let mut jwk = rsa_test_jwk(&key, "rsa-key");
         jwk.common.key_algorithm = Some(KeyAlgorithm::RS512);
@@ -1576,13 +1585,13 @@ mod tests {
         assert!(matches!(
             error,
             CorporateIdentityError::InvalidJwt(ref message)
-                if message.contains("does not match JWK algorithm")
+                if message == "nip_fi_verifier_invalid_key"
         ));
     }
 
     #[tokio::test]
     async fn validate_jwt_accepts_jwk_with_omitted_algorithm() {
-        let key = rsa_private_key(include_str!("testdata/rsa_private_key_1.der.b64"));
+        let key = rsa_private_key(0);
         let token = rsa_test_jwt(&key, "rsa-key");
         let mut jwk = rsa_test_jwk(&key, "rsa-key");
         jwk.common.key_algorithm = None;
@@ -1594,7 +1603,7 @@ mod tests {
 
     #[test]
     fn validate_jwk_requires_signature_use_and_verify_operation_when_present() {
-        let key = rsa_private_key(include_str!("testdata/rsa_private_key_1.der.b64"));
+        let key = rsa_private_key(0);
         let mut jwk = rsa_test_jwk(&key, "rsa-key");
         jwk.common.public_key_use = Some(PublicKeyUse::Encryption);
         assert!(matches!(
@@ -1634,7 +1643,7 @@ mod tests {
         });
 
         for claims in [missing, malformed] {
-            decode_test_jwt(claims, Algorithm::HS256, b"test-secret", b"test-secret")
+            decode_test_jwt(claims, Algorithm::RS256, b"test-secret", b"test-secret")
                 .expect_err("invalid audience must not enroll an identity binding");
         }
     }
@@ -1651,7 +1660,7 @@ mod tests {
             assert!(
                 decode_test_jwt(
                     Value::Object(claims),
-                    Algorithm::HS256,
+                    Algorithm::RS256,
                     b"test-secret",
                     b"test-secret",
                 )
@@ -1659,12 +1668,6 @@ mod tests {
                 "missing {claim} must fail closed",
             );
         }
-    }
-
-    #[test]
-    fn jwt_validation_pins_clock_skew_leeway() {
-        let validation = jwt_validation(Algorithm::RS256, &test_config());
-        assert_eq!(validation.leeway, JWT_CLOCK_SKEW_LEEWAY_SECS);
     }
 
     #[test]
@@ -1684,7 +1687,7 @@ mod tests {
             assert!(
                 decode_test_jwt(
                     Value::Object(claims),
-                    Algorithm::HS256,
+                    Algorithm::RS256,
                     b"test-secret",
                     b"test-secret",
                 )
@@ -1710,7 +1713,7 @@ mod tests {
         malformed.insert("nbf".to_string(), Value::String("tomorrow".to_string()));
 
         for claims in [Value::Object(future), Value::Object(malformed)] {
-            decode_test_jwt(claims, Algorithm::HS256, b"test-secret", b"test-secret")
+            decode_test_jwt(claims, Algorithm::RS256, b"test-secret", b"test-secret")
                 .expect_err("invalid nbf must fail closed");
         }
     }
@@ -1731,7 +1734,7 @@ mod tests {
             assert!(
                 decode_test_jwt(
                     Value::Object(claims),
-                    Algorithm::HS256,
+                    Algorithm::RS256,
                     b"test-secret",
                     b"test-secret",
                 )
@@ -1828,21 +1831,32 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fresh_jwks_cache_miss_does_not_refetch() {
-        let service = CorporateIdentityService::new(test_config());
+    async fn fresh_jwks_cache_miss_forces_one_bounded_refresh() {
+        let response = http_response(
+            "200 OK",
+            &["Content-Type: application/json"],
+            r#"{"keys":[]}"#,
+        );
+        let (uri, requests, server) = spawn_http_server(response).await;
+        let mut config = test_config();
+        config.jwks_uri = uri;
+        let service = CorporateIdentityService::new(config);
         *service.jwks.write().await = Some(CachedJwks {
             set: JwkSet { keys: Vec::new() },
+            generation: VerifierKeyGeneration::new(1).expect("positive generation"),
             expires_at: Instant::now() + Duration::from_secs(60),
         });
 
         let err = service
-            .jwk_for_kid("attacker-controlled-kid")
+            .jwk_snapshot_for_kid("attacker-controlled-kid")
             .await
-            .expect_err("fresh cache miss should fail without network fetch");
+            .expect_err("fresh cache miss should fail after one refresh");
         assert!(matches!(
             err,
-            CorporateIdentityError::Jwks(ref msg) if msg.contains("fresh JWKS cache")
+            CorporateIdentityError::Jwks(ref msg) if msg.contains("after JWKS refresh")
         ));
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+        server.abort();
     }
 
     #[tokio::test]
@@ -1855,10 +1869,10 @@ mod tests {
         let service = CorporateIdentityService::new(config);
 
         let (first, second, third, fourth) = tokio::join!(
-            service.jwk_for_kid("test-kid"),
-            service.jwk_for_kid("test-kid"),
-            service.jwk_for_kid("test-kid"),
-            service.jwk_for_kid("test-kid"),
+            service.jwk_snapshot_for_kid("test-kid"),
+            service.jwk_snapshot_for_kid("test-kid"),
+            service.jwk_snapshot_for_kid("test-kid"),
+            service.jwk_snapshot_for_kid("test-kid"),
         );
         for result in [first, second, third, fourth] {
             result.expect("all waiters should reuse the refreshed JWKS");
@@ -1936,6 +1950,7 @@ mod tests {
             "aud": "buzz-relay",
             "sub": "user-1",
             "email": "user@example.com",
+            "iat": now,
             "exp": now + 3_600,
         })
     }
@@ -1945,24 +1960,65 @@ mod tests {
         signing_algorithm: Algorithm,
         signing_key: &[u8],
         verification_key: &[u8],
-    ) -> Result<(), jsonwebtoken::errors::Error> {
-        let token = encode(
-            &Header::new(signing_algorithm),
-            &claims,
-            &EncodingKey::from_secret(signing_key),
-        )?;
-        decode::<RawJwtClaims>(
-            &token,
-            &DecodingKey::from_secret(verification_key),
-            &jwt_validation(Algorithm::HS256, &test_config()),
-        )?;
-        Ok(())
+    ) -> Result<(), CanonicalVerifierError> {
+        let private_key = rsa_private_key(0);
+        let token = if signing_algorithm == Algorithm::RS256 {
+            let mut header = Header::new(Algorithm::RS256);
+            header.kid = Some("canonical-test-key".to_owned());
+            encode(&header, &claims, &EncodingKey::from_rsa_der(&private_key))
+                .expect("encode canonical RSA test JWT")
+        } else {
+            let mut header = Header::new(signing_algorithm);
+            header.kid = Some("canonical-test-key".to_owned());
+            encode(&header, &claims, &EncodingKey::from_secret(signing_key))
+                .expect("encode rejected symmetric test JWT")
+        };
+        let verification_material = if signing_key == verification_key {
+            private_key
+        } else {
+            rsa_private_key(1)
+        };
+        let key_set = CanonicalVerifierKeySet::new(
+            VerifierKeyGeneration::new(1).expect("generation"),
+            JwkSet {
+                keys: vec![rsa_test_jwk(&verification_material, "canonical-test-key")],
+            },
+        );
+        let policy = CanonicalVerifierPolicy::new(
+            "https://idp.example".to_owned(),
+            "buzz-relay".to_owned(),
+            "sub".to_owned(),
+            None,
+            JWT_CLOCK_SKEW_LEEWAY_SECS,
+            IDENTITY_ASSERTION_MAX_TTL_SECS,
+        )
+        .expect("canonical policy");
+        CanonicalFederatedAssertionVerifier::new(policy)
+            .verify(
+                &token,
+                &key_set,
+                CommunityId::from_uuid(Uuid::from_u128(1)),
+                ProofTransport::Nip42,
+                [1; 32],
+                [2; 32],
+                [3; 32],
+            )
+            .map(|_| ())
     }
 
-    fn rsa_private_key(encoded: &str) -> Vec<u8> {
-        base64::engine::general_purpose::STANDARD
-            .decode(encoded.trim())
-            .expect("decode RSA test key")
+    fn rsa_private_key(index: usize) -> Vec<u8> {
+        static KEYS: std::sync::OnceLock<[Vec<u8>; 2]> = std::sync::OnceLock::new();
+        KEYS.get_or_init(|| {
+            std::array::from_fn(|_| {
+                RsaPrivateKey::new(&mut OsRng, 2_048)
+                    .expect("generate RSA test key")
+                    .to_pkcs1_der()
+                    .expect("encode generated RSA test key")
+                    .as_bytes()
+                    .to_vec()
+            })
+        })[index]
+            .clone()
     }
 
     fn rsa_test_jwk(private_key: &[u8], kid: &str) -> Jwk {
@@ -1998,7 +2054,12 @@ mod tests {
         config.jwks_uri = uri;
         config.npub_claim = None;
         let result = CorporateIdentityService::new(config)
-            .validate_jwt(token)
+            .validate_jwt(
+                token,
+                CommunityId::from_uuid(Uuid::from_u128(1)),
+                Keys::generate().public_key(),
+                None,
+            )
             .await;
         server.abort();
         result

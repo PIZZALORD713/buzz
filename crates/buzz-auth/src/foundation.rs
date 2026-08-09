@@ -7,18 +7,26 @@
 
 use buzz_core::{AuthorizationLeaseFence, CanonicalCurrentBindingEvidence, CommunityId};
 use chrono::{DateTime, Utc};
-use nostr::PublicKey;
+use jsonwebtoken::{
+    decode, decode_header,
+    jwk::{Jwk, JwkSet, KeyAlgorithm, KeyOperations, PublicKeyUse},
+    Algorithm, DecodingKey, Validation,
+};
+use nostr::{FromBech32, PublicKey};
+use serde::Deserialize;
+use serde_json::{Map, Value};
+use sha2::{Digest, Sha256};
 use std::fmt;
 use std::future::Future;
 use thiserror::Error;
 use uuid::Uuid;
 
 /// Hard implementation ceiling for one domain's retained audit events.
-pub const HARD_MAX_AUTHORIZATION_EVENTS_PER_DOMAIN: u64 = 1_000_000;
+pub const HARD_MAX_AUTHORIZATION_EVENTS_PER_DOMAIN: u64 = 10_000;
 /// Hard implementation ceiling for one domain's retained canonical bytes.
-pub const HARD_MAX_AUTHORIZATION_EVENT_BYTES_PER_DOMAIN: u64 = 4_294_967_296;
+pub const HARD_MAX_AUTHORIZATION_EVENT_BYTES_PER_DOMAIN: u64 = 16 << 20;
 /// Hard implementation ceiling for one canonical event envelope.
-pub const HARD_MAX_AUTHORIZATION_EVENT_ENVELOPE_BYTES: u32 = 65_536;
+pub const HARD_MAX_AUTHORIZATION_EVENT_ENVELOPE_BYTES: u32 = 16 << 10;
 
 /// Minimal stock NIP-FI operating modes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -166,6 +174,456 @@ pub enum ProofTransport {
     Blossom,
 }
 
+/// Stable identifier for verifier policy, deliberately excluding key material.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct CanonicalVerifierPolicyId([u8; 32]);
+
+impl CanonicalVerifierPolicyId {
+    /// Return the stable policy digest.
+    pub const fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+}
+
+impl fmt::Debug for CanonicalVerifierPolicyId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("CanonicalVerifierPolicyId([REDACTED])")
+    }
+}
+
+/// Positive monotonic generation assigned to one fetched verifier key set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct VerifierKeyGeneration(u64);
+
+impl VerifierKeyGeneration {
+    /// Validate a nonzero key-set generation.
+    pub const fn new(generation: u64) -> Option<Self> {
+        if generation == 0 {
+            None
+        } else {
+            Some(Self(generation))
+        }
+    }
+
+    /// Return the positive generation number.
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
+/// Exact stable-policy and rotating-key generation used for verification.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct VerifierPolicyStamp {
+    policy_id: CanonicalVerifierPolicyId,
+    key_generation: VerifierKeyGeneration,
+}
+
+impl VerifierPolicyStamp {
+    /// Construct a stamp from a validated policy and current key generation.
+    pub const fn new(
+        policy_id: CanonicalVerifierPolicyId,
+        key_generation: VerifierKeyGeneration,
+    ) -> Self {
+        Self {
+            policy_id,
+            key_generation,
+        }
+    }
+
+    /// Stable verifier policy identifier.
+    pub const fn policy_id(self) -> CanonicalVerifierPolicyId {
+        self.policy_id
+    }
+
+    /// Rotating key-set generation used for the evidence.
+    pub const fn key_generation(self) -> VerifierKeyGeneration {
+        self.key_generation
+    }
+}
+
+/// Provider-free JWT verifier policy whose identifier survives JWKS rotation.
+#[derive(Clone)]
+pub struct CanonicalVerifierPolicy {
+    issuer: String,
+    audience: String,
+    subject_claim: String,
+    event_author_claim: Option<String>,
+    clock_skew_seconds: u64,
+    maximum_token_lifetime_seconds: u64,
+    id: CanonicalVerifierPolicyId,
+}
+
+impl CanonicalVerifierPolicy {
+    /// Validate policy fields and derive a domain-separated stable identifier.
+    pub fn new(
+        issuer: String,
+        audience: String,
+        subject_claim: String,
+        event_author_claim: Option<String>,
+        clock_skew_seconds: u64,
+        maximum_token_lifetime_seconds: u64,
+    ) -> Result<Self, CanonicalVerifierError> {
+        if issuer.trim().is_empty()
+            || audience.trim().is_empty()
+            || subject_claim.trim().is_empty()
+            || event_author_claim
+                .as_ref()
+                .is_some_and(|claim| claim.trim().is_empty())
+            || issuer.len() > 2_048
+            || audience.len() > 2_048
+            || subject_claim.len() > 128
+            || event_author_claim
+                .as_ref()
+                .is_some_and(|claim| claim.len() > 128)
+            || clock_skew_seconds > 300
+            || maximum_token_lifetime_seconds == 0
+            || maximum_token_lifetime_seconds > 86_400
+        {
+            return Err(CanonicalVerifierError::InvalidPolicy);
+        }
+
+        let mut hasher = Sha256::new();
+        hasher.update(b"buzz:nip-fi:canonical-verifier-policy:v1\0");
+        for value in [
+            issuer.as_bytes(),
+            audience.as_bytes(),
+            subject_claim.as_bytes(),
+            event_author_claim.as_deref().unwrap_or("").as_bytes(),
+        ] {
+            hasher.update((value.len() as u64).to_be_bytes());
+            hasher.update(value);
+        }
+        hasher.update(clock_skew_seconds.to_be_bytes());
+        hasher.update(maximum_token_lifetime_seconds.to_be_bytes());
+        let id = CanonicalVerifierPolicyId(hasher.finalize().into());
+
+        Ok(Self {
+            issuer,
+            audience,
+            subject_claim,
+            event_author_claim,
+            clock_skew_seconds,
+            maximum_token_lifetime_seconds,
+            id,
+        })
+    }
+
+    /// Stable identifier excluding JWKS bytes, key ids, and key generation.
+    pub const fn id(&self) -> CanonicalVerifierPolicyId {
+        self.id
+    }
+}
+
+impl fmt::Debug for CanonicalVerifierPolicy {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("CanonicalVerifierPolicy([REDACTED])")
+    }
+}
+
+/// One immutable rotating key-set snapshot admitted by the canonical verifier.
+#[derive(Clone)]
+pub struct CanonicalVerifierKeySet {
+    generation: VerifierKeyGeneration,
+    keys: JwkSet,
+}
+
+impl CanonicalVerifierKeySet {
+    /// Seal a parsed JWKS with its positive cache generation.
+    pub const fn new(generation: VerifierKeyGeneration, keys: JwkSet) -> Self {
+        Self { generation, keys }
+    }
+
+    /// Key generation carried into evidence and the final recheck witness.
+    pub const fn generation(&self) -> VerifierKeyGeneration {
+        self.generation
+    }
+}
+
+impl fmt::Debug for CanonicalVerifierKeySet {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("CanonicalVerifierKeySet([REDACTED])")
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct CanonicalRawJwtClaims {
+    #[serde(flatten)]
+    claims: Map<String, Value>,
+}
+
+/// The sole provider-free JWT verifier used to mint federated evidence.
+#[derive(Clone)]
+pub struct CanonicalFederatedAssertionVerifier {
+    policy: CanonicalVerifierPolicy,
+}
+
+impl CanonicalFederatedAssertionVerifier {
+    /// Construct a verifier from stable policy. Key material is supplied as an
+    /// explicit generation snapshot for every verification operation.
+    pub const fn new(policy: CanonicalVerifierPolicy) -> Self {
+        Self { policy }
+    }
+
+    /// Stable policy identifier, unaffected by JWKS rotation.
+    pub const fn policy_id(&self) -> CanonicalVerifierPolicyId {
+        self.policy.id()
+    }
+
+    /// Verify a JWT and mint origin-sealed evidence carrying the key generation.
+    #[allow(clippy::too_many_arguments)]
+    pub fn verify(
+        &self,
+        token: &str,
+        key_set: &CanonicalVerifierKeySet,
+        authorization_domain: CommunityId,
+        transport: ProofTransport,
+        target_fingerprint: [u8; 32],
+        request_fingerprint: [u8; 32],
+        transport_context_fingerprint: [u8; 32],
+    ) -> Result<VerifiedFederatedAssertion, CanonicalVerifierError> {
+        if token.is_empty()
+            || token.len() > 64 * 1024
+            || authorization_domain.as_uuid().is_nil()
+            || target_fingerprint == [0; 32]
+            || request_fingerprint == [0; 32]
+            || transport_context_fingerprint == [0; 32]
+        {
+            return Err(CanonicalVerifierError::MalformedInput);
+        }
+
+        let header = decode_header(token).map_err(|_| CanonicalVerifierError::InvalidToken)?;
+        if !canonical_algorithm_allowed(header.alg) {
+            return Err(CanonicalVerifierError::UnsupportedAlgorithm);
+        }
+        let kid = header
+            .kid
+            .as_deref()
+            .filter(|kid| !kid.is_empty() && kid.len() <= 512)
+            .ok_or(CanonicalVerifierError::MissingKeyId)?;
+        let mut matching_keys = key_set
+            .keys
+            .keys
+            .iter()
+            .filter(|jwk| jwk.common.key_id.as_deref() == Some(kid));
+        let jwk = matching_keys
+            .next()
+            .ok_or(CanonicalVerifierError::UnknownKeyId)?;
+        if matching_keys.next().is_some() {
+            return Err(CanonicalVerifierError::InvalidKey);
+        }
+        validate_canonical_jwk(jwk, header.alg)?;
+        let key = DecodingKey::from_jwk(jwk).map_err(|_| CanonicalVerifierError::InvalidKey)?;
+
+        let mut validation = Validation::new(header.alg);
+        validation.leeway = self.policy.clock_skew_seconds;
+        validation.set_issuer(&[self.policy.issuer.as_str()]);
+        validation.set_audience(&[self.policy.audience.as_str()]);
+        validation.set_required_spec_claims(&["exp", "iat", "iss", "aud"]);
+        validation.validate_exp = true;
+        validation.validate_nbf = true;
+        let decoded = decode::<CanonicalRawJwtClaims>(token, &key, &validation)
+            .map_err(|_| CanonicalVerifierError::InvalidToken)?;
+
+        let subject = canonical_claim_string(&decoded.claims.claims, &self.policy.subject_claim)?;
+        let issued_at = canonical_claim_i64(&decoded.claims.claims, "iat")?;
+        let not_before = canonical_optional_claim_i64(&decoded.claims.claims, "nbf")?
+            .unwrap_or(issued_at)
+            .max(issued_at);
+        let expires_at = canonical_claim_i64(&decoded.claims.claims, "exp")?;
+        let lifetime = expires_at
+            .checked_sub(issued_at)
+            .ok_or(CanonicalVerifierError::InvalidTimeBounds)?;
+        if lifetime <= 0 || lifetime as u64 > self.policy.maximum_token_lifetime_seconds {
+            return Err(CanonicalVerifierError::InvalidTimeBounds);
+        }
+        let not_before = DateTime::from_timestamp(not_before, 0)
+            .ok_or(CanonicalVerifierError::InvalidTimeBounds)?;
+        let expires_at = DateTime::from_timestamp(expires_at, 0)
+            .ok_or(CanonicalVerifierError::InvalidTimeBounds)?;
+
+        let attested_event_author_pubkey = self
+            .policy
+            .event_author_claim
+            .as_deref()
+            .map(|claim| canonical_claim_string(&decoded.claims.claims, claim))
+            .transpose()?
+            .map(|claim| canonical_parse_pubkey(&claim))
+            .transpose()?;
+        let principal =
+            FederatedPrincipal::from_verified_parts(self.policy.issuer.clone(), subject)
+                .ok_or(CanonicalVerifierError::InvalidClaim)?;
+        let assertion_fingerprint: [u8; 32] = Sha256::digest(token.as_bytes()).into();
+        let stamp = VerifierPolicyStamp::new(self.policy.id(), key_set.generation());
+
+        VerifiedFederatedAssertion::from_verifier_with_stamp(
+            authorization_domain,
+            principal,
+            transport,
+            assertion_fingerprint,
+            target_fingerprint,
+            request_fingerprint,
+            transport_context_fingerprint,
+            not_before,
+            expires_at,
+            stamp,
+            attested_event_author_pubkey,
+        )
+        .ok_or(CanonicalVerifierError::MalformedInput)
+    }
+}
+
+impl fmt::Debug for CanonicalFederatedAssertionVerifier {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("CanonicalFederatedAssertionVerifier([REDACTED])")
+    }
+}
+
+/// Closed, stable canonical-verifier failures with no credential material.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub enum CanonicalVerifierError {
+    /// Stable verifier policy was invalid.
+    #[error("invalid canonical verifier policy")]
+    InvalidPolicy,
+    /// Token or request-bound coordinates were malformed.
+    #[error("malformed canonical verifier input")]
+    MalformedInput,
+    /// JWT header or signed claims failed canonical verification.
+    #[error("canonical verifier rejected token")]
+    InvalidToken,
+    /// JWT used an algorithm outside the asymmetric allow-list.
+    #[error("canonical verifier rejected algorithm")]
+    UnsupportedAlgorithm,
+    /// JWT header omitted its bounded key identifier.
+    #[error("canonical verifier requires key id")]
+    MissingKeyId,
+    /// Key id was absent from the supplied generation snapshot.
+    #[error("canonical verifier key id unavailable")]
+    UnknownKeyId,
+    /// JWK was not admissible for signature verification.
+    #[error("canonical verifier rejected key")]
+    InvalidKey,
+    /// Required provider-free subject or event-author claim was invalid.
+    #[error("canonical verifier rejected claim")]
+    InvalidClaim,
+    /// JWT lifetime was empty, malformed, or exceeded policy.
+    #[error("canonical verifier rejected time bounds")]
+    InvalidTimeBounds,
+}
+
+impl CanonicalVerifierError {
+    /// Unique stable machine code safe for logs, metrics, and clients.
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::InvalidPolicy => "nip_fi_verifier_invalid_policy",
+            Self::MalformedInput => "nip_fi_verifier_malformed_input",
+            Self::InvalidToken => "nip_fi_verifier_invalid_token",
+            Self::UnsupportedAlgorithm => "nip_fi_verifier_unsupported_algorithm",
+            Self::MissingKeyId => "nip_fi_verifier_missing_key_id",
+            Self::UnknownKeyId => "nip_fi_verifier_unknown_key_id",
+            Self::InvalidKey => "nip_fi_verifier_invalid_key",
+            Self::InvalidClaim => "nip_fi_verifier_invalid_claim",
+            Self::InvalidTimeBounds => "nip_fi_verifier_invalid_time_bounds",
+        }
+    }
+}
+
+fn canonical_algorithm_allowed(algorithm: Algorithm) -> bool {
+    matches!(
+        algorithm,
+        Algorithm::RS256
+            | Algorithm::RS384
+            | Algorithm::RS512
+            | Algorithm::PS256
+            | Algorithm::PS384
+            | Algorithm::PS512
+            | Algorithm::ES256
+            | Algorithm::ES384
+            | Algorithm::EdDSA
+    )
+}
+
+fn validate_canonical_jwk(
+    jwk: &Jwk,
+    token_algorithm: Algorithm,
+) -> Result<(), CanonicalVerifierError> {
+    if jwk
+        .common
+        .public_key_use
+        .as_ref()
+        .is_some_and(|key_use| key_use != &PublicKeyUse::Signature)
+        || jwk
+            .common
+            .key_operations
+            .as_ref()
+            .is_some_and(|operations| !operations.contains(&KeyOperations::Verify))
+        || jwk
+            .common
+            .key_algorithm
+            .is_some_and(|algorithm| !canonical_jwk_algorithm_matches(algorithm, token_algorithm))
+    {
+        return Err(CanonicalVerifierError::InvalidKey);
+    }
+    Ok(())
+}
+
+fn canonical_jwk_algorithm_matches(key: KeyAlgorithm, token: Algorithm) -> bool {
+    matches!(
+        (key, token),
+        (KeyAlgorithm::RS256, Algorithm::RS256)
+            | (KeyAlgorithm::RS384, Algorithm::RS384)
+            | (KeyAlgorithm::RS512, Algorithm::RS512)
+            | (KeyAlgorithm::PS256, Algorithm::PS256)
+            | (KeyAlgorithm::PS384, Algorithm::PS384)
+            | (KeyAlgorithm::PS512, Algorithm::PS512)
+            | (KeyAlgorithm::ES256, Algorithm::ES256)
+            | (KeyAlgorithm::ES384, Algorithm::ES384)
+            | (KeyAlgorithm::EdDSA, Algorithm::EdDSA)
+    )
+}
+
+fn canonical_claim_string(
+    claims: &Map<String, Value>,
+    claim: &str,
+) -> Result<String, CanonicalVerifierError> {
+    claims
+        .get(claim)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty() && value.len() <= 2_048)
+        .map(str::to_owned)
+        .ok_or(CanonicalVerifierError::InvalidClaim)
+}
+
+fn canonical_claim_i64(
+    claims: &Map<String, Value>,
+    claim: &str,
+) -> Result<i64, CanonicalVerifierError> {
+    claims
+        .get(claim)
+        .and_then(Value::as_i64)
+        .ok_or(CanonicalVerifierError::InvalidTimeBounds)
+}
+
+fn canonical_optional_claim_i64(
+    claims: &Map<String, Value>,
+    claim: &str,
+) -> Result<Option<i64>, CanonicalVerifierError> {
+    claims
+        .get(claim)
+        .map(|value| {
+            value
+                .as_i64()
+                .ok_or(CanonicalVerifierError::InvalidTimeBounds)
+        })
+        .transpose()
+}
+
+fn canonical_parse_pubkey(value: &str) -> Result<PublicKey, CanonicalVerifierError> {
+    PublicKey::from_hex(value)
+        .or_else(|_| PublicKey::from_bech32(value))
+        .map_err(|_| CanonicalVerifierError::InvalidClaim)
+}
+
 /// Closed route capability used by local policy and delegation checks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum RouteCapability {
@@ -223,6 +681,44 @@ pub enum RouteCapability {
     BindingStatus,
     /// Enroll a local binding.
     Enrollment,
+    /// Mint an invitation without consuming one.
+    InviteMint,
+    /// Claim an invitation without gaining mint authority.
+    InviteClaim,
+}
+
+/// Closed authorization outcome reason retained by immutable contexts.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub enum AuthorizationReason {
+    /// An existing active direct binding authorized the request.
+    ExistingBinding,
+    /// A signed assertion attested the enrolled Nostr author.
+    EnrolledAttestedKey,
+    /// Local provisioning authorized enrollment.
+    EnrolledProvisioned,
+    /// Explicit risk-labelled trust-on-first-use authorized enrollment.
+    EnrolledRiskLabelledTofu,
+    /// A current owner binding and exact delegation authorized the request.
+    DelegatedOwnerBinding,
+}
+
+impl AuthorizationReason {
+    /// Unique stable machine code safe for durable receipts and metrics.
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::ExistingBinding => "nip_fi_existing_binding",
+            Self::EnrolledAttestedKey => "nip_fi_enrolled_attested_key",
+            Self::EnrolledProvisioned => "nip_fi_enrolled_provisioned",
+            Self::EnrolledRiskLabelledTofu => "nip_fi_enrolled_risk_labelled_tofu",
+            Self::DelegatedOwnerBinding => "nip_fi_delegated_owner_binding",
+        }
+    }
+}
+
+impl fmt::Debug for AuthorizationReason {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("AuthorizationReason([REDACTED])")
+    }
 }
 
 /// Closed capability advertised by the concrete local binding resolver.
@@ -378,32 +874,10 @@ impl fmt::Debug for FederatedPrincipal {
 }
 
 /// Origin-sealed result of federated assertion validation.
-///
-/// External callers cannot relabel an assertion with a claimed key:
-///
-/// ```compile_fail
-/// # use buzz_auth::VerifiedFederatedAssertion;
-/// fn relabel(assertion: &mut VerifiedFederatedAssertion) {
-///     assertion.attested_event_author_pubkey = None;
-/// }
-/// ```
-///
-/// Nor can they reconstruct one with a substituted key:
-///
-/// ```compile_fail
-/// # use buzz_auth::VerifiedFederatedAssertion;
-/// fn remint(assertion: VerifiedFederatedAssertion) -> VerifiedFederatedAssertion {
-///     VerifiedFederatedAssertion {
-///         attested_event_author_pubkey: None,
-///         ..assertion
-///     }
-/// }
-/// ```
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct VerifiedFederatedAssertion {
     authorization_domain: CommunityId,
     principal: FederatedPrincipal,
-    attested_event_author_pubkey: Option<PublicKey>,
     transport: ProofTransport,
     assertion_fingerprint: [u8; 32],
     target_fingerprint: [u8; 32],
@@ -411,6 +885,8 @@ pub struct VerifiedFederatedAssertion {
     transport_context_fingerprint: [u8; 32],
     not_before: DateTime<Utc>,
     expires_at: DateTime<Utc>,
+    verifier_stamp: VerifierPolicyStamp,
+    attested_event_author_pubkey: Option<PublicKey>,
 }
 
 impl VerifiedFederatedAssertion {
@@ -426,6 +902,35 @@ impl VerifiedFederatedAssertion {
         not_before: DateTime<Utc>,
         expires_at: DateTime<Utc>,
     ) -> Option<Self> {
+        Self::from_verifier_with_stamp(
+            authorization_domain,
+            principal,
+            transport,
+            assertion_fingerprint,
+            target_fingerprint,
+            request_fingerprint,
+            transport_context_fingerprint,
+            not_before,
+            expires_at,
+            VerifierPolicyStamp::new(CanonicalVerifierPolicyId([1; 32]), VerifierKeyGeneration(1)),
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn from_verifier_with_stamp(
+        authorization_domain: CommunityId,
+        principal: FederatedPrincipal,
+        transport: ProofTransport,
+        assertion_fingerprint: [u8; 32],
+        target_fingerprint: [u8; 32],
+        request_fingerprint: [u8; 32],
+        transport_context_fingerprint: [u8; 32],
+        not_before: DateTime<Utc>,
+        expires_at: DateTime<Utc>,
+        verifier_stamp: VerifierPolicyStamp,
+        attested_event_author_pubkey: Option<PublicKey>,
+    ) -> Option<Self> {
         if authorization_domain.as_uuid().is_nil()
             || assertion_fingerprint == [0; 32]
             || target_fingerprint == [0; 32]
@@ -438,7 +943,6 @@ impl VerifiedFederatedAssertion {
         Some(Self {
             authorization_domain,
             principal,
-            attested_event_author_pubkey: None,
             transport,
             assertion_fingerprint,
             target_fingerprint,
@@ -446,6 +950,8 @@ impl VerifiedFederatedAssertion {
             transport_context_fingerprint,
             not_before,
             expires_at,
+            verifier_stamp,
+            attested_event_author_pubkey,
         })
     }
 
@@ -464,35 +970,14 @@ impl VerifiedFederatedAssertion {
         self.principal.storage_key()
     }
 
-    /// Optional assertion key claim after exact Nostr-proof matching.
-    ///
-    /// `None` is valid for grandfathered existing-binding resolution and
-    /// risk-labelled TOFU creation. Attested-key creation must require `Some`
-    /// before mutation.
-    pub const fn attested_event_author_pubkey(&self) -> Option<PublicKey> {
-        self.attested_event_author_pubkey
+    /// Stable policy and exact JWKS generation used to verify this assertion.
+    pub const fn verifier_stamp(&self) -> VerifierPolicyStamp {
+        self.verifier_stamp
     }
 
-    // Consumed by the trusted-evidence layer introduced in the next stack PR.
-    #[allow(dead_code)]
-    pub(crate) fn bind_attested_event_author_pubkey(
-        mut self,
-        event_author_pubkey: PublicKey,
-        proof: &VerifiedNostrProof,
-    ) -> Option<Self> {
-        if self.attested_event_author_pubkey.is_some()
-            || event_author_pubkey != proof.actor_pubkey()
-            || self.authorization_domain != proof.authorization_domain()
-            || self.transport != proof.transport()
-            || self.assertion_fingerprint != *proof.bound_assertion_fingerprint()?
-            || self.request_fingerprint != *proof.request_fingerprint()
-            || self.target_fingerprint != *proof.target_fingerprint()
-            || self.transport_context_fingerprint != *proof.transport_context_fingerprint()
-        {
-            return None;
-        }
-        self.attested_event_author_pubkey = Some(event_author_pubkey);
-        Some(self)
+    /// Event-author key explicitly attested by the signed assertion, if any.
+    pub const fn attested_event_author_pubkey(&self) -> Option<PublicKey> {
+        self.attested_event_author_pubkey
     }
 }
 
@@ -600,6 +1085,179 @@ impl VerifiedNostrProof {
 impl fmt::Debug for VerifiedNostrProof {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str("VerifiedNostrProof([REDACTED])")
+    }
+}
+
+/// Closed enrollment authority selected by local server policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DirectEnrollmentMode {
+    /// The signed federated assertion attests the exact Nostr event author.
+    Attested,
+    /// A locally provisioned subject-to-key assignment authorizes enrollment.
+    Provisioned,
+    /// Explicitly risk-labelled trust-on-first-use with no silent promotion.
+    RiskLabelledTofu,
+}
+
+impl DirectEnrollmentMode {
+    /// Stable database code shared with `binding_provenance` and
+    /// `identity_enrollment_policies.enrollment_mode`.
+    pub const fn database_code(self) -> i16 {
+        match self {
+            Self::Attested => 1,
+            Self::Provisioned => 2,
+            Self::RiskLabelledTofu => 3,
+        }
+    }
+
+    /// Decode the closed database representation.
+    pub const fn from_database_code(code: i16) -> Option<Self> {
+        match code {
+            1 => Some(Self::Attested),
+            2 => Some(Self::Provisioned),
+            3 => Some(Self::RiskLabelledTofu),
+            _ => None,
+        }
+    }
+}
+
+/// Exact local enrollment authority read from the configured database.
+///
+/// This value is deliberately distinct from verifier evidence. Provisioned
+/// and risk-labelled TOFU enrollment cannot be selected merely by passing an
+/// enum to the proposal constructor; the database policy, key assignment and
+/// evidence digest must all be present and later match the inserted binding.
+#[derive(Clone)]
+pub struct LocalEnrollmentAuthority {
+    authorization_domain: CommunityId,
+    principal: FederatedPrincipal,
+    event_author_pubkey: PublicKey,
+    mode: DirectEnrollmentMode,
+    policy_revision: u64,
+    evidence_digest: [u8; 32],
+}
+
+impl LocalEnrollmentAuthority {
+    /// Seal an exact enrollment-policy result returned by authoritative local
+    /// storage. Raw credentials and provider configuration are never retained.
+    pub fn from_database_parts(
+        authorization_domain: CommunityId,
+        issuer: String,
+        subject: String,
+        event_author_pubkey: PublicKey,
+        mode_code: i16,
+        policy_revision: u64,
+        evidence_digest: [u8; 32],
+    ) -> Option<Self> {
+        if authorization_domain.as_uuid().is_nil()
+            || policy_revision == 0
+            || evidence_digest == [0; 32]
+        {
+            return None;
+        }
+        Some(Self {
+            authorization_domain,
+            principal: FederatedPrincipal::from_verified_parts(issuer, subject)?,
+            event_author_pubkey,
+            mode: DirectEnrollmentMode::from_database_code(mode_code)?,
+            policy_revision,
+            evidence_digest,
+        })
+    }
+}
+
+impl fmt::Debug for LocalEnrollmentAuthority {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("LocalEnrollmentAuthority([REDACTED])")
+    }
+}
+
+/// Origin-sealed direct-enrollment proposal made from co-bound verified evidence.
+#[derive(Clone)]
+pub struct DirectEnrollmentProposal {
+    mode: DirectEnrollmentMode,
+    policy_revision: u64,
+    evidence_digest: [u8; 32],
+    assertion: VerifiedFederatedAssertion,
+    proof: VerifiedNostrProof,
+}
+
+impl DirectEnrollmentProposal {
+    /// Validate and seal an enrollment proposal under an exact database-read
+    /// local authority. The proposal cannot invent its own enrollment mode.
+    pub fn from_verified_evidence(
+        authority: LocalEnrollmentAuthority,
+        assertion: VerifiedFederatedAssertion,
+        proof: VerifiedNostrProof,
+        authoritative_now: DateTime<Utc>,
+    ) -> Result<Self, AuthorizationError> {
+        if assertion.authorization_domain != proof.authorization_domain
+            || assertion.transport != proof.transport
+            || assertion.assertion_fingerprint
+                != proof
+                    .bound_assertion_fingerprint
+                    .ok_or(AuthorizationError::BindingMismatch)?
+            || assertion.target_fingerprint != proof.target_fingerprint
+            || assertion.request_fingerprint != proof.request_fingerprint
+            || assertion.transport_context_fingerprint != proof.transport_context_fingerprint
+            || proof.delegation_conditions_fingerprint.is_some()
+        {
+            return Err(AuthorizationError::BindingMismatch);
+        }
+        if authoritative_now < assertion.not_before
+            || authoritative_now >= assertion.expires_at
+            || authoritative_now >= proof.expires_at
+        {
+            return Err(AuthorizationError::Expired);
+        }
+        if authority.authorization_domain != assertion.authorization_domain
+            || authority.principal != assertion.principal
+            || authority.event_author_pubkey != proof.actor_pubkey
+        {
+            return Err(AuthorizationError::EnrollmentAuthorityMismatch);
+        }
+        if authority.mode == DirectEnrollmentMode::Attested
+            && assertion.attested_event_author_pubkey != Some(proof.actor_pubkey)
+        {
+            return Err(AuthorizationError::EnrollmentAuthorityMismatch);
+        }
+        Ok(Self {
+            mode: authority.mode,
+            policy_revision: authority.policy_revision,
+            evidence_digest: authority.evidence_digest,
+            assertion,
+            proof,
+        })
+    }
+
+    /// Closed enrollment authority retained through storage resolution.
+    pub const fn mode(&self) -> DirectEnrollmentMode {
+        self.mode
+    }
+
+    /// Server-resolved authorization domain sealed by both proofs.
+    pub const fn authorization_domain(&self) -> CommunityId {
+        self.assertion.authorization_domain
+    }
+
+    /// Exact local policy revision and privacy-safe evidence digest that the
+    /// resulting immutable binding must retain.
+    pub const fn local_authority(&self) -> (u64, &[u8; 32]) {
+        (self.policy_revision, &self.evidence_digest)
+    }
+
+    fn assertion(&self) -> &VerifiedFederatedAssertion {
+        &self.assertion
+    }
+
+    fn proof(&self) -> &VerifiedNostrProof {
+        &self.proof
+    }
+}
+
+impl fmt::Debug for DirectEnrollmentProposal {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("DirectEnrollmentProposal([REDACTED])")
     }
 }
 
@@ -711,10 +1369,8 @@ pub enum BindingResolutionRequest {
     },
     /// Resolve or create a binding under the local enrollment policy.
     Enrollment {
-        /// Origin-sealed federated assertion.
-        assertion: VerifiedFederatedAssertion,
-        /// Origin-sealed Nostr proof.
-        proof: VerifiedNostrProof,
+        /// Origin-sealed proposal retaining its explicit enrollment authority.
+        proposal: DirectEnrollmentProposal,
         /// Exact protected capability.
         capability: RouteCapability,
     },
@@ -729,6 +1385,7 @@ pub struct ActiveLocalBinding {
     binding_version: u64,
     event_author_pubkey: PublicKey,
     expires_at: Option<DateTime<Utc>>,
+    enrollment_authority: Option<(DirectEnrollmentMode, u64, [u8; 32])>,
 }
 
 impl ActiveLocalBinding {
@@ -780,7 +1437,41 @@ impl ActiveLocalBinding {
             binding_version,
             event_author_pubkey,
             expires_at,
+            enrollment_authority: None,
         })
+    }
+
+    /// Construct an immutable binding generation created by an enrollment
+    /// operation. Its provenance, policy revision and evidence digest are
+    /// rechecked against the proposal before authorization can be prepared.
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_enrollment_storage_parts(
+        authorization_domain: CommunityId,
+        issuer: String,
+        subject: String,
+        binding_id: Uuid,
+        binding_version: u64,
+        event_author_pubkey: PublicKey,
+        expires_at: Option<DateTime<Utc>>,
+        provenance_code: i16,
+        policy_revision: u64,
+        enrollment_evidence_digest: [u8; 32],
+    ) -> Option<Self> {
+        let mut binding = Self::from_storage_parts(
+            authorization_domain,
+            issuer,
+            subject,
+            binding_id,
+            binding_version,
+            event_author_pubkey,
+            expires_at,
+        )?;
+        let mode = DirectEnrollmentMode::from_database_code(provenance_code)?;
+        if policy_revision == 0 || enrollment_evidence_digest == [0; 32] {
+            return None;
+        }
+        binding.enrollment_authority = Some((mode, policy_revision, enrollment_evidence_digest));
+        Some(binding)
     }
 }
 
@@ -801,7 +1492,7 @@ enum LocalBindingResolutionKind {
         binding: ActiveLocalBinding,
     },
     Enrollment {
-        assertion: VerifiedFederatedAssertion,
+        proposal: Box<DirectEnrollmentProposal>,
         binding: ActiveLocalBinding,
     },
     Delegated {
@@ -816,9 +1507,12 @@ impl LocalBindingResolution {
         Self(LocalBindingResolutionKind::Direct { assertion, binding })
     }
 
-    /// Bind caller-owned enrollment output to its origin-sealed assertion.
-    pub fn enrollment(assertion: VerifiedFederatedAssertion, binding: ActiveLocalBinding) -> Self {
-        Self(LocalBindingResolutionKind::Enrollment { assertion, binding })
+    /// Bind enrollment output to its origin-sealed, explicitly labelled proposal.
+    pub fn enrollment(proposal: DirectEnrollmentProposal, binding: ActiveLocalBinding) -> Self {
+        Self(LocalBindingResolutionKind::Enrollment {
+            proposal: Box::new(proposal),
+            binding,
+        })
     }
 
     /// Bind an assertion-free delegation to the exact authoritative owner row.
@@ -1170,6 +1864,7 @@ pub struct AuthContext {
     binding_id: Uuid,
     binding_version: u64,
     capability: RouteCapability,
+    reason: AuthorizationReason,
     transport: ProofTransport,
     request_fingerprint: [u8; 32],
     lease: BoundedAuthorizationLease,
@@ -1201,6 +1896,11 @@ impl AuthContext {
         self.capability
     }
 
+    /// Closed stable reason for the final authorization outcome.
+    pub const fn reason(&self) -> AuthorizationReason {
+        self.reason
+    }
+
     /// Exact active direct/owner binding identifier and version.
     pub const fn binding(&self) -> (Uuid, u64) {
         (self.binding_id, self.binding_version)
@@ -1228,21 +1928,168 @@ impl fmt::Debug for AuthContext {
     }
 }
 
+/// Immutable pre-delivery authorization awaiting an exact final recheck.
+#[derive(Clone)]
+pub struct PreparedAuthorization {
+    context: AuthContext,
+    recheck: PreparedAuthorizationRecheck,
+}
+
+impl PreparedAuthorization {
+    /// Clone the exact dependency tuple that authoritative storage and the
+    /// verifier cache must recheck after all intervening I/O.
+    pub fn recheck_request(&self) -> PreparedAuthorizationRecheck {
+        self.recheck.clone()
+    }
+
+    /// Earliest exclusive expiry retained while the value is prepared.
+    pub const fn expires_at(&self) -> DateTime<Utc> {
+        self.context.lease.expires_at
+    }
+}
+
+impl fmt::Debug for PreparedAuthorization {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("PreparedAuthorization([REDACTED])")
+    }
+}
+
+/// Exact read-only dependency tuple required for final authorization.
+#[derive(Clone, PartialEq, Eq)]
+pub struct PreparedAuthorizationRecheck {
+    lease_dependencies: AuthorizationLeaseDependencySnapshot,
+    verifier_stamp: Option<VerifierPolicyStamp>,
+}
+
+impl PreparedAuthorizationRecheck {
+    /// Clone the database lease dependencies for an atomic current-state read.
+    pub fn lease_dependencies(&self) -> AuthorizationLeaseDependencySnapshot {
+        self.lease_dependencies.clone()
+    }
+
+    /// Stable policy and key generation requiring final verifier revalidation.
+    pub const fn verifier_stamp(&self) -> Option<VerifierPolicyStamp> {
+        self.verifier_stamp
+    }
+}
+
+impl fmt::Debug for PreparedAuthorizationRecheck {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("PreparedAuthorizationRecheck([REDACTED])")
+    }
+}
+
+/// Atomic database/verifier observation produced only while executing the
+/// configured final rechecker.
+#[derive(Clone)]
+pub struct AuthoritativeAuthorizationRecheck {
+    recheck: PreparedAuthorizationRecheck,
+    authoritative_now: DateTime<Utc>,
+}
+
+impl AuthoritativeAuthorizationRecheck {
+    /// Adapt one atomic local database observation and current verifier-cache
+    /// generation. This value is data, not a finalization witness: callers
+    /// cannot pass it directly to [`AuthorizationFinalizer::finalize`].
+    pub const fn from_authoritative_parts(
+        lease_dependencies: AuthorizationLeaseDependencySnapshot,
+        verifier_stamp: Option<VerifierPolicyStamp>,
+        authoritative_now: DateTime<Utc>,
+    ) -> Self {
+        Self {
+            recheck: PreparedAuthorizationRecheck {
+                lease_dependencies,
+                verifier_stamp,
+            },
+            authoritative_now,
+        }
+    }
+}
+
+impl fmt::Debug for AuthoritativeAuthorizationRecheck {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("AuthoritativeAuthorizationRecheck([REDACTED])")
+    }
+}
+
+/// Configured read-only boundary used by the finalizer after intervening I/O.
+///
+/// Implementations must atomically read the complete lease dependency tuple
+/// and authoritative database time, then include the current canonical
+/// verifier generation. They must not enroll, mutate lifecycle state or reuse
+/// the prepared tuple as their result.
+pub trait AuthorizationFinalizationRechecker: Send + Sync {
+    /// Perform the final atomic read. Storage/cache failures map to a closed,
+    /// redacted authorization error and therefore fail closed.
+    fn recheck<'a>(
+        &'a self,
+        request: &'a PreparedAuthorizationRecheck,
+    ) -> impl Future<Output = Result<AuthoritativeAuthorizationRecheck, AuthorizationError>> + Send + 'a;
+}
+
+/// One-use witness that exact dependencies were rechecked after intervening I/O.
+pub struct AuthorizationFinalizationWitness {
+    recheck: PreparedAuthorizationRecheck,
+    authoritative_now: DateTime<Utc>,
+}
+
+impl AuthorizationFinalizationWitness {
+    /// Compare authoritative post-I/O results with the prepared tuple and seal
+    /// a one-use witness. Any policy, binding, fence, proof, key-generation, or
+    /// time drift fails closed.
+    fn from_authoritative_recheck(
+        prepared: &PreparedAuthorization,
+        observation: AuthoritativeAuthorizationRecheck,
+    ) -> Result<Self, AuthorizationError> {
+        if prepared.recheck != observation.recheck {
+            return Err(AuthorizationError::StaleRecheck);
+        }
+        if !prepared
+            .context
+            .lease
+            .is_valid_at(observation.authoritative_now)
+        {
+            return Err(AuthorizationError::Expired);
+        }
+        Ok(Self {
+            recheck: observation.recheck,
+            authoritative_now: observation.authoritative_now,
+        })
+    }
+}
+
+impl fmt::Debug for AuthorizationFinalizationWitness {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("AuthorizationFinalizationWitness([REDACTED])")
+    }
+}
+
 /// The one provider-free authorization finalizer.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct AuthorizationFinalizer;
 
 impl AuthorizationFinalizer {
-    /// Recheck one protected route and compute the earliest exclusive expiry.
+    /// Execute the configured post-I/O rechecker and return a one-use witness.
+    /// The witness has no public constructor, so an ordinary caller cannot
+    /// finalize by echoing [`PreparedAuthorization::recheck_request`].
+    pub async fn recheck<R: AuthorizationFinalizationRechecker>(
+        prepared: &PreparedAuthorization,
+        rechecker: &R,
+    ) -> Result<AuthorizationFinalizationWitness, AuthorizationError> {
+        let observation = rechecker.recheck(&prepared.recheck).await?;
+        AuthorizationFinalizationWitness::from_authoritative_recheck(prepared, observation)
+    }
+
+    /// Prepare one protected route and compute the earliest exclusive expiry.
     ///
     /// Explicitly unprotected routes bypass this API. They produce no
     /// [`AuthContext`], policy lookup, fence, or lease.
-    pub fn finalize(
+    pub fn prepare(
         input: AuthorizationInput,
         resolution: LocalBindingResolution,
         policy: LocalAuthorizationPolicy,
         authoritative_now: DateTime<Utc>,
-    ) -> Result<AuthContext, AuthorizationError> {
+    ) -> Result<PreparedAuthorization, AuthorizationError> {
         if policy.authorization_domain != input.authorization_domain {
             return Err(AuthorizationError::DomainMismatch);
         }
@@ -1260,9 +2107,10 @@ impl AuthorizationFinalizer {
             relationship_id,
             relationship_revision,
             expires_at,
+            reason,
+            verifier_stamp,
         ) = match resolution.0 {
-            LocalBindingResolutionKind::Direct { assertion, binding }
-            | LocalBindingResolutionKind::Enrollment { assertion, binding } => {
+            LocalBindingResolutionKind::Direct { assertion, binding } => {
                 if assertion.authorization_domain != input.authorization_domain
                     || binding.authorization_domain != input.authorization_domain
                     || assertion.principal != binding.principal
@@ -1300,6 +2148,65 @@ impl AuthorizationFinalizer {
                     None,
                     None,
                     expires_at,
+                    AuthorizationReason::ExistingBinding,
+                    Some(assertion.verifier_stamp),
+                )
+            }
+            LocalBindingResolutionKind::Enrollment { proposal, binding } => {
+                let assertion = proposal.assertion();
+                let proposed_proof = proposal.proof();
+                let (proposal_policy_revision, proposal_evidence_digest) =
+                    proposal.local_authority();
+                if proposal.authorization_domain() != input.authorization_domain
+                    || binding.authorization_domain != input.authorization_domain
+                    || assertion.principal != binding.principal
+                    || binding.event_author_pubkey != input.proof.actor_pubkey
+                    || proposed_proof.authorization_domain != input.proof.authorization_domain
+                    || proposed_proof.actor_pubkey != input.proof.actor_pubkey
+                    || proposed_proof.transport != input.proof.transport
+                    || proposed_proof.request_fingerprint != input.proof.request_fingerprint
+                    || proposed_proof.target_fingerprint != input.proof.target_fingerprint
+                    || proposed_proof.transport_context_fingerprint
+                        != input.proof.transport_context_fingerprint
+                    || proposed_proof.bound_assertion_fingerprint
+                        != input.proof.bound_assertion_fingerprint
+                    || proposed_proof.delegation_conditions_fingerprint
+                        != input.proof.delegation_conditions_fingerprint
+                    || proposed_proof.expires_at != input.proof.expires_at
+                    || binding.enrollment_authority
+                        != Some((
+                            proposal.mode(),
+                            proposal_policy_revision,
+                            *proposal_evidence_digest,
+                        ))
+                {
+                    return Err(AuthorizationError::BindingMismatch);
+                }
+                let expires_at = Self::effective_lease_upper_bound(
+                    authoritative_now,
+                    &[
+                        Some(input.proof.expires_at),
+                        Some(assertion.expires_at),
+                        binding.expires_at,
+                        Some(policy.expires_at),
+                    ],
+                )?;
+                let reason = match proposal.mode() {
+                    DirectEnrollmentMode::Attested => AuthorizationReason::EnrolledAttestedKey,
+                    DirectEnrollmentMode::Provisioned => AuthorizationReason::EnrolledProvisioned,
+                    DirectEnrollmentMode::RiskLabelledTofu => {
+                        AuthorizationReason::EnrolledRiskLabelledTofu
+                    }
+                };
+                (
+                    None,
+                    binding.binding_id,
+                    binding.binding_version,
+                    None,
+                    None,
+                    expires_at,
+                    reason,
+                    Some(assertion.verifier_stamp),
                 )
             }
             LocalBindingResolutionKind::Delegated {
@@ -1343,11 +2250,13 @@ impl AuthorizationFinalizer {
                     Some(delegation.relationship_id),
                     Some(delegation.relationship_revision),
                     expires_at,
+                    AuthorizationReason::DelegatedOwnerBinding,
+                    None,
                 )
             }
         };
 
-        Ok(AuthContext {
+        let context = AuthContext {
             authorization_domain: input.authorization_domain,
             correlation_id: input.correlation_id,
             actor_pubkey: input.proof.actor_pubkey,
@@ -1355,6 +2264,7 @@ impl AuthorizationFinalizer {
             binding_id,
             binding_version,
             capability: input.capability,
+            reason,
             transport: input.proof.transport,
             request_fingerprint: input.proof.request_fingerprint,
             lease: BoundedAuthorizationLease {
@@ -1379,7 +2289,30 @@ impl AuthorizationFinalizer {
                 authority_epoch: policy.authority_epoch,
                 expires_at,
             },
-        })
+        };
+        let recheck = PreparedAuthorizationRecheck {
+            lease_dependencies: context.lease.dependency_snapshot(),
+            verifier_stamp,
+        };
+        Ok(PreparedAuthorization { context, recheck })
+    }
+
+    /// Consume a prepared value and its exact post-I/O witness.
+    pub fn finalize(
+        prepared: PreparedAuthorization,
+        witness: AuthorizationFinalizationWitness,
+    ) -> Result<AuthContext, AuthorizationError> {
+        if prepared.recheck != witness.recheck {
+            return Err(AuthorizationError::StaleRecheck);
+        }
+        if !prepared
+            .context
+            .lease
+            .is_valid_at(witness.authoritative_now)
+        {
+            return Err(AuthorizationError::Expired);
+        }
+        Ok(prepared.context)
     }
 
     fn effective_lease_upper_bound(
@@ -1400,7 +2333,7 @@ impl AuthorizationFinalizer {
 }
 
 /// Stable fail-closed authorization errors without credential material.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+#[derive(Clone, Copy, PartialEq, Eq, Error)]
 pub enum AuthorizationError {
     /// Input identifiers were not valid server-generated identifiers.
     #[error("invalid authorization input")]
@@ -1414,9 +2347,36 @@ pub enum AuthorizationError {
     /// Delegation, actor, owner, request, or capability did not match exactly.
     #[error("delegation mismatch")]
     DelegationMismatch,
+    /// Enrollment mode did not have its required local or signed authority.
+    #[error("enrollment authority mismatch")]
+    EnrollmentAuthorityMismatch,
+    /// A post-I/O dependency or verifier generation changed.
+    #[error("authorization recheck changed")]
+    StaleRecheck,
     /// A half-open time bound was no longer valid.
     #[error("authorization expired")]
     Expired,
+}
+
+impl AuthorizationError {
+    /// Unique stable machine code without credential or policy detail.
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::InvalidInput => "nip_fi_auth_invalid_input",
+            Self::DomainMismatch => "nip_fi_auth_domain_mismatch",
+            Self::BindingMismatch => "nip_fi_auth_binding_mismatch",
+            Self::DelegationMismatch => "nip_fi_auth_delegation_mismatch",
+            Self::EnrollmentAuthorityMismatch => "nip_fi_auth_enrollment_authority_mismatch",
+            Self::StaleRecheck => "nip_fi_auth_stale_recheck",
+            Self::Expired => "nip_fi_auth_expired",
+        }
+    }
+}
+
+impl fmt::Debug for AuthorizationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("AuthorizationError([REDACTED])")
+    }
 }
 
 #[cfg(test)]
@@ -1432,6 +2392,25 @@ mod tests {
 
     fn domain() -> CommunityId {
         CommunityId::from_uuid(Uuid::from_u128(1))
+    }
+
+    fn finalized(
+        input: AuthorizationInput,
+        resolution: LocalBindingResolution,
+        policy: LocalAuthorizationPolicy,
+        authoritative_now: DateTime<Utc>,
+    ) -> Result<AuthContext, AuthorizationError> {
+        let prepared =
+            AuthorizationFinalizer::prepare(input, resolution, policy, authoritative_now)?;
+        let rechecked = prepared.recheck_request();
+        let witness = AuthorizationFinalizationWitness::from_authoritative_recheck(
+            &prepared,
+            AuthoritativeAuthorizationRecheck {
+                recheck: rechecked,
+                authoritative_now,
+            },
+        )?;
+        AuthorizationFinalizer::finalize(prepared, witness)
     }
 
     fn proof(
@@ -1471,6 +2450,13 @@ mod tests {
     }
 
     fn policy(expires_at: DateTime<Utc>) -> LocalAuthorizationPolicy {
+        policy_for(RouteCapability::MessagesRead, expires_at)
+    }
+
+    fn policy_for(
+        capability: RouteCapability,
+        expires_at: DateTime<Utc>,
+    ) -> LocalAuthorizationPolicy {
         LocalAuthorizationPolicy::from_database(
             domain(),
             Uuid::from_u128(10),
@@ -1478,7 +2464,7 @@ mod tests {
             0,
             1,
             AuthorizationLeaseFence::from_bytes([4; 32]).unwrap(),
-            RouteCapability::MessagesRead,
+            capability,
             expires_at,
             Some(expires_at),
             None,
@@ -1498,49 +2484,26 @@ mod tests {
             AuthorizationAuditConfig::new(NipFiMode::Off, Some(fixture)),
             Err(AuthorizationAuditConfigError::UnexpectedEventCapacity)
         );
-    }
-
-    #[test]
-    fn audit_capacity_accepts_exact_hard_maxima_and_rejects_each_successor() {
-        let exact_maxima = AuthorizationEventCapacityPolicy::new(
-            HARD_MAX_AUTHORIZATION_EVENTS_PER_DOMAIN,
-            HARD_MAX_AUTHORIZATION_EVENT_BYTES_PER_DOMAIN,
-            HARD_MAX_AUTHORIZATION_EVENT_ENVELOPE_BYTES,
-        )
-        .unwrap();
-        assert_eq!(
-            exact_maxima.max_events_per_domain(),
-            HARD_MAX_AUTHORIZATION_EVENTS_PER_DOMAIN
-        );
-        assert_eq!(
-            exact_maxima.max_bytes_per_domain(),
-            HARD_MAX_AUTHORIZATION_EVENT_BYTES_PER_DOMAIN
-        );
-        assert_eq!(
-            exact_maxima.max_envelope_bytes(),
-            HARD_MAX_AUTHORIZATION_EVENT_ENVELOPE_BYTES
-        );
-
         assert_eq!(
             AuthorizationEventCapacityPolicy::new(
                 HARD_MAX_AUTHORIZATION_EVENTS_PER_DOMAIN + 1,
-                HARD_MAX_AUTHORIZATION_EVENT_BYTES_PER_DOMAIN,
-                HARD_MAX_AUTHORIZATION_EVENT_ENVELOPE_BYTES,
+                16 << 20,
+                16 << 10,
             ),
             Err(AuthorizationEventCapacityPolicyError::EventCount)
         );
         assert_eq!(
             AuthorizationEventCapacityPolicy::new(
-                HARD_MAX_AUTHORIZATION_EVENTS_PER_DOMAIN,
+                10_000,
                 HARD_MAX_AUTHORIZATION_EVENT_BYTES_PER_DOMAIN + 1,
-                HARD_MAX_AUTHORIZATION_EVENT_ENVELOPE_BYTES,
+                16 << 10,
             ),
             Err(AuthorizationEventCapacityPolicyError::DomainBytes)
         );
         assert_eq!(
             AuthorizationEventCapacityPolicy::new(
-                HARD_MAX_AUTHORIZATION_EVENTS_PER_DOMAIN,
-                HARD_MAX_AUTHORIZATION_EVENT_BYTES_PER_DOMAIN,
+                10_000,
+                16 << 20,
                 HARD_MAX_AUTHORIZATION_EVENT_ENVELOPE_BYTES + 1,
             ),
             Err(AuthorizationEventCapacityPolicyError::EnvelopeBytes)
@@ -1608,7 +2571,7 @@ mod tests {
             RouteCapability::MessagesRead,
         )
         .unwrap();
-        let context = AuthorizationFinalizer::finalize(
+        let context = finalized(
             input,
             LocalBindingResolution::direct(assertion, binding),
             policy(now() + Duration::seconds(180)),
@@ -1661,7 +2624,7 @@ mod tests {
             )
             .unwrap();
             let finalize = |proof: VerifiedNostrProof| {
-                AuthorizationFinalizer::finalize(
+                finalized(
                     AuthorizationInput::new(
                         domain(),
                         Uuid::from_u128(5),
@@ -1766,7 +2729,7 @@ mod tests {
             RouteCapability::MessagesRead,
         )
         .unwrap();
-        let context = AuthorizationFinalizer::finalize(
+        let context = finalized(
             input,
             LocalBindingResolution::delegated(delegation, owner_binding),
             policy(now() + Duration::seconds(180)),
@@ -1817,7 +2780,7 @@ mod tests {
         let finalize = |assertion: VerifiedFederatedAssertion,
                         binding: ActiveLocalBinding,
                         proof: VerifiedNostrProof| {
-            AuthorizationFinalizer::finalize(
+            finalized(
                 AuthorizationInput::new(
                     domain(),
                     Uuid::from_u128(5),
@@ -1908,7 +2871,7 @@ mod tests {
             now() + Duration::seconds(120),
         );
         let finalize = |delegation: VerifiedDelegation, proof: VerifiedNostrProof| {
-            AuthorizationFinalizer::finalize(
+            finalized(
                 AuthorizationInput::new(
                     domain(),
                     Uuid::from_u128(5),
@@ -1992,5 +2955,330 @@ mod tests {
             now() + Duration::seconds(80),
         )
         .is_none());
+    }
+
+    #[test]
+    fn invite_mint_and_claim_are_non_substitutable() {
+        let owner = Keys::generate().public_key();
+        let delegate = Keys::generate().public_key();
+        let principal = FederatedPrincipal::from_verified_parts(
+            "https://issuer.example".into(),
+            "owner-subject".into(),
+        )
+        .unwrap();
+        let owner_binding = ActiveLocalBinding::from_storage(
+            domain(),
+            principal,
+            Uuid::from_u128(6),
+            1,
+            owner,
+            None,
+        )
+        .unwrap();
+        let delegation = VerifiedDelegation::from_verifier(
+            domain(),
+            owner,
+            delegate,
+            ProofTransport::Nip42,
+            Uuid::from_u128(7),
+            1,
+            vec![RouteCapability::InviteMint],
+            [11; 32],
+            [8; 32],
+            [3; 32],
+            [9; 32],
+            now() + Duration::minutes(1),
+        )
+        .unwrap();
+        let result = finalized(
+            AuthorizationInput::new(
+                domain(),
+                Uuid::from_u128(5),
+                proof(delegate, None, Some([11; 32]), now() + Duration::minutes(1)),
+                RouteCapability::InviteClaim,
+            )
+            .unwrap(),
+            LocalBindingResolution::delegated(delegation, owner_binding),
+            policy_for(RouteCapability::InviteClaim, now() + Duration::minutes(1)),
+            now(),
+        );
+        assert!(matches!(
+            result,
+            Err(AuthorizationError::DelegationMismatch)
+        ));
+    }
+
+    #[test]
+    fn reasons_and_errors_have_unique_stable_codes_and_redacted_debug() {
+        use std::collections::HashSet;
+
+        let reasons = [
+            AuthorizationReason::ExistingBinding,
+            AuthorizationReason::EnrolledAttestedKey,
+            AuthorizationReason::EnrolledProvisioned,
+            AuthorizationReason::EnrolledRiskLabelledTofu,
+            AuthorizationReason::DelegatedOwnerBinding,
+        ];
+        assert_eq!(
+            reasons
+                .iter()
+                .map(|reason| reason.code())
+                .collect::<HashSet<_>>()
+                .len(),
+            reasons.len()
+        );
+        for reason in reasons {
+            assert_eq!(format!("{reason:?}"), "AuthorizationReason([REDACTED])");
+        }
+
+        let errors = [
+            AuthorizationError::InvalidInput,
+            AuthorizationError::DomainMismatch,
+            AuthorizationError::BindingMismatch,
+            AuthorizationError::DelegationMismatch,
+            AuthorizationError::EnrollmentAuthorityMismatch,
+            AuthorizationError::StaleRecheck,
+            AuthorizationError::Expired,
+        ];
+        assert_eq!(
+            errors
+                .iter()
+                .map(|error| error.code())
+                .collect::<HashSet<_>>()
+                .len(),
+            errors.len()
+        );
+        for error in errors {
+            assert_eq!(format!("{error:?}"), "AuthorizationError([REDACTED])");
+        }
+
+        let verifier_errors = [
+            CanonicalVerifierError::InvalidPolicy,
+            CanonicalVerifierError::MalformedInput,
+            CanonicalVerifierError::InvalidToken,
+            CanonicalVerifierError::UnsupportedAlgorithm,
+            CanonicalVerifierError::MissingKeyId,
+            CanonicalVerifierError::UnknownKeyId,
+            CanonicalVerifierError::InvalidKey,
+            CanonicalVerifierError::InvalidClaim,
+            CanonicalVerifierError::InvalidTimeBounds,
+        ];
+        assert_eq!(
+            verifier_errors
+                .iter()
+                .map(|error| error.code())
+                .collect::<HashSet<_>>()
+                .len(),
+            verifier_errors.len()
+        );
+    }
+
+    #[test]
+    fn prepared_authorization_requires_exact_post_io_witness() {
+        let actor = Keys::generate().public_key();
+        let principal = FederatedPrincipal::from_verified_parts(
+            "https://issuer.example".into(),
+            "opaque-subject".into(),
+        )
+        .unwrap();
+        let assertion = VerifiedFederatedAssertion::from_verifier(
+            domain(),
+            principal.clone(),
+            ProofTransport::Nip42,
+            [2; 32],
+            [8; 32],
+            [3; 32],
+            [9; 32],
+            now() - Duration::seconds(1),
+            now() + Duration::seconds(30),
+        )
+        .unwrap();
+        let binding = ActiveLocalBinding::from_storage(
+            domain(),
+            principal,
+            Uuid::from_u128(6),
+            1,
+            actor,
+            None,
+        )
+        .unwrap();
+        let prepared = AuthorizationFinalizer::prepare(
+            AuthorizationInput::new(
+                domain(),
+                Uuid::from_u128(5),
+                proof(actor, Some([2; 32]), None, now() + Duration::seconds(30)),
+                RouteCapability::MessagesRead,
+            )
+            .unwrap(),
+            LocalBindingResolution::direct(assertion, binding),
+            policy(now() + Duration::seconds(30)),
+            now(),
+        )
+        .unwrap();
+
+        let mut changed = prepared.recheck_request();
+        changed.lease_dependencies.policy_revision += 1;
+        assert!(matches!(
+            AuthorizationFinalizationWitness::from_authoritative_recheck(
+                &prepared,
+                AuthoritativeAuthorizationRecheck {
+                    recheck: changed,
+                    authoritative_now: now() + Duration::seconds(1),
+                },
+            ),
+            Err(AuthorizationError::StaleRecheck)
+        ));
+
+        let mut rotated = prepared.recheck_request();
+        rotated.verifier_stamp = Some(VerifierPolicyStamp::new(
+            CanonicalVerifierPolicyId([1; 32]),
+            VerifierKeyGeneration(2),
+        ));
+        assert!(matches!(
+            AuthorizationFinalizationWitness::from_authoritative_recheck(
+                &prepared,
+                AuthoritativeAuthorizationRecheck {
+                    recheck: rotated,
+                    authoritative_now: now() + Duration::seconds(1),
+                },
+            ),
+            Err(AuthorizationError::StaleRecheck)
+        ));
+
+        assert!(matches!(
+            AuthorizationFinalizationWitness::from_authoritative_recheck(
+                &prepared,
+                AuthoritativeAuthorizationRecheck {
+                    recheck: prepared.recheck_request(),
+                    authoritative_now: prepared.expires_at(),
+                },
+            ),
+            Err(AuthorizationError::Expired)
+        ));
+    }
+
+    #[test]
+    fn enrollment_proposals_are_sealed_and_explicitly_label_risk() {
+        let actor = Keys::generate().public_key();
+        let principal = FederatedPrincipal::from_verified_parts(
+            "https://issuer.example".into(),
+            "opaque-subject".into(),
+        )
+        .unwrap();
+        let mut assertion = VerifiedFederatedAssertion::from_verifier(
+            domain(),
+            principal.clone(),
+            ProofTransport::Nip42,
+            [2; 32],
+            [8; 32],
+            [3; 32],
+            [9; 32],
+            now() - Duration::seconds(1),
+            now() + Duration::minutes(1),
+        )
+        .unwrap();
+        assertion.attested_event_author_pubkey = Some(actor);
+        let proof = proof(actor, Some([2; 32]), None, now() + Duration::minutes(1));
+
+        for mode in [
+            DirectEnrollmentMode::Attested,
+            DirectEnrollmentMode::Provisioned,
+            DirectEnrollmentMode::RiskLabelledTofu,
+        ] {
+            let authority = LocalEnrollmentAuthority::from_database_parts(
+                domain(),
+                principal.issuer.clone(),
+                principal.subject.clone(),
+                actor,
+                mode.database_code(),
+                7,
+                [7; 32],
+            )
+            .unwrap();
+            let proposal = DirectEnrollmentProposal::from_verified_evidence(
+                authority,
+                assertion.clone(),
+                proof.clone(),
+                now(),
+            )
+            .unwrap();
+            assert_eq!(proposal.mode(), mode);
+            assert_eq!(
+                format!("{proposal:?}"),
+                "DirectEnrollmentProposal([REDACTED])"
+            );
+        }
+
+        assertion.attested_event_author_pubkey = Some(Keys::generate().public_key());
+        let authority = LocalEnrollmentAuthority::from_database_parts(
+            domain(),
+            principal.issuer,
+            principal.subject,
+            actor,
+            DirectEnrollmentMode::Attested.database_code(),
+            7,
+            [7; 32],
+        )
+        .unwrap();
+        assert!(matches!(
+            DirectEnrollmentProposal::from_verified_evidence(authority, assertion, proof, now(),),
+            Err(AuthorizationError::EnrollmentAuthorityMismatch)
+        ));
+    }
+
+    #[test]
+    fn verifier_policy_identifier_excludes_key_generation() {
+        let policy = CanonicalVerifierPolicy::new(
+            "https://issuer.example".to_owned(),
+            "buzz".to_owned(),
+            "sub".to_owned(),
+            Some("npub".to_owned()),
+            60,
+            3_600,
+        )
+        .unwrap();
+        let policy_again = CanonicalVerifierPolicy::new(
+            "https://issuer.example".to_owned(),
+            "buzz".to_owned(),
+            "sub".to_owned(),
+            Some("npub".to_owned()),
+            60,
+            3_600,
+        )
+        .unwrap();
+        assert_eq!(policy.id(), policy_again.id());
+        assert_ne!(
+            VerifierPolicyStamp::new(policy.id(), VerifierKeyGeneration(1)),
+            VerifierPolicyStamp::new(policy.id(), VerifierKeyGeneration(2))
+        );
+        assert_eq!(format!("{policy:?}"), "CanonicalVerifierPolicy([REDACTED])");
+        assert!(VerifierKeyGeneration::new(0).is_none());
+        assert!(CanonicalVerifierPolicy::new(
+            String::new(),
+            "buzz".to_owned(),
+            "sub".to_owned(),
+            None,
+            60,
+            3_600,
+        )
+        .is_err());
+
+        let verifier = CanonicalFederatedAssertionVerifier::new(policy);
+        let key_set = CanonicalVerifierKeySet::new(
+            VerifierKeyGeneration::new(1).unwrap(),
+            JwkSet { keys: Vec::new() },
+        );
+        assert!(matches!(
+            verifier.verify(
+                "malformed",
+                &key_set,
+                domain(),
+                ProofTransport::Nip42,
+                [1; 32],
+                [2; 32],
+                [3; 32],
+            ),
+            Err(CanonicalVerifierError::InvalidToken)
+        ));
     }
 }

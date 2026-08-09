@@ -1388,7 +1388,7 @@ mod tests {
             remote_addr: "127.0.0.1:1234".parse().expect("socket addr"),
             corporate_identity_jwt: None,
             auth_state: RwLock::new(crate::connection::AuthState::Authenticated(
-                buzz_auth::ConnectionAuthContext {
+                buzz_auth::AuthContext {
                     pubkey: agent.public_key(),
                     scopes: vec![],
                     channel_ids: None,

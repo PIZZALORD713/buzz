@@ -12,16 +12,14 @@
 //! ## Security invariants
 //!
 //! - **AUTH events (kind:22242) are NEVER stored or logged.**
-//! - NIP-42/NIP-98 produce a [`ConnectionAuthContext`] authentication shim.
-//! - Protected routes receive only the immutable context produced by the one
-//!   provider-free authorization finalizer.
+//! - All paths produce an [`AuthContext`] bound to the connection.
 //! - No JWT validation, no token management, no IdP runtime dependency.
 
 /// Channel access checking trait and helpers.
 pub mod access;
 /// Authentication error types.
 pub mod error;
-/// Provider-free local authorization composition.
+/// Provider-free authorization composition and sealed verifier evidence.
 pub mod foundation;
 /// NIP-42 challenge–response authentication.
 pub mod nip42;
@@ -37,17 +35,24 @@ pub mod scope;
 pub use access::{check_read_access, check_write_access, require_scope, ChannelAccessChecker};
 pub use error::AuthError;
 pub use foundation::{
-    ActiveLocalBinding, AuthContext, AuthorizationAuditConfig, AuthorizationAuditConfigError,
-    AuthorizationError, AuthorizationEventCapacityPolicy, AuthorizationEventCapacityPolicyError,
-    AuthorizationFinalizer, AuthorizationInput, AuthorizationLeaseDependencySnapshot,
-    BindingResolutionRequest, BoundedAuthorizationLease, CurrentBindingStatusEvidenceRequest,
-    FederatedPrincipal, FederatedPrincipalStorageKey, LocalAuthorizationPolicy,
-    LocalBindingResolution, LocalBindingResolver, LocalBindingResolverCapability, NipFiMode,
+    ActiveLocalBinding, AuthContext as FinalizedAuthContext, AuthoritativeAuthorizationRecheck,
+    AuthorizationAuditConfig, AuthorizationAuditConfigError, AuthorizationError,
+    AuthorizationEventCapacityPolicy, AuthorizationEventCapacityPolicyError,
+    AuthorizationFinalizationRechecker, AuthorizationFinalizationWitness, AuthorizationFinalizer,
+    AuthorizationInput, AuthorizationLeaseDependencySnapshot, AuthorizationReason,
+    BindingResolutionRequest, BoundedAuthorizationLease, CanonicalFederatedAssertionVerifier,
+    CanonicalVerifierError, CanonicalVerifierKeySet, CanonicalVerifierPolicy,
+    CanonicalVerifierPolicyId, CurrentBindingStatusEvidenceRequest, DirectEnrollmentMode,
+    DirectEnrollmentProposal, FederatedPrincipalStorageKey, LocalAuthorizationPolicy,
+    LocalBindingResolution, LocalBindingResolver, LocalBindingResolverCapability,
+    LocalEnrollmentAuthority, NipFiMode, PreparedAuthorization, PreparedAuthorizationRecheck,
     ProofTransport, RouteCapability, RouteProtection, VerifiedDelegation,
-    VerifiedFederatedAssertion, VerifiedNostrProof, HARD_MAX_AUTHORIZATION_EVENTS_PER_DOMAIN,
-    HARD_MAX_AUTHORIZATION_EVENT_BYTES_PER_DOMAIN, HARD_MAX_AUTHORIZATION_EVENT_ENVELOPE_BYTES,
+    VerifiedFederatedAssertion, VerifiedNostrProof, VerifierKeyGeneration, VerifierPolicyStamp,
 };
-pub use nip42::{generate_challenge, verify_nip42_event};
+pub use nip42::{
+    generate_challenge, verify_nip42_authorization_proof, verify_nip42_event,
+    Nip42AuthorizationProofError,
+};
 pub use nip98::verify_nip98_event;
 pub use nip98_replay::{
     nip98_replay_key, nip98_replay_key_for_scope, Nip98ReplayGuard, DEFAULT_REPLAY_TTL_SECS,
@@ -74,12 +79,9 @@ pub enum AuthMethod {
     Nip98,
 }
 
-/// Transitional NIP-42/NIP-98 authentication state bound to a connection.
-///
-/// This is a migration shim, not a finalized authorization decision. It
-/// cannot carry a protected-route binding, policy decision, or lease.
+/// The result of a successful authentication, bound to a connection.
 #[derive(Debug, Clone)]
-pub struct ConnectionAuthContext {
+pub struct AuthContext {
     /// The authenticated Nostr public key.
     pub pubkey: nostr::PublicKey,
     /// Permission scopes granted to this connection.
@@ -97,7 +99,7 @@ pub struct ConnectionAuthContext {
     pub agent_owner_pubkey: Option<nostr::PublicKey>,
 }
 
-impl ConnectionAuthContext {
+impl AuthContext {
     /// Returns `true` if this context includes the given [`Scope`].
     pub fn has_scope(&self, scope: &Scope) -> bool {
         self.scopes.contains(scope)
@@ -130,7 +132,7 @@ impl AuthService {
         &self.config
     }
 
-    /// Verify a NIP-42 AUTH event and return a [`ConnectionAuthContext`].
+    /// Verify a NIP-42 AUTH event and return an [`AuthContext`].
     ///
     /// Pure cryptographic verification — no network calls, no JWT, no tokens.
     pub async fn verify_auth_event(
@@ -138,7 +140,7 @@ impl AuthService {
         auth_event: nostr::Event,
         expected_challenge: &str,
         relay_url: &str,
-    ) -> Result<ConnectionAuthContext, AuthError> {
+    ) -> Result<AuthContext, AuthError> {
         // Verify NIP-42 signature (spawn_blocking for CPU-bound Schnorr verify)
         let event_clone = auth_event.clone();
         let challenge_owned = expected_challenge.to_string();
@@ -151,7 +153,7 @@ impl AuthService {
 
         // In pure Nostr mode, all authenticated connections get full scopes.
         // Per-channel access is enforced by the relay's membership checks (NIP-29).
-        Ok(ConnectionAuthContext {
+        Ok(AuthContext {
             pubkey: auth_event.pubkey,
             scopes: Scope::all_known(),
             channel_ids: None,
@@ -203,7 +205,7 @@ mod tests {
     #[test]
     fn auth_context_scope_check() {
         let keys = Keys::generate();
-        let ctx = ConnectionAuthContext {
+        let ctx = AuthContext {
             pubkey: keys.public_key(),
             scopes: vec![Scope::MessagesRead, Scope::ChannelsRead],
             channel_ids: None,

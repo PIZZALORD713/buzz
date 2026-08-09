@@ -29,6 +29,8 @@ pub mod feed;
 pub mod git_repo;
 /// Corporate identity binding persistence.
 pub mod identity_binding;
+/// Canonical identity lifecycle advisory-lock helpers.
+pub mod identity_lifecycle;
 /// Embedded database migrations.
 pub mod migration;
 /// Community moderation: reports, bans/timeouts, audit actions.
