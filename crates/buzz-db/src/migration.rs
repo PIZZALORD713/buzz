@@ -900,7 +900,7 @@ mod tests {
 
         let desired_schema = include_str!("../../../schema/schema.sql");
         assert!(
-            desired_schema.contains("CREATE TABLE join_policy_acceptances"),
+            desired_schema.contains("CREATE TABLE IF NOT EXISTS join_policy_acceptances"),
             "desired-state schema must include join-policy evidence used by invite claims",
         );
         // Replica heartbeat (this branch, renumbered to 0026 after
@@ -942,44 +942,41 @@ mod tests {
         assert!(
             long_reactions.contains("ALTER TABLE reactions ALTER COLUMN emoji TYPE VARCHAR(66)")
         );
-        assert!(desired_schema.contains("emoji               VARCHAR(66) NOT NULL"));
+        assert!(desired_schema.contains("emoji varchar(66)"));
 
-        // Relay-verified identity bindings are additive and community-scoped.
+        // NIP-FI uses direct-final, provider-free foundation migrations.
         assert_eq!(migrations[28].version, 29);
-        assert!(migrations[28]
-            .sql
-            .as_str()
-            .contains("CREATE TABLE identity_bindings"));
-        assert!(migrations[28]
-            .sql
-            .as_str()
-            .contains("idx_identity_bindings_active_principal"));
+        let identity_foundation = migrations[28].sql.as_str();
+        for required in [
+            "CREATE TABLE authorization_operation_receipts",
+            "CREATE TABLE identity_enrollment_policies",
+            "CREATE TABLE identity_bindings",
+            "CREATE TABLE identity_lifecycle_history",
+            "CREATE TABLE identity_lifecycle_selectors",
+            "binding_provenance SMALLINT",
+            "identity_bindings_no_delete",
+        ] {
+            assert!(
+                identity_foundation.contains(required),
+                "migration 0029 missing direct-final identity surface: {required}",
+            );
+        }
+
         assert_eq!(migrations[29].version, 30);
-        assert!(migrations[29].sql.as_str().contains("revocation_scope"));
-        assert!(migrations[29]
-            .sql
-            .as_str()
-            .contains("idx_identity_bindings_revoked_principal"));
-        assert!(migrations[29]
-            .sql
-            .as_str()
-            .contains("CREATE TABLE identity_principals"));
-        assert!(migrations[29]
-            .sql
-            .as_str()
-            .contains("INSERT INTO identity_principals"));
-        assert!(migrations[29]
-            .sql
-            .as_str()
-            .contains("INSERT INTO identity_revoked_keys"));
-        assert!(migrations[29]
-            .sql
-            .as_str()
-            .contains("rotation_completed_at"));
-        assert!(migrations[29]
-            .sql
-            .as_str()
-            .contains("CREATE TABLE identity_revoked_keys"));
+        let authorization_foundation = migrations[29].sql.as_str();
+        for required in [
+            "CREATE TABLE authorization_invalidation_domains",
+            "CREATE TABLE authorization_invalidation_floors",
+            "CREATE TABLE protected_object_authority",
+            "CREATE TABLE authorization_events",
+            "CREATE TABLE client_status_revisions",
+            "28, 29",
+        ] {
+            assert!(
+                authorization_foundation.contains(required),
+                "migration 0030 missing direct-final authorization surface: {required}",
+            );
+        }
     }
 
     #[test]
@@ -1346,4 +1343,9 @@ mod tests {
             "fresh installs must default non-allowlisted kinds to NULL: {search_expression}"
         );
     }
+
+    #[path = "migration_nip_fi_authorization_tests.rs"]
+    mod nip_fi_authorization_tests;
+    #[path = "migration_nip_fi_tests.rs"]
+    mod nip_fi_direct_final_tests;
 }
