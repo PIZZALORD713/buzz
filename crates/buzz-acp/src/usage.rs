@@ -292,10 +292,9 @@ pub(crate) struct UsageTracker {
     /// current turn observes `accumulated_input_tokens: None`. Monotonically
     /// grows (never cleared mid-turn); reset to `false` by `begin_turn()`.
     /// At `take()` this value is OR-ed into the session's `input_ever_poisoned`
-    /// flag, creating or updating the session entry as needed. This ensures
-    /// the poison is captured even for un-baselined sessions (the
-    /// attach-to-existing path that skips `seed_zero_baseline` and therefore
-    /// starts with no entry in `self.sessions`).
+    /// flag, creating or updating the session entry as needed. If `take()` is
+    /// never called before the next `begin_turn()`, the flush is performed at
+    /// `begin_turn()` time instead, so no observed absence is ever discarded.
     input_absence_observed: bool,
     /// Per-in-flight-turn fold accumulator for output-field absence.
     /// Symmetric contract to `input_absence_observed`.
@@ -309,7 +308,66 @@ impl UsageTracker {
     /// in-flight. Must be called before the corresponding `session/prompt`
     /// request is sent so that setup notifications received before this call
     /// do not become publishable for this turn.
+    ///
+    /// If the previous turn's fold accumulators hold observed absences and
+    /// `take()` was never called (e.g. the initial-message path calls
+    /// `begin_turn` twice without a `take()` between them), those absences are
+    /// committed here into the previous in-flight session's sticky
+    /// `*_ever_poisoned` state before the accumulators are reset.  This
+    /// prevents the "take-skipped turn" escape: observed absences are
+    /// impossible to discard regardless of whether `take()` was called.
     pub(crate) fn begin_turn(&mut self, session_id: &str) {
+        // Flush any outstanding fold state from the previous in-flight turn
+        // into the previous session's entry BEFORE resetting the accumulators.
+        //
+        // This closes two discard points:
+        //   1. **Take-skipped same-session** — `begin_turn("s")` called twice
+        //      without a `take()` in between (the initial-message path in
+        //      pool.rs does exactly this).
+        //   2. **Cross-session** — session A's turn observed absences, then
+        //      `begin_turn("B")` runs next.  A's poison must survive.
+        //
+        // The fold accumulators can only be non-false when `in_flight_session`
+        // is Some, because only in-flight `record()` calls set them.  The outer
+        // guard is a performance short-circuit (skip the map lookup on the
+        // common no-absence path); correctness does not depend on it.
+        if self.input_absence_observed || self.output_absence_observed {
+            if let Some(ref prev_session) = self.in_flight_session {
+                let key = prev_session.clone();
+                let existing = self.sessions.get(key.as_str());
+                let input_ever_poisoned =
+                    existing.is_some_and(|s| s.input_ever_poisoned) || self.input_absence_observed;
+                let output_ever_poisoned = existing.is_some_and(|s| s.output_ever_poisoned)
+                    || self.output_absence_observed;
+                let (published_seq, last_input, last_output, last_cost, last_total, lci, lcw) =
+                    match existing {
+                        Some(s) => (
+                            s.published_seq,
+                            s.last_input,
+                            s.last_output,
+                            s.last_cost,
+                            s.last_total,
+                            s.last_cached_input,
+                            s.last_cache_write,
+                        ),
+                        None => (0, None, None, None, None, None, None),
+                    };
+                self.sessions.insert(
+                    key,
+                    SessionState {
+                        published_seq,
+                        last_input,
+                        last_output,
+                        last_cost,
+                        last_total,
+                        last_cached_input: lci,
+                        last_cache_write: lcw,
+                        input_ever_poisoned,
+                        output_ever_poisoned,
+                    },
+                );
+            }
+        }
         self.in_flight_session = Some(session_id.to_string());
         self.pending = None;
         self.pending_identity = None;
@@ -2690,6 +2748,97 @@ mod tests {
         assert!(
             !t2.delta_reliable,
             "t2: absence was observed in t1 — sticky poison must hold"
+        );
+    }
+
+    /// Take-skipped same-session: `begin_turn("s")` is called twice without
+    /// a `take()` in between (the initial-message path in pool.rs does this).
+    /// An absence observed in the skipped turn must NOT be discarded — the
+    /// next real turn must stay unreliable.
+    ///
+    /// This is Paul's probe that FAILED at 762e47bd31.  The fold accumulators
+    /// were only committed in `take()`, so a skipped `take()` silently dropped
+    /// the observed absence.  The fix flushes in `begin_turn()` instead.
+    #[test]
+    fn take_skipped_turn_input_absence_survives_to_next_turn() {
+        let mut t = UsageTracker::default();
+        t.seed_zero_baseline("s");
+        t.begin_turn("s");
+        t.record("s", &payload_opt(None, Some(10))); // absence observed in init turn
+                                                     // NO take() — init-message path goes straight to the next begin_turn
+        t.begin_turn("s");
+        t.record("s", &payload_opt(Some(100), Some(20)));
+        let t2 = t.take().expect("t2");
+        assert!(
+            !t2.delta_reliable,
+            "absence must survive a skipped take() (input)"
+        );
+    }
+
+    /// Symmetric output-field case for the take-skipped escape.
+    #[test]
+    fn take_skipped_turn_output_absence_survives_to_next_turn() {
+        let mut t = UsageTracker::default();
+        t.seed_zero_baseline("s");
+        t.begin_turn("s");
+        t.record("s", &payload_opt(Some(10), None)); // absence observed in init turn: output absent
+                                                     // NO take() — init-message path goes straight to the next begin_turn
+        t.begin_turn("s");
+        t.record("s", &payload_opt(Some(100), Some(20)));
+        let t2 = t.take().expect("t2");
+        assert!(
+            !t2.delta_reliable,
+            "absence must survive a skipped take() (output)"
+        );
+    }
+
+    /// Cross-session take-skipped: session A's turn observed an absence, then
+    /// `begin_turn("B")` runs next (no take() for A).  A's poison must survive
+    /// — when A is next in-flight its delta must still be unreliable.
+    #[test]
+    fn cross_session_take_skipped_input_absence_survives() {
+        let mut t = UsageTracker::default();
+        t.seed_zero_baseline("a");
+        t.seed_zero_baseline("b");
+        // Session A's turn: observe absence (no take)
+        t.begin_turn("a");
+        t.record("a", &payload_opt(None, Some(10))); // input absence observed for A
+                                                     // Session B starts — no take() for A
+        t.begin_turn("b");
+        t.record("b", &payload_opt(Some(50), Some(5)));
+        let tb = t.take().expect("tb");
+        assert!(tb.delta_reliable, "session B must still be reliable");
+        // Session A resumes — poison must hold
+        t.begin_turn("a");
+        t.record("a", &payload_opt(Some(100), Some(20)));
+        let ta = t.take().expect("ta");
+        assert!(
+            !ta.delta_reliable,
+            "session A: absence observed before cross-session begin_turn must hold"
+        );
+    }
+
+    /// Symmetric output-field cross-session case.
+    #[test]
+    fn cross_session_take_skipped_output_absence_survives() {
+        let mut t = UsageTracker::default();
+        t.seed_zero_baseline("a");
+        t.seed_zero_baseline("b");
+        // Session A's turn: observe output absence (no take)
+        t.begin_turn("a");
+        t.record("a", &payload_opt(Some(10), None)); // output absence observed for A
+                                                     // Session B starts — no take() for A
+        t.begin_turn("b");
+        t.record("b", &payload_opt(Some(50), Some(5)));
+        let tb = t.take().expect("tb");
+        assert!(tb.delta_reliable, "session B must still be reliable");
+        // Session A resumes — poison must hold
+        t.begin_turn("a");
+        t.record("a", &payload_opt(Some(100), Some(20)));
+        let ta = t.take().expect("ta");
+        assert!(
+            !ta.delta_reliable,
+            "session A: output absence observed before cross-session begin_turn must hold"
         );
     }
 }
