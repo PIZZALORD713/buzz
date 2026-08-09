@@ -3100,7 +3100,7 @@ mod tests {
         t.seed_zero_baseline("b");
         // A has NO entry at all.
         assert!(
-            t.sessions.get("a").is_none(),
+            !t.sessions.contains_key("a"),
             "A must have no entry before the cross-session record"
         );
 
@@ -3176,7 +3176,7 @@ mod tests {
         let mut t = UsageTracker::default();
         t.seed_zero_baseline("b");
         assert!(
-            t.sessions.get("a").is_none(),
+            !t.sessions.contains_key("a"),
             "A must have no entry before the cross-session record"
         );
 
