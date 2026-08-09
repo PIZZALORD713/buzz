@@ -47,10 +47,11 @@ CREATE TABLE authorization_invalidation_floors (
 );
 
 -- Protected-object kinds: 1 domain, 2 channel, 3 repository, 4 media,
--- 5 moderation target, 6 audio session, 7 binding status.
+-- 5 moderation target, 6 audio session. Kind 7 is retired: current binding
+-- status is connection-local evidence and never a durable protected object.
 CREATE TABLE authorization_authority_epochs (
     community_id UUID NOT NULL REFERENCES communities(id),
-    object_kind SMALLINT NOT NULL CHECK (object_kind IN (1, 2, 3, 4, 5, 6, 7)),
+    object_kind SMALLINT NOT NULL CHECK (object_kind IN (1, 2, 3, 4, 5, 6)),
     object_key BYTEA NOT NULL CHECK (octet_length(object_key) = 32),
     authority_epoch BIGINT NOT NULL CHECK (authority_epoch > 0),
     fence BYTEA NOT NULL CHECK (
@@ -80,7 +81,7 @@ CREATE TABLE authorization_authority_epochs (
 -- exact source re-fenced immediately before a protected mutation or emission.
 CREATE TABLE protected_object_authority (
     community_id UUID NOT NULL REFERENCES communities(id),
-    object_kind SMALLINT NOT NULL CHECK (object_kind IN (1, 2, 3, 4, 5, 6, 7)),
+    object_kind SMALLINT NOT NULL CHECK (object_kind IN (1, 2, 3, 4, 5, 6)),
     object_key BYTEA NOT NULL CHECK (octet_length(object_key) = 32),
     capability SMALLINT NOT NULL CHECK (
         capability IN (
@@ -153,74 +154,6 @@ CREATE TABLE protected_object_authority (
     )
 );
 
--- Epoch-free kind-24244 status revision history. There is deliberately no
--- 24245 ClientBindingEpoch/bootstrap/connection field here.
--- disposition: 1 current, 2 withdrawn.
-CREATE TABLE client_status_revisions (
-    community_id UUID NOT NULL REFERENCES communities(id),
-    event_author_pubkey BYTEA NOT NULL CHECK (octet_length(event_author_pubkey) = 32),
-    revision BIGINT NOT NULL CHECK (revision > 0),
-    disposition SMALLINT NOT NULL CHECK (disposition IN (1, 2)),
-    binding_id UUID,
-    binding_version BIGINT CHECK (binding_version IS NULL OR binding_version > 0),
-    policy_revision BIGINT CHECK (policy_revision IS NULL OR policy_revision > 0),
-    invalidation_generation BIGINT CHECK (
-        invalidation_generation IS NULL OR invalidation_generation >= 0
-    ),
-    authority_epoch BIGINT CHECK (authority_epoch IS NULL OR authority_epoch > 0),
-    fence BYTEA CHECK (
-        fence IS NULL
-        OR (octet_length(fence) = 32 AND fence <> decode(repeat('00', 32), 'hex'))
-    ),
-    observed_at TIMESTAMPTZ,
-    fresh_until TIMESTAMPTZ,
-    supersedes_revision BIGINT CHECK (supersedes_revision IS NULL OR supersedes_revision > 0),
-    receipt_digest BYTEA NOT NULL CHECK (octet_length(receipt_digest) = 32),
-    operation_id UUID NOT NULL,
-    request_fingerprint BYTEA NOT NULL CHECK (octet_length(request_fingerprint) = 32),
-    recorded_at TIMESTAMPTZ NOT NULL DEFAULT transaction_timestamp(),
-    PRIMARY KEY (community_id, event_author_pubkey, revision),
-    UNIQUE (community_id, operation_id),
-    FOREIGN KEY (community_id, operation_id, request_fingerprint)
-        REFERENCES authorization_operation_receipts
-            (community_id, operation_id, request_fingerprint)
-        DEFERRABLE INITIALLY DEFERRED,
-    FOREIGN KEY (community_id, binding_id, binding_version)
-        REFERENCES identity_bindings (community_id, binding_id, binding_version)
-        DEFERRABLE INITIALLY DEFERRED,
-    FOREIGN KEY (community_id, event_author_pubkey, supersedes_revision)
-        REFERENCES client_status_revisions (community_id, event_author_pubkey, revision)
-        DEFERRABLE INITIALLY DEFERRED,
-    CHECK (
-        (disposition = 1
-            AND binding_id IS NOT NULL
-            AND binding_version IS NOT NULL
-            AND policy_revision IS NOT NULL
-            AND invalidation_generation IS NOT NULL
-            AND authority_epoch IS NOT NULL
-            AND fence IS NOT NULL
-            AND observed_at IS NOT NULL
-            AND fresh_until IS NOT NULL
-            AND supersedes_revision IS NULL
-            AND observed_at < fresh_until
-            AND fresh_until <= observed_at + INTERVAL '300 seconds')
-        OR (disposition = 2
-            AND binding_id IS NULL
-            AND binding_version IS NULL
-            AND policy_revision IS NULL
-            AND invalidation_generation IS NULL
-            AND authority_epoch IS NULL
-            AND fence IS NULL
-            AND observed_at IS NULL
-            AND fresh_until IS NULL
-            AND supersedes_revision IS NOT NULL
-            AND supersedes_revision < revision)
-    )
-);
-
-CREATE INDEX client_status_revisions_current_lookup
-    ON client_status_revisions (community_id, event_author_pubkey, revision DESC);
-
 -- Explicit immutable-capacity policy required by Enforce mode. Hard ceilings
 -- match buzz-auth; installation limits must be sized explicitly below them.
 -- V1 has no online pruning/export/reset workflow.
@@ -256,14 +189,15 @@ CREATE TABLE authorization_event_capacity (
 -- Durable versioned pseudonymous authorization envelope. event_kind:
 -- 1 enrolled, 2 revoked, 3 rotated, 4 recovered, 5 principal enabled,
 -- 6 retired, 7 principal disabled, 8 admission lost, 9 operator denied,
--- 10 protected allowed, 11 protected denied, 12 status published,
--- 13 status withdrawn, 14 invalidation advanced.
+-- 10 protected allowed, 11 protected denied, 14 invalidation advanced.
+-- Kinds 12 and 13 are retired: kind 24244 publication/withdrawal is ephemeral
+-- connection state and never a durable authorization event.
 CREATE TABLE authorization_events (
     community_id UUID NOT NULL REFERENCES communities(id),
     event_id UUID NOT NULL,
     schema_version SMALLINT NOT NULL DEFAULT 1 CHECK (schema_version = 1),
     event_kind SMALLINT NOT NULL CHECK (
-        event_kind IN (1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14)
+        event_kind IN (1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 14)
     ),
     outcome_code SMALLINT NOT NULL CHECK (outcome_code IN (1, 2, 3, 4, 5)),
     reason_code SMALLINT NOT NULL CHECK (
@@ -365,12 +299,13 @@ CREATE TABLE authorization_operation_version_delta_manifests (
 );
 
 -- component_kind: 1 binding version, 2 policy revision,
--- 3 invalidation generation, 4 authority epoch, 5 client-status revision,
--- 6 delegated-relationship revision, 7 lifecycle-selector generation.
+-- 3 invalidation generation, 4 authority epoch, 6 delegated-relationship
+-- revision, 7 lifecycle-selector generation. Kind 5 is retired with durable
+-- client-status revisions; retained kinds keep their original identities.
 CREATE TABLE authorization_operation_version_deltas (
     community_id UUID NOT NULL REFERENCES communities(id),
     operation_id UUID NOT NULL,
-    component_kind SMALLINT NOT NULL CHECK (component_kind IN (1, 2, 3, 4, 5, 6, 7)),
+    component_kind SMALLINT NOT NULL CHECK (component_kind IN (1, 2, 3, 4, 6, 7)),
     component_key BYTEA NOT NULL CHECK (octet_length(component_key) = 32),
     before_version BIGINT NOT NULL CHECK (before_version >= 0),
     after_version BIGINT NOT NULL,
@@ -593,13 +528,6 @@ CREATE TRIGGER authorization_authentication_denial_attempts_immutable
     FOR EACH ROW EXECUTE FUNCTION nip_fi_reject_row_mutation_v1();
 CREATE TRIGGER authorization_authentication_denial_attempts_no_truncate
     BEFORE TRUNCATE ON authorization_authentication_denial_attempts
-    FOR EACH STATEMENT EXECUTE FUNCTION nip_fi_reject_truncate_v1();
-
-CREATE TRIGGER client_status_revisions_immutable
-    BEFORE UPDATE OR DELETE ON client_status_revisions
-    FOR EACH ROW EXECUTE FUNCTION nip_fi_reject_row_mutation_v1();
-CREATE TRIGGER client_status_revisions_no_truncate
-    BEFORE TRUNCATE ON client_status_revisions
     FOR EACH STATEMENT EXECUTE FUNCTION nip_fi_reject_truncate_v1();
 
 CREATE FUNCTION authorization_operation_version_delta_cardinality_guard_v1()

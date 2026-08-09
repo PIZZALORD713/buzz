@@ -13,9 +13,10 @@ CREATE TABLE authorization_operation_receipts (
     request_fingerprint BYTEA NOT NULL CHECK (octet_length(request_fingerprint) = 32),
     -- 1 enroll, 2 provision, 3 retire, 4 disable, 5 revoke, 6 rotate,
     -- 7 recover, 8 enable, 9 admission loss, 10 operator,
-    -- 11 protected mutation, 12 invalidation, 13 status revision.
+    -- 11 protected mutation, 12 invalidation. Kind 13 is retired: kind 24244
+    -- status is derived connection-locally and has no durable operation row.
     operation_kind SMALLINT NOT NULL CHECK (
-        operation_kind IN (1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13)
+        operation_kind IN (1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12)
     ),
     actor_fingerprint BYTEA NOT NULL CHECK (octet_length(actor_fingerprint) = 32),
     -- 1 applied, 2 denied, 3 no-op.

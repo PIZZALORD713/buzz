@@ -125,6 +125,13 @@ async fn nip_fi_authorization_foundation_behavior() {
         .await
         .expect("apply direct-final authorization migrations");
 
+    let durable_status_table: Option<String> =
+        sqlx::query_scalar("SELECT to_regclass('public.client_status_revisions')::text")
+            .fetch_one(&pool)
+            .await
+            .expect("inspect durable status table absence");
+    assert!(durable_status_table.is_none());
+
     let community_id = Uuid::new_v4();
     sqlx::query("INSERT INTO communities (id,host) VALUES ($1,$2)")
         .bind(community_id)
@@ -132,6 +139,27 @@ async fn nip_fi_authorization_foundation_behavior() {
         .execute(&pool)
         .await
         .expect("insert authorization test community");
+
+    let retired_status_operation = sqlx::query(
+        "INSERT INTO authorization_operation_receipts \
+         (community_id,operation_id,request_fingerprint,operation_kind,actor_fingerprint, \
+          outcome_code,result_digest) VALUES ($1,$2,$3,13,$4,1,$5)",
+    )
+    .bind(community_id)
+    .bind(Uuid::new_v4())
+    .bind(vec![20_u8; 32])
+    .bind(vec![21_u8; 32])
+    .bind(vec![22_u8; 32])
+    .execute(&pool)
+    .await
+    .expect_err("retired durable status operation kind must be rejected");
+    assert_eq!(
+        retired_status_operation
+            .as_database_error()
+            .and_then(|error| error.code().map(|code| code.into_owned()))
+            .as_deref(),
+        Some("23514")
+    );
     sqlx::query(
         "INSERT INTO identity_enrollment_policies \
          (community_id,policy_revision,enrollment_mode,policy_digest,effective_at) \
@@ -414,109 +442,6 @@ async fn nip_fi_authorization_foundation_behavior() {
             .and_then(|error| error.constraint()),
         Some("protected_object_authority_delegated_relationship_non_nil")
     );
-
-    // Current status is complete and bounded; withdrawal is exact-author
-    // self-referential, and rows are immutable.
-    let status_key = event_author_pubkey.to_bytes();
-    let (status_operation_1, status_request_1) =
-        committed_receipt(&pool, community_id, 13, 61).await;
-    sqlx::query(
-        "INSERT INTO client_status_revisions \
-         (community_id,event_author_pubkey,revision,disposition,binding_id,binding_version, \
-          policy_revision,invalidation_generation,authority_epoch,fence,observed_at,fresh_until, \
-          receipt_digest,operation_id,request_fingerprint) \
-         VALUES ($1,$2,1,1,$3,$4,1,0,3,$5,transaction_timestamp(), \
-                 transaction_timestamp()+INTERVAL '300 seconds',$6,$7,$8)",
-    )
-    .bind(community_id)
-    .bind(status_key.as_slice())
-    .bind(binding_id)
-    .bind(binding_version)
-    .bind(&fence_3)
-    .bind(vec![62_u8; 32])
-    .bind(status_operation_1)
-    .bind(&status_request_1)
-    .execute(&pool)
-    .await
-    .expect("insert current status revision");
-    let (status_operation_2, status_request_2) =
-        committed_receipt(&pool, community_id, 13, 63).await;
-    sqlx::query(
-        "INSERT INTO client_status_revisions \
-         (community_id,event_author_pubkey,revision,disposition,supersedes_revision, \
-          receipt_digest,operation_id,request_fingerprint) VALUES ($1,$2,2,2,1,$3,$4,$5)",
-    )
-    .bind(community_id)
-    .bind(status_key.as_slice())
-    .bind(vec![64_u8; 32])
-    .bind(status_operation_2)
-    .bind(&status_request_2)
-    .execute(&pool)
-    .await
-    .expect("withdraw exact current status revision");
-    let cross_author_operation = Uuid::new_v4();
-    let cross_author_request = vec![69_u8; 32];
-    let mut cross_author = pool.begin().await.expect("begin cross-author withdrawal");
-    insert_receipt(
-        &mut cross_author,
-        community_id,
-        cross_author_operation,
-        &cross_author_request,
-        13,
-    )
-    .await;
-    sqlx::query(
-        "INSERT INTO client_status_revisions \
-         (community_id,event_author_pubkey,revision,disposition,supersedes_revision, \
-          receipt_digest,operation_id,request_fingerprint) VALUES ($1,$2,2,2,1,$3,$4,$5)",
-    )
-    .bind(community_id)
-    .bind(vec![70_u8; 32])
-    .bind(vec![71_u8; 32])
-    .bind(cross_author_operation)
-    .bind(&cross_author_request)
-    .execute(&mut *cross_author)
-    .await
-    .expect("defer exact-author supersession check");
-    (&mut *cross_author)
-        .execute("SET CONSTRAINTS ALL IMMEDIATE")
-        .await
-        .expect_err("status withdrawal cannot supersede another author's revision");
-    cross_author
-        .rollback()
-        .await
-        .expect("rollback cross-author withdrawal");
-    sqlx::query(
-        "UPDATE client_status_revisions SET receipt_digest=$3 \
-         WHERE community_id=$1 AND event_author_pubkey=$2 AND revision=2",
-    )
-    .bind(community_id)
-    .bind(status_key.as_slice())
-    .bind(vec![65_u8; 32])
-    .execute(&pool)
-    .await
-    .expect_err("status revision is immutable");
-    let (zero_epoch_operation, zero_epoch_request) =
-        committed_receipt(&pool, community_id, 13, 66).await;
-    sqlx::query(
-        "INSERT INTO client_status_revisions \
-         (community_id,event_author_pubkey,revision,disposition,binding_id,binding_version, \
-          policy_revision,invalidation_generation,authority_epoch,fence,observed_at,fresh_until, \
-          receipt_digest,operation_id,request_fingerprint) \
-         VALUES ($1,$2,1,1,$3,$4,1,0,0,$5,transaction_timestamp(), \
-                 transaction_timestamp()+INTERVAL '1 second',$6,$7,$8)",
-    )
-    .bind(community_id)
-    .bind(vec![67_u8; 32])
-    .bind(binding_id)
-    .bind(binding_version)
-    .bind(&fence_2)
-    .bind(vec![68_u8; 32])
-    .bind(zero_epoch_operation)
-    .bind(&zero_epoch_request)
-    .execute(&pool)
-    .await
-    .expect_err("current status rejects unallocated authority epoch");
 
     // Audit insertion atomically advances bounded counters. Exhaustion and
     // unhealthy state reject the event without advancing either counter, and
@@ -869,7 +794,7 @@ async fn nip_fi_authorization_foundation_behavior() {
         sqlx::query(
             "INSERT INTO authorization_operation_version_deltas \
              (community_id,operation_id,component_kind,component_key,before_version, \
-              after_version,component_digest) VALUES ($1,$2,5,$3,1,2,$4)",
+              after_version,component_digest) VALUES ($1,$2,6,$3,1,2,$4)",
         )
         .bind(community_id)
         .bind(delta_operation)
@@ -955,7 +880,7 @@ async fn nip_fi_authorization_foundation_behavior() {
     .execute(&mut *extra)
     .await
     .expect("defer extra-component manifest cardinality");
-    for (kind, key_byte) in [(4_i16, 100_u8), (5_i16, 101_u8)] {
+    for (kind, key_byte) in [(4_i16, 100_u8), (6_i16, 101_u8)] {
         sqlx::query(
             "INSERT INTO authorization_operation_version_deltas \
              (community_id,operation_id,component_kind,component_key,before_version, \

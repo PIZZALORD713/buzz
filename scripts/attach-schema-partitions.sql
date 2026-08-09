@@ -194,3 +194,125 @@ BEGIN
             FOR VALUES FROM ('2026-07-01') TO (MAXVALUE);
     END IF;
 END $$;
+
+-- pgschema 1.7.4 omits disjunctive CHECK constraints from its desired-state
+-- dump. Close only the retained direct-final NIP-FI catalog gap here. Existing
+-- constraints are never dropped or replaced: a same-name definition mismatch
+-- aborts the apply so an unsafe desired catalog cannot be accepted silently.
+CREATE OR REPLACE FUNCTION pg_temp.ensure_exact_check_constraint(
+    constrained_table regclass,
+    constraint_name text,
+    expected_definition text,
+    constraint_expression text
+) RETURNS void
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    actual_definition text;
+BEGIN
+    SELECT pg_get_constraintdef(constraint_oid.oid, true)
+    INTO actual_definition
+    FROM pg_constraint AS constraint_oid
+    WHERE constraint_oid.conrelid = constrained_table
+      AND constraint_oid.conname = constraint_name;
+
+    IF FOUND AND actual_definition IS DISTINCT FROM expected_definition THEN
+        RAISE EXCEPTION 'constraint % on % has unexpected definition: %',
+            constraint_name, constrained_table, actual_definition
+            USING ERRCODE = 'check_violation',
+                  CONSTRAINT = constraint_name;
+    END IF;
+
+    IF NOT FOUND THEN
+        EXECUTE format(
+            'ALTER TABLE %s ADD CONSTRAINT %I CHECK (%s)',
+            constrained_table,
+            constraint_name,
+            constraint_expression
+        );
+
+        SELECT pg_get_constraintdef(constraint_oid.oid, true)
+        INTO STRICT actual_definition
+        FROM pg_constraint AS constraint_oid
+        WHERE constraint_oid.conrelid = constrained_table
+          AND constraint_oid.conname = constraint_name;
+
+        IF actual_definition IS DISTINCT FROM expected_definition THEN
+            RAISE EXCEPTION 'installed constraint % on % has unexpected definition: %',
+                constraint_name, constrained_table, actual_definition
+                USING ERRCODE = 'check_violation',
+                      CONSTRAINT = constraint_name;
+        END IF;
+    END IF;
+END;
+$$;
+
+SELECT pg_temp.ensure_exact_check_constraint(
+    'authorization_invalidation_floors',
+    'authorization_invalidation_floors_check',
+    $definition$CHECK (selector_kind = 3 AND binding_version_floor IS NOT NULL AND relationship_revision_floor IS NULL OR selector_kind = 7 AND binding_version_floor IS NULL AND relationship_revision_floor IS NOT NULL OR (selector_kind <> ALL (ARRAY[3, 7])) AND binding_version_floor IS NULL AND relationship_revision_floor IS NULL)$definition$,
+    $expression$selector_kind = 3 AND binding_version_floor IS NOT NULL AND relationship_revision_floor IS NULL OR selector_kind = 7 AND binding_version_floor IS NULL AND relationship_revision_floor IS NOT NULL OR (selector_kind <> ALL (ARRAY[3, 7])) AND binding_version_floor IS NULL AND relationship_revision_floor IS NULL$expression$
+);
+
+SELECT pg_temp.ensure_exact_check_constraint(
+    'identity_bindings',
+    'identity_bindings_check1',
+    $definition$CHECK (binding_state = 1 AND lifecycle_revision = 1 AND retirement_history_id IS NULL OR binding_state = 2 AND lifecycle_revision = 2 AND retirement_history_id IS NOT NULL)$definition$,
+    $expression$binding_state = 1 AND lifecycle_revision = 1 AND retirement_history_id IS NULL OR binding_state = 2 AND lifecycle_revision = 2 AND retirement_history_id IS NOT NULL$expression$
+);
+
+SELECT pg_temp.ensure_exact_check_constraint(
+    'identity_lifecycle_history',
+    'identity_lifecycle_history_check',
+    $definition$CHECK (old_binding_id IS NULL AND old_binding_version IS NULL AND old_prior_lifecycle_revision IS NULL AND old_prior_state IS NULL AND old_resulting_lifecycle_revision IS NULL AND old_resulting_state IS NULL OR old_binding_id IS NOT NULL AND old_binding_version IS NOT NULL AND old_prior_lifecycle_revision IS NOT NULL AND old_prior_state IS NOT NULL AND old_resulting_lifecycle_revision IS NOT NULL AND old_resulting_state IS NOT NULL)$definition$,
+    $expression$old_binding_id IS NULL AND old_binding_version IS NULL AND old_prior_lifecycle_revision IS NULL AND old_prior_state IS NULL AND old_resulting_lifecycle_revision IS NULL AND old_resulting_state IS NULL OR old_binding_id IS NOT NULL AND old_binding_version IS NOT NULL AND old_prior_lifecycle_revision IS NOT NULL AND old_prior_state IS NOT NULL AND old_resulting_lifecycle_revision IS NOT NULL AND old_resulting_state IS NOT NULL$expression$
+);
+
+SELECT pg_temp.ensure_exact_check_constraint(
+    'identity_lifecycle_history',
+    'identity_lifecycle_history_check1',
+    $definition$CHECK (successor_binding_id IS NULL AND successor_binding_version IS NULL AND successor_lifecycle_revision IS NULL AND successor_state IS NULL OR successor_binding_id IS NOT NULL AND successor_binding_version IS NOT NULL AND successor_lifecycle_revision = 1 AND successor_state = 1)$definition$,
+    $expression$successor_binding_id IS NULL AND successor_binding_version IS NULL AND successor_lifecycle_revision IS NULL AND successor_state IS NULL OR successor_binding_id IS NOT NULL AND successor_binding_version IS NOT NULL AND successor_lifecycle_revision = 1 AND successor_state = 1$expression$
+);
+
+SELECT pg_temp.ensure_exact_check_constraint(
+    'identity_lifecycle_history',
+    'identity_lifecycle_history_check5',
+    $definition$CHECK (outcome_code = 3 AND old_binding_id IS NULL AND successor_binding_id IS NULL OR outcome_code = 1 AND ((transition_kind = ANY (ARRAY[1, 2])) AND old_binding_id IS NULL AND successor_binding_id IS NOT NULL OR transition_kind = 3 AND old_binding_id IS NOT NULL AND successor_binding_id IS NULL OR (transition_kind = ANY (ARRAY[4, 5])) AND successor_binding_id IS NULL OR transition_kind = 6 AND old_binding_id IS NOT NULL AND successor_binding_id IS NOT NULL OR transition_kind = 7 AND old_binding_id IS NOT NULL AND successor_binding_id IS NOT NULL OR transition_kind = 8 AND successor_binding_id IS NOT NULL OR transition_kind = 9 AND old_binding_id IS NOT NULL AND successor_binding_id IS NULL))$definition$,
+    $expression$outcome_code = 3 AND old_binding_id IS NULL AND successor_binding_id IS NULL OR outcome_code = 1 AND ((transition_kind = ANY (ARRAY[1, 2])) AND old_binding_id IS NULL AND successor_binding_id IS NOT NULL OR transition_kind = 3 AND old_binding_id IS NOT NULL AND successor_binding_id IS NULL OR (transition_kind = ANY (ARRAY[4, 5])) AND successor_binding_id IS NULL OR transition_kind = 6 AND old_binding_id IS NOT NULL AND successor_binding_id IS NOT NULL OR transition_kind = 7 AND old_binding_id IS NOT NULL AND successor_binding_id IS NOT NULL OR transition_kind = 8 AND successor_binding_id IS NOT NULL OR transition_kind = 9 AND old_binding_id IS NOT NULL AND successor_binding_id IS NULL)$expression$
+);
+
+SELECT pg_temp.ensure_exact_check_constraint(
+    'identity_lifecycle_selectors',
+    'identity_lifecycle_selectors_check',
+    $definition$CHECK (selector_kind = 1 AND fact_generation = 1 AND principal_fingerprint IS NOT NULL AND event_author_pubkey IS NOT NULL AND binding_id IS NOT NULL AND binding_version IS NOT NULL OR selector_kind = 2 AND principal_fingerprint IS NOT NULL AND event_author_pubkey IS NULL AND binding_id IS NULL AND binding_version IS NULL OR selector_kind = 3 AND fact_generation = 1 AND principal_fingerprint IS NULL AND event_author_pubkey IS NOT NULL AND binding_id IS NULL AND binding_version IS NULL OR selector_kind = 4 AND principal_fingerprint IS NOT NULL AND event_author_pubkey IS NOT NULL AND binding_id IS NOT NULL AND binding_version IS NOT NULL)$definition$,
+    $expression$selector_kind = 1 AND fact_generation = 1 AND principal_fingerprint IS NOT NULL AND event_author_pubkey IS NOT NULL AND binding_id IS NOT NULL AND binding_version IS NOT NULL OR selector_kind = 2 AND principal_fingerprint IS NOT NULL AND event_author_pubkey IS NULL AND binding_id IS NULL AND binding_version IS NULL OR selector_kind = 3 AND fact_generation = 1 AND principal_fingerprint IS NULL AND event_author_pubkey IS NOT NULL AND binding_id IS NULL AND binding_version IS NULL OR selector_kind = 4 AND principal_fingerprint IS NOT NULL AND event_author_pubkey IS NOT NULL AND binding_id IS NOT NULL AND binding_version IS NOT NULL$expression$
+);
+
+SELECT pg_temp.ensure_exact_check_constraint(
+    'authorization_event_capacity',
+    'authorization_event_capacity_check3',
+    $definition$CHECK (health_state = 1 AND failure_code IS NULL AND failure_observed_at IS NULL OR health_state = 2 AND failure_code IS NOT NULL AND failure_observed_at IS NOT NULL)$definition$,
+    $expression$health_state = 1 AND failure_code IS NULL AND failure_observed_at IS NULL OR health_state = 2 AND failure_code IS NOT NULL AND failure_observed_at IS NOT NULL$expression$
+);
+
+SELECT pg_temp.ensure_exact_check_constraint(
+    'authorization_events',
+    'authorization_events_check',
+    $definition$CHECK (actor_kind = 4 AND event_kind = 9 AND request_fingerprint IS NULL OR (actor_kind = ANY (ARRAY[1, 2, 3])) AND request_fingerprint IS NOT NULL)$definition$,
+    $expression$actor_kind = 4 AND event_kind = 9 AND request_fingerprint IS NULL OR (actor_kind = ANY (ARRAY[1, 2, 3])) AND request_fingerprint IS NOT NULL$expression$
+);
+
+SELECT pg_temp.ensure_exact_check_constraint(
+    'authorization_events',
+    'authorization_events_check1',
+    $definition$CHECK (actor_kind = 4 AND actor_fingerprint IS NULL AND subject_fingerprint IS NULL OR (actor_kind = ANY (ARRAY[1, 2, 3])) AND actor_fingerprint IS NOT NULL)$definition$,
+    $expression$actor_kind = 4 AND actor_fingerprint IS NULL AND subject_fingerprint IS NULL OR (actor_kind = ANY (ARRAY[1, 2, 3])) AND actor_fingerprint IS NOT NULL$expression$
+);
+
+SELECT pg_temp.ensure_exact_check_constraint(
+    'protected_object_authority',
+    'protected_object_authority_check1',
+    $definition$CHECK (owner_pubkey IS NULL AND delegated_relationship_id IS NULL AND delegated_relationship_revision IS NULL AND delegation_conditions_fingerprint IS NULL OR owner_pubkey IS NOT NULL AND delegated_relationship_id IS NOT NULL AND delegated_relationship_revision IS NOT NULL AND delegation_conditions_fingerprint IS NOT NULL)$definition$,
+    $expression$owner_pubkey IS NULL AND delegated_relationship_id IS NULL AND delegated_relationship_revision IS NULL AND delegation_conditions_fingerprint IS NULL OR owner_pubkey IS NOT NULL AND delegated_relationship_id IS NOT NULL AND delegated_relationship_revision IS NOT NULL AND delegation_conditions_fingerprint IS NOT NULL$expression$
+);

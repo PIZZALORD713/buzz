@@ -31,6 +31,67 @@ fn direct_schema_separates_durable_binding_and_invite_capabilities() {
 }
 
 #[test]
+fn client_status_is_ephemeral_and_retired_codes_stay_unallocated() {
+    for forbidden in [
+        "CREATE TABLE client_status_revisions",
+        "client_status_revisions_current_lookup",
+        "client_status_revisions_immutable",
+        "client_status_revisions_no_truncate",
+        "status published",
+        "status withdrawn",
+        "7 binding status",
+    ] {
+        assert!(
+            !AUTHORIZATION_FOUNDATION_SQL.contains(forbidden),
+            "durable status artifact remains: {forbidden}"
+        );
+    }
+    assert!(IDENTITY_FOUNDATION_SQL
+        .contains("operation_kind IN (1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12)"));
+    assert!(AUTHORIZATION_FOUNDATION_SQL.contains("object_kind IN (1, 2, 3, 4, 5, 6)"));
+    assert!(AUTHORIZATION_FOUNDATION_SQL
+        .contains("event_kind IN (1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 14)"));
+    assert!(AUTHORIZATION_FOUNDATION_SQL.contains("component_kind IN (1, 2, 3, 4, 6, 7)"));
+    assert!(AUTHORIZATION_FOUNDATION_SQL.contains("Kinds 12 and 13 are retired"));
+    assert!(AUTHORIZATION_FOUNDATION_SQL.contains("Kind 5 is retired"));
+}
+
+#[test]
+fn catalog_closure_is_exact_and_limited_to_retained_nip_fi_checks() {
+    assert!(ATTACH_SCHEMA_PARTITIONS_SQL.contains("ensure_exact_check_constraint"));
+    assert!(ATTACH_SCHEMA_PARTITIONS_SQL.contains("actual_definition IS DISTINCT FROM"));
+    assert!(ATTACH_SCHEMA_PARTITIONS_SQL.contains("ERRCODE = 'check_violation'"));
+
+    let retained_constraints = [
+        "authorization_invalidation_floors_check",
+        "identity_bindings_check1",
+        "identity_lifecycle_history_check",
+        "identity_lifecycle_history_check1",
+        "identity_lifecycle_history_check5",
+        "identity_lifecycle_selectors_check",
+        "authorization_event_capacity_check3",
+        "authorization_events_check",
+        "authorization_events_check1",
+        "protected_object_authority_check1",
+    ];
+    for constraint in retained_constraints {
+        let quoted = format!("'{constraint}'");
+        assert_eq!(
+            ATTACH_SCHEMA_PARTITIONS_SQL.matches(&quoted).count(),
+            1,
+            "closure must declare {constraint} exactly once"
+        );
+    }
+
+    for m0_owned_constraint in ["moderation_reports_check", "push_leases_check"] {
+        assert!(
+            !ATTACH_SCHEMA_PARTITIONS_SQL.contains(m0_owned_constraint),
+            "S2 must not author the closure definition for {m0_owned_constraint}"
+        );
+    }
+}
+
+#[test]
 fn partition_attach_removes_every_parent_trigger_clone_dynamically() {
     assert!(ATTACH_SCHEMA_PARTITIONS_SQL.contains("FROM pg_trigger AS child_trigger"));
     assert!(ATTACH_SCHEMA_PARTITIONS_SQL.contains("JOIN pg_trigger AS parent_trigger"));
@@ -152,6 +213,114 @@ async fn partition_attach_live_reconciles_current_and_future_parent_triggers_ide
     .await
     .expect("count dynamically reconciled future trigger");
     assert_eq!(future_clone_count, 1);
+}
+
+#[tokio::test]
+#[ignore = "requires a dedicated disposable Postgres database"]
+async fn catalog_closure_restores_exact_checks_and_rejects_wrong_same_name_definition() {
+    let pool = connect_test_pool().await;
+    reset_public_schema(&pool).await;
+    run_migrations(&pool)
+        .await
+        .expect("apply direct-final migrations");
+
+    let retained_constraints = [
+        (
+            "authorization_invalidation_floors",
+            "authorization_invalidation_floors_check",
+        ),
+        ("identity_bindings", "identity_bindings_check1"),
+        (
+            "identity_lifecycle_history",
+            "identity_lifecycle_history_check",
+        ),
+        (
+            "identity_lifecycle_history",
+            "identity_lifecycle_history_check1",
+        ),
+        (
+            "identity_lifecycle_history",
+            "identity_lifecycle_history_check5",
+        ),
+        (
+            "identity_lifecycle_selectors",
+            "identity_lifecycle_selectors_check",
+        ),
+        (
+            "authorization_event_capacity",
+            "authorization_event_capacity_check3",
+        ),
+        ("authorization_events", "authorization_events_check"),
+        ("authorization_events", "authorization_events_check1"),
+        (
+            "protected_object_authority",
+            "protected_object_authority_check1",
+        ),
+    ];
+
+    // A migration-built catalog already has every constraint; the closure is
+    // a read-only exact-definition check in this state.
+    sqlx::raw_sql(ATTACH_SCHEMA_PARTITIONS_SQL)
+        .execute(&pool)
+        .await
+        .expect("validate migration-built constraint definitions");
+
+    for (table, constraint) in retained_constraints {
+        sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+            "ALTER TABLE {table} DROP CONSTRAINT {constraint}"
+        )))
+        .execute(&pool)
+        .await
+        .unwrap_or_else(|error| panic!("drop {constraint}: {error}"));
+    }
+
+    for attempt in 1..=2 {
+        sqlx::raw_sql(ATTACH_SCHEMA_PARTITIONS_SQL)
+            .execute(&pool)
+            .await
+            .unwrap_or_else(|error| panic!("catalog closure attempt {attempt}: {error}"));
+    }
+
+    let restored: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM pg_constraint \
+         WHERE connamespace='public'::regnamespace AND conname=ANY($1)",
+    )
+    .bind(
+        retained_constraints
+            .iter()
+            .map(|(_, constraint)| *constraint)
+            .collect::<Vec<_>>(),
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("count restored direct-final constraints");
+    assert_eq!(restored, retained_constraints.len() as i64);
+
+    let mut wrong_definition = pool.begin().await.expect("begin wrong-definition test");
+    sqlx::raw_sql(
+        "ALTER TABLE authorization_event_capacity \
+         DROP CONSTRAINT authorization_event_capacity_check3; \
+         ALTER TABLE authorization_event_capacity \
+         ADD CONSTRAINT authorization_event_capacity_check3 \
+         CHECK (health_state IN (1, 2))",
+    )
+    .execute(&mut *wrong_definition)
+    .await
+    .expect("install same-name wrong definition");
+    let error = sqlx::raw_sql(ATTACH_SCHEMA_PARTITIONS_SQL)
+        .execute(&mut *wrong_definition)
+        .await
+        .expect_err("same-name wrong constraint definition must fail closed");
+    assert_eq!(
+        error
+            .as_database_error()
+            .and_then(|error| error.constraint()),
+        Some("authorization_event_capacity_check3")
+    );
+    wrong_definition
+        .rollback()
+        .await
+        .expect("rollback wrong-definition test");
 }
 
 #[derive(Clone)]
@@ -976,6 +1145,7 @@ async fn nip_fi_direct_final_catalog_and_behavior() {
         "audio_admission_ledger",
         "authorization_event_deliveries",
         "authorization_event_claims",
+        "client_status_revisions",
         "public_projection",
         "trusted_assertion_projections",
     ])
