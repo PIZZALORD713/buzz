@@ -382,7 +382,11 @@ impl UsageTracker {
     /// session produces a publishable `pending` record. A notification that
     /// arrives outside any turn (e.g. during `session/new` setup) advances the
     /// committed baseline so the next in-flight turn computes a correct delta.
-    /// A notification for a *different* in-flight session is ignored entirely.
+    /// A notification for a *different* in-flight session drops its counters
+    /// (advancing the baseline would undercount that session's next turn) but
+    /// latches any observed input/output absence into that session's committed
+    /// `*_ever_poisoned` state — the sticky-absence contract has no cross-session
+    /// exemption.
     ///
     /// When multiple notifications arrive during the same turn, the **last one
     /// wins** on the cumulative totals, and the delta is always measured from
@@ -916,8 +920,9 @@ mod tests {
         // publishing a metric, so A's next turn (2000/250) would see a delta of
         // only 500/100 instead of the correct 1000/150.
         //
-        // With the fixed three-way branch, the cross-session notification is
-        // ignored entirely and A's baseline stays at its last published state.
+        // With the fixed three-way branch, the cross-session notification drops
+        // its counters (advancing A's baseline would undercount A's next turn)
+        // and latches any observed absence into A's committed poison flags.
         let mut tracker = UsageTracker::default();
 
         // ── Turn A1 — establish A's committed baseline at 1000/100, seq=1 ──
@@ -2889,15 +2894,19 @@ mod tests {
     /// into the notified session's `*_ever_poisoned` state even though the
     /// notification's counters are otherwise dropped.
     ///
+    /// Round-6 upgrade: byte-compares A's full `SessionState` (all nine fields)
+    /// immediately before and after the cross-session `record()` to prove:
+    ///   - `published_seq` is unchanged.
+    ///   - All six committed baselines are unchanged.
+    ///   - `input_ever_poisoned` grows from false to true.
+    ///   - `output_ever_poisoned` is unchanged (present field, no latch).
+    ///
     /// Scenario:
     ///   - A publishes a reliable turn at 50/10 (turn 1).
     ///   - B becomes in-flight.
-    ///   - A late A notification arrives: input=None, output=10 (input absent).
+    ///   - A late A notification arrives: input=None, output=Some(10).
     ///   - B's turn publishes normally (must be unaffected).
     ///   - A's turn 2: record at 100/20, take — must be `!delta_reliable`.
-    ///   - A's baseline was NOT advanced by the dropped cross-session notification:
-    ///     cumulative fields on turn 2 reflect the real A snapshot, not the
-    ///     intermediate one that was dropped.
     #[test]
     fn cross_session_absent_notification_latches_poison_input() {
         let mut t = UsageTracker::default();
@@ -2912,9 +2921,63 @@ mod tests {
         assert_eq!(a1.turn_input_tokens, Some(50));
         assert_eq!(a1.turn_output_tokens, Some(10));
 
+        // ── Snapshot A's SessionState BEFORE the cross-session record ──
+        let state_before = t
+            .sessions
+            .get("a")
+            .expect("A entry must exist after turn 1")
+            .clone();
+
         // ── B in-flight; late A notification with input absent ──
         t.begin_turn("b");
         t.record("a", &payload_opt(None, Some(10))); // input absent — must latch for A
+
+        // ── Snapshot A's SessionState AFTER the cross-session record ──
+        let state_after = t
+            .sessions
+            .get("a")
+            .expect("A entry must still exist")
+            .clone();
+
+        // Every non-poison field must be byte-for-byte unchanged.
+        assert_eq!(
+            state_after.published_seq, state_before.published_seq,
+            "published_seq must not be advanced by a dropped cross-session notification"
+        );
+        assert_eq!(
+            state_after.last_input, state_before.last_input,
+            "last_input baseline must not change"
+        );
+        assert_eq!(
+            state_after.last_output, state_before.last_output,
+            "last_output baseline must not change"
+        );
+        assert_eq!(
+            state_after.last_cost, state_before.last_cost,
+            "last_cost baseline must not change"
+        );
+        assert_eq!(
+            state_after.last_total, state_before.last_total,
+            "last_total baseline must not change"
+        );
+        assert_eq!(
+            state_after.last_cached_input, state_before.last_cached_input,
+            "last_cached_input baseline must not change"
+        );
+        assert_eq!(
+            state_after.last_cache_write, state_before.last_cache_write,
+            "last_cache_write baseline must not change"
+        );
+        // Poison: input flag must have been latched; output flag must be unchanged.
+        assert!(
+            state_after.input_ever_poisoned,
+            "input_ever_poisoned must be latched by the cross-session absent notification"
+        );
+        assert_eq!(
+            state_after.output_ever_poisoned, state_before.output_ever_poisoned,
+            "output_ever_poisoned must not change when only input is absent"
+        );
+
         t.record("b", &payload_opt(Some(200), Some(30)));
         let b1 = t.take().expect("b1");
         assert!(
@@ -2931,16 +2994,13 @@ mod tests {
             !a2.delta_reliable,
             "A turn 2 must be poisoned: input absence observed in dropped cross-session notification"
         );
-        // Baseline was NOT advanced by the dropped notification — A's committed
-        // baseline is still at 50/10 from turn 1, so cumulative fields are correct.
-        assert_eq!(
-            a2.cumulative_input_tokens,
-            Some(100),
-            "A baseline must not have been advanced by the dropped notification"
-        );
     }
 
     /// Symmetric output-absent case for the cross-session absence latch.
+    ///
+    /// Round-6 upgrade: same byte-compare of A's `SessionState` as the input
+    /// variant — output poison latched, input poison unchanged, all six baselines
+    /// and `published_seq` preserved.
     #[test]
     fn cross_session_absent_notification_latches_poison_output() {
         let mut t = UsageTracker::default();
@@ -2953,9 +3013,63 @@ mod tests {
         let a1 = t.take().expect("a1");
         assert!(a1.delta_reliable, "A turn 1 must be reliable");
 
+        // ── Snapshot A's SessionState BEFORE the cross-session record ──
+        let state_before = t
+            .sessions
+            .get("a")
+            .expect("A entry must exist after turn 1")
+            .clone();
+
         // ── B in-flight; late A notification with output absent ──
         t.begin_turn("b");
         t.record("a", &payload_opt(Some(50), None)); // output absent — must latch for A
+
+        // ── Snapshot A's SessionState AFTER the cross-session record ──
+        let state_after = t
+            .sessions
+            .get("a")
+            .expect("A entry must still exist")
+            .clone();
+
+        // Every non-poison field must be byte-for-byte unchanged.
+        assert_eq!(
+            state_after.published_seq, state_before.published_seq,
+            "published_seq must not be advanced"
+        );
+        assert_eq!(
+            state_after.last_input, state_before.last_input,
+            "last_input baseline must not change"
+        );
+        assert_eq!(
+            state_after.last_output, state_before.last_output,
+            "last_output baseline must not change"
+        );
+        assert_eq!(
+            state_after.last_cost, state_before.last_cost,
+            "last_cost baseline must not change"
+        );
+        assert_eq!(
+            state_after.last_total, state_before.last_total,
+            "last_total baseline must not change"
+        );
+        assert_eq!(
+            state_after.last_cached_input, state_before.last_cached_input,
+            "last_cached_input baseline must not change"
+        );
+        assert_eq!(
+            state_after.last_cache_write, state_before.last_cache_write,
+            "last_cache_write baseline must not change"
+        );
+        // Poison: output flag must have been latched; input flag must be unchanged.
+        assert!(
+            state_after.output_ever_poisoned,
+            "output_ever_poisoned must be latched by the cross-session absent notification"
+        );
+        assert_eq!(
+            state_after.input_ever_poisoned, state_before.input_ever_poisoned,
+            "input_ever_poisoned must not change when only output is absent"
+        );
+
         t.record("b", &payload_opt(Some(200), Some(30)));
         let b1 = t.take().expect("b1");
         assert!(b1.delta_reliable, "B turn 1 must be unaffected");
@@ -2969,23 +3083,70 @@ mod tests {
             !a2.delta_reliable,
             "A turn 2 must be poisoned: output absence observed in dropped cross-session notification"
         );
-        assert_eq!(a2.cumulative_input_tokens, Some(100));
     }
 
-    /// Un-baselined variant: A has NO session entry when the cross-session absent
-    /// notification arrives.  The poison must be created and hold for A's first
-    /// real turn AND persist into A's second turn even after A establishes a
-    /// baseline.  (A's first turn is unreliable regardless because it has no
-    /// prior baseline; the second turn is where the latch matters.)
+    /// Un-baselined variant (input-absent): A has NO session entry when the
+    /// cross-session absent notification arrives.  The latch must CREATE an entry
+    /// with only `input_ever_poisoned = true` and zero-baseline fields (all six
+    /// `last_*` baselines remain `None`, `published_seq` = 0).  The poison must
+    /// then survive into A's second real turn after A establishes its own baseline.
+    ///
+    /// (A's first turn is unreliable regardless because it has no prior baseline;
+    /// the second turn is where the latch matters — without it, `take()` would
+    /// see `input_ever_poisoned: false` and flip `delta_reliable: true`.)
     #[test]
     fn cross_session_absent_notification_latches_poison_unbaselined() {
         let mut t = UsageTracker::default();
         t.seed_zero_baseline("b");
-        // A has NO entry (no seed_zero_baseline for A).
+        // A has NO entry at all.
+        assert!(
+            t.sessions.get("a").is_none(),
+            "A must have no entry before the cross-session record"
+        );
 
         // ── B in-flight; A notification arrives with input absent ──
         t.begin_turn("b");
-        t.record("a", &payload_opt(None, Some(5))); // A has no entry — must CREATE one with poison
+        t.record("a", &payload_opt(None, Some(5))); // A has no entry — latch must CREATE one
+
+        // Entry must now exist with exactly the right shape.
+        let created = t
+            .sessions
+            .get("a")
+            .expect("latch must create an entry for A");
+        assert_eq!(created.published_seq, 0, "created entry has zero seq");
+        assert!(
+            created.last_input.is_none(),
+            "created entry must have no input baseline"
+        );
+        assert!(
+            created.last_output.is_none(),
+            "created entry must have no output baseline"
+        );
+        assert!(
+            created.last_cost.is_none(),
+            "created entry must have no cost baseline"
+        );
+        assert!(
+            created.last_total.is_none(),
+            "created entry must have no total baseline"
+        );
+        assert!(
+            created.last_cached_input.is_none(),
+            "created entry must have no cache-read baseline"
+        );
+        assert!(
+            created.last_cache_write.is_none(),
+            "created entry must have no cache-write baseline"
+        );
+        assert!(
+            created.input_ever_poisoned,
+            "input_ever_poisoned must be set on the newly created entry"
+        );
+        assert!(
+            !created.output_ever_poisoned,
+            "output_ever_poisoned must NOT be set (only input was absent)"
+        );
+
         t.record("b", &payload_opt(Some(100), Some(20)));
         let b1 = t.take().expect("b1");
         assert!(b1.delta_reliable, "B must be unaffected");
@@ -2994,22 +3155,71 @@ mod tests {
         t.begin_turn("a");
         t.record("a", &payload_opt(Some(80), Some(15)));
         let _a1 = t.take().expect("a1");
-        // First turn is unreliable with or without the fix (no baseline) — not
-        // a useful distinguishing assertion.
 
-        // ── A's second turn: a new present snapshot at 150/25 ──
-        // Without the latch the cross-session absence was never committed, so
-        // `input_ever_poisoned` is false on A's entry; take() only poisons from
-        // a1's cumulative field (which is Some(80)) → delta_reliable would flip
-        // to true here, healing the unknown prefix.
-        // With the latch the committed `input_ever_poisoned` flag is true from
-        // the cross-session notification → delta_reliable must stay false.
+        // ── A's second turn: with the fix, `input_ever_poisoned` was committed
+        // by take() above; without it, the flag would be false and delta heals. ──
         t.begin_turn("a");
         t.record("a", &payload_opt(Some(150), Some(25)));
         let a2 = t.take().expect("a2");
         assert!(
             !a2.delta_reliable,
             "A second turn must be poisoned: input absence from cross-session notification must hold even with no prior entry"
+        );
+    }
+
+    /// Un-baselined variant (output-absent): symmetric mirror of the input-absent
+    /// case above.  A has no entry; a cross-session notification with output absent
+    /// creates an entry with only `output_ever_poisoned = true`; the poison holds
+    /// through A's second real turn.
+    #[test]
+    fn cross_session_absent_notification_latches_poison_unbaselined_output() {
+        let mut t = UsageTracker::default();
+        t.seed_zero_baseline("b");
+        assert!(
+            t.sessions.get("a").is_none(),
+            "A must have no entry before the cross-session record"
+        );
+
+        // ── B in-flight; A notification arrives with output absent ──
+        t.begin_turn("b");
+        t.record("a", &payload_opt(Some(5), None)); // output absent
+
+        // Entry must now exist with exactly the right shape.
+        let created = t
+            .sessions
+            .get("a")
+            .expect("latch must create an entry for A");
+        assert_eq!(created.published_seq, 0, "created entry has zero seq");
+        assert!(created.last_input.is_none());
+        assert!(created.last_output.is_none());
+        assert!(created.last_cost.is_none());
+        assert!(created.last_total.is_none());
+        assert!(created.last_cached_input.is_none());
+        assert!(created.last_cache_write.is_none());
+        assert!(
+            !created.input_ever_poisoned,
+            "input_ever_poisoned must NOT be set (only output was absent)"
+        );
+        assert!(
+            created.output_ever_poisoned,
+            "output_ever_poisoned must be set on the newly created entry"
+        );
+
+        t.record("b", &payload_opt(Some(100), Some(20)));
+        let b1 = t.take().expect("b1");
+        assert!(b1.delta_reliable, "B must be unaffected");
+
+        // ── A first and second real turns ──
+        t.begin_turn("a");
+        t.record("a", &payload_opt(Some(80), Some(15)));
+        let _a1 = t.take().expect("a1");
+
+        t.begin_turn("a");
+        t.record("a", &payload_opt(Some(150), Some(25)));
+        let a2 = t.take().expect("a2");
+        assert!(
+            !a2.delta_reliable,
+            "A second turn must be poisoned: output absence from cross-session notification must hold even with no prior entry"
         );
     }
 }
