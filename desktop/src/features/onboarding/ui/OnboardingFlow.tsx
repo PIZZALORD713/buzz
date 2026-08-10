@@ -170,6 +170,7 @@ export function OnboardingFlow({
   );
   const [keyImportStage, setKeyImportStage] =
     React.useState<NostrKeyImportStage>("key-entry");
+  const [isKeyImporting, setIsKeyImporting] = React.useState(false);
   const [keyImportFormKey, setKeyImportFormKey] = React.useState(0);
   const [profileDraft, setProfileDraft] =
     React.useState<OnboardingProfileValues>(savedProfile);
@@ -460,6 +461,7 @@ export function OnboardingFlow({
                 : identityLost
                   ? "Start new identity"
                   : "Back",
+            disabled: isKeyImporting,
             onClick: handleKeyImportBack,
           }
         : currentPage === "avatar"
@@ -604,6 +606,7 @@ export function OnboardingFlow({
                   key={keyImportFormKey}
                   onBack={handleKeyImportBack}
                   onImport={importExistingKey}
+                  onImportingChange={setIsKeyImporting}
                   onStageChange={setKeyImportStage}
                   showBack={false}
                   showPasswordStageBack={false}

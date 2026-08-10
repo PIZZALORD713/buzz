@@ -32,6 +32,10 @@ export const ENTRANCE_TRANSITION = {
   ease: [0.23, 1, 0.32, 1],
 } as const;
 
+/**
+ * Builds the composite animated-avatar URL and starts a temporary local-poster
+ * presentation while the uploaded poster and animation become available.
+ */
 export function presentAnimatedAvatar(
   poster: { url: string },
   animation: { url: string },

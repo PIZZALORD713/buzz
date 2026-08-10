@@ -804,6 +804,31 @@ test("first-launch key import continues to machine setup", async ({ page }) => {
   await expect(page.getByTestId("app-loading-gate")).toHaveCount(0);
 });
 
+test("key import locks host navigation and ignores rapid duplicate submits", async ({
+  page,
+}) => {
+  await installMockBridge(
+    page,
+    { identityImportDelayMs: 500 },
+    {
+      skipCommunitySeed: true,
+      skipOnboardingSeed: true,
+    },
+  );
+  await page.goto("/");
+
+  await page.getByRole("button", { name: "Use an existing key" }).click();
+  const importedNsec = nsecEncode(hexToBytes(TEST_IDENTITIES.alice.privateKey));
+  await page.getByTestId("nostr-import-nsec-input").fill(importedNsec);
+  const submit = page.getByTestId("nostr-import-submit");
+  await submit.dblclick({ delay: 0 });
+
+  await expect(submit).toBeDisabled();
+  await expect(page.getByTestId("onboarding-back")).toBeDisabled();
+  await expect.poll(() => commandCount(page, "import_identity")).toBe(1);
+  await expect(page.getByTestId("onboarding-page-2")).toBeVisible();
+});
+
 test("imported-key users can skip out of harness setup", async ({ page }) => {
   // Regression: importing an existing key sets the onboarding state machine's
   // "continuing" marker, which pinned the stage to onboarding even after
@@ -2262,6 +2287,21 @@ test("connected first-community profile keeps Back bottom-left and balances the 
     .poll(() => avatarDialog.evaluate((element) => element.clientHeight))
     .toBe(selectedEmojiDialogHeight);
   await page.getByRole("tab", { name: "Image" }).click();
+  await page.getByTestId("community-avatar-input").setInputFiles({
+    buffer: Buffer.from(ONE_PIXEL_PNG_BASE64, "base64"),
+    mimeType: "image/png",
+    name: "emoji-replacement.png",
+  });
+  await expect(
+    page.getByTestId("community-avatar-live-preview-image"),
+  ).toHaveAttribute("src", /^blob:/);
+  await expect
+    .poll(() =>
+      page
+        .getByTestId("community-avatar-live-preview-image")
+        .getAttribute("src"),
+    )
+    .not.toMatch(/^blob:/);
   await expect
     .poll(() => avatarDialog.evaluate((element) => element.clientHeight))
     .toBe(imageDialogHeight);

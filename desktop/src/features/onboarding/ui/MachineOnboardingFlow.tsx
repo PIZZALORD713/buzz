@@ -93,6 +93,7 @@ export function MachineOnboardingFlow({
   const [identityWasImported, setIdentityWasImported] = React.useState(false);
   const [keyImportStage, setKeyImportStage] =
     React.useState<NostrKeyImportStage>("key-entry");
+  const [isKeyImporting, setIsKeyImporting] = React.useState(false);
   const [keyImportFormKey, setKeyImportFormKey] = React.useState(0);
   const [keyImportDialog, setKeyImportDialog] = React.useState<
     "backup" | "phone" | null
@@ -254,7 +255,7 @@ export function MachineOnboardingFlow({
   const chromeBackAction =
     page === "key-import" &&
     (!identityLost || keyImportStage === "backup-password")
-      ? { onClick: backFromKeyImport }
+      ? { disabled: isKeyImporting, onClick: backFromKeyImport }
       : page === "backup" && backupSubview !== "created"
         ? {
             label: "Return to onboarding",
@@ -412,6 +413,7 @@ export function MachineOnboardingFlow({
                     key={keyImportFormKey}
                     onBack={backFromKeyImport}
                     onImport={importExistingIdentity}
+                    onImportingChange={setIsKeyImporting}
                     onStageChange={setKeyImportStage}
                     showBack={false}
                     showPasswordStageBack={false}
@@ -420,6 +422,7 @@ export function MachineOnboardingFlow({
                   {identityLost && keyImportStage === "key-entry" ? (
                     <Button
                       className={`${ONBOARDING_SECONDARY_CTA_CLASS} mt-2 px-5`}
+                      disabled={isPending || isKeyImporting}
                       onClick={() => void replaceLostIdentity()}
                       type="button"
                       variant="ghost"

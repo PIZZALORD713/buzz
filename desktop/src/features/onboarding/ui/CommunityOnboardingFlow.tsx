@@ -666,6 +666,18 @@ export function CommunityOnboardingFlow({
                           {isAnimatedPreviewActive
                             ? null
                             : (() => {
+                                if (localAvatarPreviewUrl) {
+                                  return (
+                                    <ProfileAvatar
+                                      avatarUrl={localAvatarPreviewUrl}
+                                      className="h-full w-full rounded-full text-5xl"
+                                      label={
+                                        displayName.trim() || "Your profile"
+                                      }
+                                      testId="community-avatar-live-preview"
+                                    />
+                                  );
+                                }
                                 const emojiAvatar =
                                   parseEmojiAvatarDataUrl(avatarUrl);
                                 return emojiAvatar ? (
