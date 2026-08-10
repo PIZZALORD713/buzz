@@ -4227,7 +4227,6 @@ mod tests {
             &client,
             &url,
             &serde_json::json!({}),
-            false,
             Duration::from_secs(5),
             |b| b,
         )
@@ -4291,7 +4290,6 @@ mod tests {
             &client,
             &url,
             &serde_json::json!({}),
-            false,
             Duration::from_secs(5),
             |b| b,
         )
