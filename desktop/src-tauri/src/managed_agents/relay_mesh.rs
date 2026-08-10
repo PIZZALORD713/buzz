@@ -4,12 +4,30 @@ pub const RELAY_MESH_PROVIDER_ID: &str = "relay-mesh";
 /// Stored value for "let the mesh decide", kept as the user-facing word.
 pub const RELAY_MESH_AUTO_MODEL_ID: &str = "auto";
 /// MeshLLM's virtual model. It resolves per request: a Mixture-of-Agents
-/// committee when two or more workers are reachable, a single served model when
-/// they are not (`moa_gateway::degrade_to_single_model`). Sending it is always
-/// safe, so Buzz translates the stored `auto` into it here rather than teaching
-/// buzz-agent anything about the mesh.
+/// committee when two or more workers are reachable, and otherwise degrades to
+/// a single served model rather than erroring
+/// (`moa_gateway::degrade_to_single_model`). That degradation is a pre-flight
+/// capacity decision, so a committee that forms and *then* loses a worker still
+/// surfaces as a failed turn — MoA repairs partial results internally
+/// (`repair_tool_result_answer`) before it gets that far. Buzz translates the
+/// stored `auto` here rather than teaching buzz-agent anything about meshes.
 #[cfg(feature = "mesh-llm")]
 pub const RELAY_MESH_VIRTUAL_MODEL_ID: &str = "mesh";
+
+/// The wire name for a stored shared-compute model: `auto` (and a blank legacy
+/// value) means "let the mesh decide" and becomes MeshLLM's virtual `mesh`
+/// model; anything else is a model the user named and is passed through.
+///
+/// The single place this mapping happens. Every consumer that has to name a
+/// model to the mesh — the LLM transport env and the ACP harness — goes through
+/// here, so they cannot disagree.
+#[cfg(feature = "mesh-llm")]
+pub fn relay_mesh_wire_model(stored: &str) -> &str {
+    match stored.trim() {
+        "" | RELAY_MESH_AUTO_MODEL_ID => RELAY_MESH_VIRTUAL_MODEL_ID,
+        named => named,
+    }
+}
 
 /// Translate the native Buzz shared compute provider into the OpenAI-compatible
 /// transport understood by buzz-agent. These are derived runtime details, not
@@ -23,17 +41,7 @@ pub fn apply_relay_mesh_env(
     if provider.map(str::trim) != Some(RELAY_MESH_PROVIDER_ID) {
         return;
     }
-    // The stored model is either a named model or `auto`; `auto` (and a blank
-    // legacy value) becomes MeshLLM's virtual `mesh` model on the wire.
-    let stored = model
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .unwrap_or(RELAY_MESH_AUTO_MODEL_ID);
-    let model = if stored == RELAY_MESH_AUTO_MODEL_ID {
-        RELAY_MESH_VIRTUAL_MODEL_ID.to_string()
-    } else {
-        stored.to_string()
-    };
+    let model = relay_mesh_wire_model(model.unwrap_or(RELAY_MESH_AUTO_MODEL_ID)).to_string();
     env.insert("BUZZ_AGENT_PROVIDER".to_string(), "openai".to_string());
     env.insert("BUZZ_AGENT_MODEL".to_string(), model.clone());
     env.insert(
@@ -165,6 +173,22 @@ mod tests {
         assert_eq!(
             env.get("BUZZ_AGENT_MODEL").map(String::as_str),
             Some(RELAY_MESH_VIRTUAL_MODEL_ID)
+        );
+    }
+
+    /// Every consumer that names a model to the mesh goes through one helper,
+    /// so the LLM transport and the ACP harness cannot be told different things.
+    #[test]
+    fn wire_model_maps_auto_and_blank_but_passes_named_through() {
+        assert_eq!(
+            relay_mesh_wire_model(RELAY_MESH_AUTO_MODEL_ID),
+            RELAY_MESH_VIRTUAL_MODEL_ID
+        );
+        assert_eq!(relay_mesh_wire_model(""), RELAY_MESH_VIRTUAL_MODEL_ID);
+        assert_eq!(relay_mesh_wire_model("  "), RELAY_MESH_VIRTUAL_MODEL_ID);
+        assert_eq!(
+            relay_mesh_wire_model("unsloth/gemma-4-E4B-it-GGUF:Q4_K_M"),
+            "unsloth/gemma-4-E4B-it-GGUF:Q4_K_M"
         );
     }
 
