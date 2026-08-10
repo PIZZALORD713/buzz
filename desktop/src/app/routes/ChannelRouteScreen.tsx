@@ -4,9 +4,15 @@ import { useQueryClient } from "@tanstack/react-query";
 import type { SearchHighlightNavigation } from "@/app/navigation/searchHighlightNavigation";
 import { getCachedSearchHitEvent } from "@/app/navigation/searchHitEventCache";
 import { useAppNavigation } from "@/app/navigation/useAppNavigation";
-import { useChannelsQuery } from "@/features/channels/hooks";
+import { useCanvasQuery, useChannelsQuery } from "@/features/channels/hooks";
 import { useOpenChannelDirectoryQuery } from "@/features/channels/openChannelDirectory";
+import {
+  type ChannelViewMode,
+  resolveChannelViewMode,
+} from "@/features/channels/lib/canvasBoard";
+import { ChannelBoardScreen } from "@/features/channels/ui/ChannelBoardScreen";
 import { ChannelScreen } from "@/features/channels/ui/ChannelScreen";
+import { ChannelViewModeProvider } from "@/features/channels/ui/ChannelViewModeContext";
 import { HuddleStartingView } from "@/features/huddle/components/HuddleStartingView";
 import { huddleWindowChannelId } from "@/features/huddle/lib/huddleWindow";
 import {
@@ -34,6 +40,7 @@ type ChannelRouteScreenProps = {
   autoSendDraftKey: string | null;
   channelId: string;
   searchHighlight: SearchHighlightNavigation | null | undefined;
+  hasStreamRouteIntent: boolean;
   selectedPostId: string | null;
   targetMessageId: string | null;
   targetReplyId: string | null;
@@ -115,6 +122,7 @@ export function ChannelRouteScreen({
   autoSendDraftKey,
   channelId,
   searchHighlight,
+  hasStreamRouteIntent,
   selectedPostId,
   targetMessageId,
   targetReplyId,
@@ -159,6 +167,41 @@ export function ChannelRouteScreen({
   );
   const projectHome =
     enumeratedProjectHome ?? projectHomeLookupQuery.data ?? null;
+  const canvasQuery = useCanvasQuery(
+    activeChannel?.id ?? null,
+    activeChannel !== null && activeChannel.channelType !== "dm",
+  );
+  const [viewSelection, setViewSelection] = React.useState<{
+    channelId: string;
+    mode: ChannelViewMode;
+  } | null>(null);
+  const hasRouteTarget = Boolean(
+    hasStreamRouteIntent ||
+      searchHighlight ||
+      selectedPostId ||
+      targetMessageId ||
+      targetReplyId ||
+      targetThreadRootId,
+  );
+  const explicitView =
+    viewSelection?.channelId === channelId ? viewSelection.mode : null;
+  const channelView = resolveChannelViewMode({
+    channelName: activeChannel?.name ?? null,
+    channelType: activeChannel?.channelType ?? null,
+    explicitView,
+    hasCanvas: Boolean(canvasQuery.data?.content?.trim()),
+    hasRouteTarget,
+  });
+  const handleViewModeChange = React.useCallback(
+    (mode: ChannelViewMode) => setViewSelection({ channelId, mode }),
+    [channelId],
+  );
+
+  React.useEffect(() => {
+    if (hasRouteTarget) {
+      setViewSelection({ channelId, mode: "stream" });
+    }
+  }, [channelId, hasRouteTarget]);
   const [targetMessageEvents, setTargetMessageEvents] = React.useState<
     RelayEvent[]
   >(() => {
@@ -309,23 +352,41 @@ export function ChannelRouteScreen({
   }
 
   return (
-    <ChannelScreen
-      activeChannel={activeChannel}
-      autoSendDraftKey={autoSendDraftKey}
-      currentIdentity={identityQuery.data}
-      currentProfile={profileQuery.data}
-      onCloseForumPost={() => {
-        void closeForumPost(channelId);
+    <ChannelViewModeProvider
+      value={{
+        boardAvailable: channelView.boardAvailable && !hasRouteTarget,
+        mode: channelView.mode,
+        onModeChange: handleViewModeChange,
       }}
-      onSelectForumPost={(postId) => {
-        void goForumPost(channelId, postId);
-      }}
-      selectedForumPostId={selectedPostId}
-      targetForumReplyId={targetReplyId}
-      targetMessageEvents={targetMessageEvents}
-      targetMessageId={targetMessageId}
-      targetSearchMessageId={activeSearchHighlight?.messageId}
-      targetSearchQuery={activeSearchHighlight?.query}
-    />
+    >
+      {channelView.mode === "board" && activeChannel ? (
+        <ChannelBoardScreen
+          canvas={canvasQuery.data}
+          canvasError={canvasQuery.error}
+          canvasLoading={canvasQuery.isLoading}
+          channel={activeChannel}
+          currentPubkey={identityQuery.data?.pubkey}
+        />
+      ) : (
+        <ChannelScreen
+          activeChannel={activeChannel}
+          autoSendDraftKey={autoSendDraftKey}
+          currentIdentity={identityQuery.data}
+          currentProfile={profileQuery.data}
+          onCloseForumPost={() => {
+            void closeForumPost(channelId);
+          }}
+          onSelectForumPost={(postId) => {
+            void goForumPost(channelId, postId);
+          }}
+          selectedForumPostId={selectedPostId}
+          targetForumReplyId={targetReplyId}
+          targetMessageEvents={targetMessageEvents}
+          targetMessageId={targetMessageId}
+          targetSearchMessageId={activeSearchHighlight?.messageId}
+          targetSearchQuery={activeSearchHighlight?.query}
+        />
+      )}
+    </ChannelViewModeProvider>
   );
 }
