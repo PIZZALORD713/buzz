@@ -23,14 +23,6 @@ const DATABRICKS_OAUTH_SCOPES: &[&str] = &["all-apis", "offline_access"];
 const MAX_LLM_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 const MAX_LLM_ERROR_BODY_BYTES: usize = 4 * 1024;
 const STALL_NOTICE_THRESHOLD: std::time::Duration = std::time::Duration::from_secs(300);
-/// Buzz shared compute exposes one virtual model. MeshLLM answers a
-/// `model=mesh` request with a Mixture-of-Agents committee when two or more
-/// workers are reachable, and degrades to a single served model when they are
-/// not (`moa_gateway::degrade_to_single_model`, MeshLLM >= 0.75.0). The agent
-/// can therefore send `mesh` unconditionally instead of probing `/models` and
-/// maintaining a hysteretic view of whether a committee is currently possible.
-const MESH_VIRTUAL_MODEL_ID: &str = "mesh";
-const MESH_AUTO_MODEL_ID: &str = "auto";
 
 /// Parser for an OpenAI-family JSON response. Per-endpoint pair lives
 /// alongside its `_body` serializer.
@@ -339,11 +331,9 @@ impl Llm {
         .map_err(PostError::into_agent)
     }
 
-    /// OpenAI dispatch. Buzz shared compute maps `auto` onto MeshLLM's virtual
-    /// `mesh` model, which MeshLLM itself resolves per request: a
-    /// Mixture-of-Agents committee when two or more workers are reachable, a
-    /// single served model when they are not. No client-side catalog probe or
-    /// hysteresis is needed for that decision.
+    /// OpenAI dispatch. The configured model is sent as given: callers that
+    /// route through a mesh (Buzz shared compute) resolve their own model name
+    /// before spawning the agent, so nothing here needs to know about meshes.
     async fn openai_request<F>(
         &self,
         cfg: &Config,
@@ -353,15 +343,7 @@ impl Llm {
     where
         F: FnMut(bool, &str) -> (Value, OpenAiParse) + Send,
     {
-        let request_model = if cfg.provider == Provider::OpenAi
-            && cfg.prefer_mesh_for_auto
-            && effective_model == MESH_AUTO_MODEL_ID
-        {
-            MESH_VIRTUAL_MODEL_ID
-        } else {
-            effective_model
-        };
-        self.openai_request_for_model(cfg, request_model, &mut build)
+        self.openai_request_for_model(cfg, effective_model, &mut build)
             .await
             .map_err(PostError::into_agent)
     }
@@ -2457,7 +2439,6 @@ mod tests {
             base_url: "http://example.invalid".into(),
             anthropic_api_version: "2023-06-01".into(),
             openai_api: OpenAiApi::Chat,
-            prefer_mesh_for_auto: false,
             hints_enabled: true,
             thinking_effort: None,
             thinking_summary: ThinkingSummary::Auto,
@@ -2629,7 +2610,6 @@ mod tests {
         .await;
         let mut config = cfg(Provider::OpenAi);
         config.base_url = base_url;
-        config.prefer_mesh_for_auto = true;
         let llm = Llm::new(&config).unwrap();
 
         let error = complete_model(&llm, &config, "mesh").await.unwrap_err();
@@ -2647,41 +2627,28 @@ mod tests {
         assert!(requests.iter().all(|request| request.path != "/v1/models"));
     }
 
-    /// Shared-compute `auto` maps straight onto the virtual `mesh` model with
-    /// no catalog probe: MeshLLM decides per request whether that becomes a
-    /// committee or a single served model.
+    /// Whatever model the config names is what goes on the wire -- including
+    /// `auto`, which is a real provider model name for plain OpenAI hosts. A
+    /// caller routing through a mesh resolves its own name before spawning the
+    /// agent, so there is nothing to rewrite here and no catalog to probe.
     #[tokio::test]
-    async fn relay_mesh_auto_sends_mesh_without_probing_the_catalog() {
-        let (base_url, captured) =
-            spawn_sequence_stub(vec![StubHttpResponse::ok(chat_response("ok"))]).await;
-        let mut config = cfg(Provider::OpenAi);
-        config.base_url = base_url;
-        config.prefer_mesh_for_auto = true;
-        let llm = Llm::new(&config).unwrap();
+    async fn the_configured_model_is_sent_verbatim() {
+        for model in ["auto", "mesh", "unsloth/Qwen3-8B-GGUF:Q4_K_M"] {
+            let (base_url, captured) =
+                spawn_sequence_stub(vec![StubHttpResponse::ok(chat_response("ok"))]).await;
+            let mut config = cfg(Provider::OpenAi);
+            config.base_url = base_url;
+            let llm = Llm::new(&config).unwrap();
 
-        let response = complete_model(&llm, &config, "auto").await.unwrap();
-        assert_eq!(response.text, "ok");
-        let requests = captured.lock().await;
-        assert_eq!(posted_models(&requests), vec!["mesh"]);
-        assert!(requests.iter().all(|request| request.path != "/v1/models"));
-    }
-
-    /// Without shared compute, `auto` is a real provider model name and must
-    /// never be rewritten to the mesh virtual model.
-    #[tokio::test]
-    async fn plain_openai_auto_is_left_alone() {
-        let (base_url, captured) =
-            spawn_sequence_stub(vec![StubHttpResponse::ok(chat_response("ok"))]).await;
-        let mut config = cfg(Provider::OpenAi);
-        config.base_url = base_url;
-        config.prefer_mesh_for_auto = false;
-        let llm = Llm::new(&config).unwrap();
-
-        let response = complete_model(&llm, &config, "auto").await.unwrap();
-        assert_eq!(response.text, "ok");
-        let requests = captured.lock().await;
-        assert_eq!(posted_models(&requests), vec!["auto"]);
-        assert!(requests.iter().all(|request| request.path != "/v1/models"));
+            let response = complete_model(&llm, &config, model).await.unwrap();
+            assert_eq!(response.text, "ok");
+            let requests = captured.lock().await;
+            assert_eq!(posted_models(&requests), vec![model]);
+            assert!(
+                requests.iter().all(|request| request.path != "/v1/models"),
+                "no catalog probe belongs on this path"
+            );
+        }
     }
 
     fn image_history() -> Vec<HistoryItem> {
