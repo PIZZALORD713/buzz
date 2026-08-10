@@ -595,6 +595,12 @@ fn mesh_readiness_failure_message(
 /// `HTTP 429`, so the UI can tell "still warming up" apart from "can't reach
 /// the host".
 async fn wait_for_mesh_inference(model_id: &str) -> CmdResult<()> {
+    // Probe the name that will actually be requested. Callers pass a stored
+    // value, which for shared-compute `auto` is not a model the mesh
+    // advertises: probing it would validate a route no agent uses, and could
+    // fail readiness while the real route works. Named models pass through
+    // unchanged, so this is safe for the serve-side callers too.
+    let model_id = crate::managed_agents::relay_mesh_wire_model(model_id);
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
         .build()
