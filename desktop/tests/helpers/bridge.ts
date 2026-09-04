@@ -290,6 +290,7 @@ type MockBridgeOptions = {
   canvas?: {
     author?: string | null;
     content: string | null;
+    eventId?: string | null;
     updatedAt?: number | null;
   };
   canvasReadError?: string;

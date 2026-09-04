@@ -373,6 +373,7 @@ type E2eConfig = {
     canvas?: {
       author?: string | null;
       content: string | null;
+      eventId?: string | null;
       updatedAt?: number | null;
     };
     canvasReadError?: string;
@@ -14670,16 +14671,28 @@ export function maybeInstallE2eTauriMocks() {
         // returning null mirrors the Rust submit_event success path.
         return null;
       case "set_canvas": {
-        const input = payload as { content: string };
+        const input = payload as {
+          content: string;
+          enforceRevision?: boolean;
+          expectedEventId?: string | null;
+        };
+        const currentEventId = activeConfig?.mock?.canvas?.eventId ?? null;
+        if (input.enforceRevision && input.expectedEventId !== currentEventId) {
+          throw new Error(
+            "Canvas revision conflict: the board changed before this save.",
+          );
+        }
+        const eventId = mockEventId();
         if (activeConfig) {
           activeConfig.mock ??= {};
           activeConfig.mock.canvas = {
             author: identity?.pubkey ?? null,
             content: input.content,
+            eventId,
             updatedAt: Math.floor(Date.now() / 1_000),
           };
         }
-        return { ok: true, event_id: mockEventId() };
+        return { ok: true, event_id: eventId };
       }
       case "get_canvas": {
         const canvasReadError = activeConfig?.mock?.canvasReadError;
@@ -14689,6 +14702,7 @@ export function maybeInstallE2eTauriMocks() {
         const canvas = activeConfig?.mock?.canvas;
         return {
           content: canvas?.content ?? null,
+          event_id: canvas?.eventId ?? null,
           updated_at: canvas?.updatedAt ?? null,
           author: canvas?.author ?? null,
         };

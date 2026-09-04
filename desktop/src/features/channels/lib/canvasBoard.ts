@@ -1,5 +1,6 @@
 import type { ChannelType } from "@/shared/api/types";
 import { channelNamesMatch } from "@/features/channels/lib/canonicalChannelName";
+import { getStorageItem, setStorageItem } from "@/shared/lib/safeStorage";
 
 export type CanvasBoardCardKind =
   | "artifact"
@@ -9,11 +10,28 @@ export type CanvasBoardCardKind =
   | "people"
   | "welcome";
 
+export type CanvasBoardCardType =
+  | "agent"
+  | "artifact"
+  | "conversation"
+  | "decision"
+  | "note"
+  | "person"
+  | "project"
+  | "task";
+
+export type CanvasBoardCardStatus = "backlog" | "doing" | "done";
+
 export type CanvasBoardCard = {
+  author: string | null;
   body: string;
+  hasExplicitMetadata: boolean;
   id: string;
   kind: CanvasBoardCardKind;
+  status: CanvasBoardCardStatus;
+  threadId: string | null;
   title: string;
+  type: CanvasBoardCardType;
 };
 
 export type CanvasBoard = {
@@ -23,16 +41,57 @@ export type CanvasBoard = {
 };
 
 export type CanvasBoardCardDraft = {
+  author?: string | null;
   body: string;
+  id?: string;
+  status?: CanvasBoardCardStatus;
+  threadId?: string | null;
   title: string;
+  type?: CanvasBoardCardType;
 };
 
 export type ChannelViewMode = "board" | "stream";
+
+const CHANNEL_VIEW_MODE_STORAGE_PREFIX = "buzz.channelViewMode.v1";
 
 const H1_PATTERN = /^#\s+(.+?)\s*#*\s*$/u;
 const H2_PATTERN = /^##\s+(.+?)\s*#*\s*$/u;
 const FENCE_OPEN_PATTERN = /^ {0,3}(`{3,}|~{3,})/u;
 const FENCE_CLOSE_PATTERN = /^ {0,3}(`{3,}|~{3,})[ \t]*$/u;
+const CARD_METADATA_PATTERN =
+  /^\s*<!--\s*buzz-board-card\s+(\{.*\})\s*-->\s*$/u;
+const CARD_ID_PATTERN = /^[a-zA-Z0-9][a-zA-Z0-9._:-]{0,127}$/u;
+const EVENT_ID_PATTERN = /^[0-9a-f]{64}$/u;
+
+const CARD_TYPES = new Set<CanvasBoardCardType>([
+  "agent",
+  "artifact",
+  "conversation",
+  "decision",
+  "note",
+  "person",
+  "project",
+  "task",
+]);
+const CARD_STATUSES = new Set<CanvasBoardCardStatus>([
+  "backlog",
+  "doing",
+  "done",
+]);
+
+type CanvasBoardCardMetadata = {
+  author: string | null;
+  id: string | null;
+  status: CanvasBoardCardStatus | null;
+  threadId: string | null;
+  type: CanvasBoardCardType | null;
+};
+
+type ParsedCanvasBoardSection = {
+  body: string;
+  hasExplicitMetadata: boolean;
+  metadata: CanvasBoardCardMetadata;
+};
 
 type CanvasBoardSourceSection = {
   bodyLines: string[];
@@ -53,6 +112,113 @@ function cardId(title: string, index: number): string {
     .replace(/[^a-z0-9]+/gu, "-")
     .replace(/^-|-$/gu, "");
   return `${slug || "card"}-${index + 1}`;
+}
+
+function isStringRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function optionalString(value: unknown): string | null {
+  return typeof value === "string" && value.trim().length > 0
+    ? value.trim()
+    : null;
+}
+
+function parseCardMetadataLine(line: string): CanvasBoardCardMetadata | null {
+  const match = line.match(CARD_METADATA_PATTERN);
+  if (!match) {
+    return null;
+  }
+
+  try {
+    const parsed: unknown = JSON.parse(match[1]);
+    if (!isStringRecord(parsed)) {
+      return null;
+    }
+    const id = optionalString(parsed.id);
+    const type = optionalString(parsed.type);
+    const status = optionalString(parsed.status);
+    const threadId = optionalString(parsed.thread);
+    const author = optionalString(parsed.author);
+    return {
+      author,
+      id: id && CARD_ID_PATTERN.test(id) ? id : null,
+      status:
+        status && CARD_STATUSES.has(status as CanvasBoardCardStatus)
+          ? (status as CanvasBoardCardStatus)
+          : null,
+      threadId:
+        threadId && EVENT_ID_PATTERN.test(threadId.toLowerCase())
+          ? threadId.toLowerCase()
+          : null,
+      type:
+        type && CARD_TYPES.has(type as CanvasBoardCardType)
+          ? (type as CanvasBoardCardType)
+          : null,
+    };
+  } catch {
+    return null;
+  }
+}
+
+function parseCanvasBoardSection(
+  section: CanvasBoardSourceSection,
+): ParsedCanvasBoardSection {
+  const bodyLines = [...section.bodyLines];
+  const metadataLineIndex = bodyLines.findIndex(
+    (line) => line.trim().length > 0,
+  );
+  if (metadataLineIndex === -1) {
+    return {
+      body: "",
+      hasExplicitMetadata: false,
+      metadata: {
+        author: null,
+        id: null,
+        status: null,
+        threadId: null,
+        type: null,
+      },
+    };
+  }
+
+  const metadata = parseCardMetadataLine(bodyLines[metadataLineIndex]);
+  if (!metadata) {
+    return {
+      body: bodyLines.join("\n").trim(),
+      hasExplicitMetadata: false,
+      metadata: {
+        author: null,
+        id: null,
+        status: null,
+        threadId: null,
+        type: null,
+      },
+    };
+  }
+
+  bodyLines.splice(metadataLineIndex, 1);
+  return {
+    body: bodyLines.join("\n").trim(),
+    hasExplicitMetadata: true,
+    metadata,
+  };
+}
+
+function serializeCardMetadata(metadata: {
+  author?: string | null;
+  id: string;
+  status: CanvasBoardCardStatus;
+  threadId?: string | null;
+  type: CanvasBoardCardType;
+}): string {
+  return `<!-- buzz-board-card ${JSON.stringify({
+    id: metadata.id,
+    type: metadata.type,
+    status: metadata.status,
+    ...(metadata.threadId ? { thread: metadata.threadId } : {}),
+    ...(metadata.author ? { author: metadata.author } : {}),
+  })} -->`;
 }
 
 export function classifyCanvasBoardCard(title: string): CanvasBoardCardKind {
@@ -76,6 +242,42 @@ export function classifyCanvasBoardCard(title: string): CanvasBoardCardKind {
     return "welcome";
   }
   return "note";
+}
+
+export function classifyCanvasBoardCardType(
+  title: string,
+): CanvasBoardCardType {
+  const normalizedTitle = title.toLowerCase();
+  if (/\b(agent|bot|berd)\b/u.test(normalizedTitle)) return "agent";
+  if (/\b(person|people|member|steward|contributor)\b/u.test(normalizedTitle)) {
+    return "person";
+  }
+  if (/\b(decision|decide|approved|verdict)\b/u.test(normalizedTitle)) {
+    return "decision";
+  }
+  if (/\b(conversation|discussion|thread|work room)\b/u.test(normalizedTitle)) {
+    return "conversation";
+  }
+  if (/\b(project|initiative|program|campaign)\b/u.test(normalizedTitle)) {
+    return "project";
+  }
+  if (/\b(finished|made|shipped|artifact|showcase)\b/u.test(normalizedTitle)) {
+    return "artifact";
+  }
+  if (
+    /\b(task|todo|to-do|help|join|next|action|now|today|week|current|active)\b/u.test(
+      normalizedTitle,
+    )
+  ) {
+    return "task";
+  }
+  return "note";
+}
+
+function inferredCardStatus(kind: CanvasBoardCardKind): CanvasBoardCardStatus {
+  if (kind === "artifact") return "done";
+  if (kind === "now") return "doing";
+  return "backlog";
 }
 
 function parseCanvasBoardSource(content: string): CanvasBoardSource {
@@ -157,12 +359,23 @@ function serializeCanvasBoardSource(source: CanvasBoardSource): string {
 function canvasBoardCardsFromSource(
   source: CanvasBoardSource,
 ): CanvasBoardCard[] {
-  return source.sections.map((section, index) => ({
-    body: section.bodyLines.join("\n").trim(),
-    id: cardId(section.title, index),
-    kind: classifyCanvasBoardCard(section.title),
-    title: section.title,
-  }));
+  return source.sections.map((section, index) => {
+    const parsedSection = parseCanvasBoardSection(section);
+    const kind = classifyCanvasBoardCard(section.title);
+    return {
+      author: parsedSection.metadata.author,
+      body: parsedSection.body,
+      hasExplicitMetadata: parsedSection.hasExplicitMetadata,
+      id: parsedSection.metadata.id ?? cardId(section.title, index),
+      kind,
+      status: parsedSection.metadata.status ?? inferredCardStatus(kind),
+      threadId: parsedSection.metadata.threadId,
+      title: section.title,
+      type:
+        parsedSection.metadata.type ??
+        classifyCanvasBoardCardType(section.title),
+    };
+  });
 }
 
 /**
@@ -176,10 +389,15 @@ export function parseCanvasBoard(content: string): CanvasBoard {
 
   if (cards.length === 0 && introduction.length > 0) {
     cards.push({
+      author: null,
       body: introduction,
+      hasExplicitMetadata: false,
       id: "overview-1",
       kind: "welcome",
+      status: "backlog",
+      threadId: null,
       title: "Overview",
+      type: "note",
     });
   }
 
@@ -217,8 +435,21 @@ export function appendCanvasBoardCard(
   draft: CanvasBoardCardDraft,
 ): string {
   const source = parseCanvasBoardSource(content);
+  const type = draft.type ?? classifyCanvasBoardCardType(draft.title);
+  const status = draft.status ?? "backlog";
+  const id = draft.id ?? cardId(draft.title, source.sections.length);
   source.sections.push({
-    bodyLines: draft.body.trim().split("\n"),
+    bodyLines: [
+      serializeCardMetadata({
+        author: draft.author,
+        id,
+        status,
+        threadId: draft.threadId,
+        type,
+      }),
+      "",
+      ...draft.body.trim().split("\n"),
+    ],
     headingLine: `## ${draft.title.trim()}`,
     title: draft.title.trim(),
   });
@@ -241,7 +472,17 @@ export function updateCanvasBoardCard(
     );
     source.introductionLines = [];
     source.sections.push({
-      bodyLines: draft.body.trim().split("\n"),
+      bodyLines: [
+        serializeCardMetadata({
+          author: draft.author,
+          id: draft.id ?? cardId(draft.title, 0),
+          status: draft.status ?? "backlog",
+          threadId: draft.threadId,
+          type: draft.type ?? classifyCanvasBoardCardType(draft.title),
+        }),
+        "",
+        ...draft.body.trim().split("\n"),
+      ],
       headingLine: `## ${draft.title.trim()}`,
       title: draft.title.trim(),
     });
@@ -255,10 +496,73 @@ export function updateCanvasBoardCard(
     return null;
   }
 
-  section.bodyLines = draft.body.trim().split("\n");
+  const currentCard = cards[sectionIndex];
+  section.bodyLines = [
+    serializeCardMetadata({
+      author: draft.author ?? currentCard.author,
+      id: draft.id ?? currentCard.id,
+      status: draft.status ?? currentCard.status,
+      threadId:
+        draft.threadId === undefined ? currentCard.threadId : draft.threadId,
+      type: draft.type ?? currentCard.type,
+    }),
+    "",
+    ...draft.body.trim().split("\n"),
+  ];
   section.headingLine = `## ${draft.title.trim()}`;
   section.title = draft.title.trim();
   return serializeCanvasBoardSource(source);
+}
+
+export function updateCanvasBoardCardMetadata(
+  content: string,
+  cardIdToUpdate: string,
+  patch: Partial<{
+    author: string | null;
+    status: CanvasBoardCardStatus;
+    threadId: string | null;
+    type: CanvasBoardCardType;
+  }>,
+): string | null {
+  const source = parseCanvasBoardSource(content);
+  const cards = canvasBoardCardsFromSource(source);
+  const sectionIndex = cards.findIndex((card) => card.id === cardIdToUpdate);
+  const section = source.sections[sectionIndex];
+  const card = cards[sectionIndex];
+  if (!section || !card) {
+    return null;
+  }
+
+  section.bodyLines = [
+    serializeCardMetadata({
+      author: patch.author === undefined ? card.author : patch.author,
+      id: card.id,
+      status: patch.status ?? card.status,
+      threadId: patch.threadId === undefined ? card.threadId : patch.threadId,
+      type: patch.type ?? card.type,
+    }),
+    "",
+    ...card.body.split("\n"),
+  ];
+  return serializeCanvasBoardSource(source);
+}
+
+export function canvasBoardCardConversationMarker(cardId: string): string {
+  return `magic-board-card:${cardId}`;
+}
+
+export function buildCanvasBoardCardConversationOpener(
+  card: CanvasBoardCard,
+  channelName: string,
+): string {
+  const body = card.body.trim();
+  return [
+    `## ${card.title}`,
+    body,
+    `_Conversation attached to the ${channelName} board._`,
+  ]
+    .filter((part) => part.length > 0)
+    .join("\n\n");
 }
 
 export function reorderCanvasBoardCard(
@@ -306,4 +610,22 @@ export function resolveChannelViewMode(input: {
     boardAvailable,
     mode: input.explicitView ?? (isDispatch ? "board" : "stream"),
   };
+}
+
+export function channelViewModeStorageKey(channelId: string): string {
+  return `${CHANNEL_VIEW_MODE_STORAGE_PREFIX}:${channelId}`;
+}
+
+export function readStoredChannelViewMode(
+  channelId: string,
+): ChannelViewMode | null {
+  const value = getStorageItem(channelViewModeStorageKey(channelId));
+  return value === "board" || value === "stream" ? value : null;
+}
+
+export function writeStoredChannelViewMode(
+  channelId: string,
+  mode: ChannelViewMode,
+): boolean {
+  return setStorageItem(channelViewModeStorageKey(channelId), mode);
 }

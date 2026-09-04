@@ -4,11 +4,17 @@ import { useQueryClient } from "@tanstack/react-query";
 import type { SearchHighlightNavigation } from "@/app/navigation/searchHighlightNavigation";
 import { getCachedSearchHitEvent } from "@/app/navigation/searchHitEventCache";
 import { useAppNavigation } from "@/app/navigation/useAppNavigation";
-import { useCanvasQuery, useChannelsQuery } from "@/features/channels/hooks";
+import {
+  useCanvasQuery,
+  useCanvasSubscription,
+  useChannelsQuery,
+} from "@/features/channels/hooks";
 import { useOpenChannelDirectoryQuery } from "@/features/channels/openChannelDirectory";
 import {
   type ChannelViewMode,
+  readStoredChannelViewMode,
   resolveChannelViewMode,
+  writeStoredChannelViewMode,
 } from "@/features/channels/lib/canvasBoard";
 import { ChannelBoardScreen } from "@/features/channels/ui/ChannelBoardScreen";
 import { ChannelScreen } from "@/features/channels/ui/ChannelScreen";
@@ -171,6 +177,10 @@ export function ChannelRouteScreen({
     activeChannel?.id ?? null,
     activeChannel !== null && activeChannel.channelType !== "dm",
   );
+  useCanvasSubscription(
+    activeChannel?.id ?? null,
+    activeChannel !== null && activeChannel.channelType !== "dm",
+  );
   const [viewSelection, setViewSelection] = React.useState<{
     channelId: string;
     mode: ChannelViewMode;
@@ -184,7 +194,9 @@ export function ChannelRouteScreen({
       targetThreadRootId,
   );
   const explicitView =
-    viewSelection?.channelId === channelId ? viewSelection.mode : null;
+    viewSelection?.channelId === channelId
+      ? viewSelection.mode
+      : readStoredChannelViewMode(channelId);
   const channelView = resolveChannelViewMode({
     channelName: activeChannel?.name ?? null,
     channelType: activeChannel?.channelType ?? null,
@@ -193,15 +205,12 @@ export function ChannelRouteScreen({
     hasRouteTarget,
   });
   const handleViewModeChange = React.useCallback(
-    (mode: ChannelViewMode) => setViewSelection({ channelId, mode }),
+    (mode: ChannelViewMode) => {
+      setViewSelection({ channelId, mode });
+      writeStoredChannelViewMode(channelId, mode);
+    },
     [channelId],
   );
-
-  React.useEffect(() => {
-    if (hasRouteTarget) {
-      setViewSelection({ channelId, mode: "stream" });
-    }
-  }, [channelId, hasRouteTarget]);
   const [targetMessageEvents, setTargetMessageEvents] = React.useState<
     RelayEvent[]
   >(() => {

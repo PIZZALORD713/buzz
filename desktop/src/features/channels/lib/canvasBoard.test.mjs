@@ -3,11 +3,15 @@ import test from "node:test";
 
 import {
   appendCanvasBoardCard,
+  buildCanvasBoardCardConversationOpener,
+  canvasBoardCardConversationMarker,
   classifyCanvasBoardCard,
+  classifyCanvasBoardCardType,
   parseCanvasBoard,
   reorderCanvasBoardCard,
   resolveChannelViewMode,
   updateCanvasBoardCard,
+  updateCanvasBoardCardMetadata,
   validateCanvasBoardCardDraft,
 } from "./canvasBoard.ts";
 
@@ -88,19 +92,43 @@ test("parseCanvasBoard falls back to one overview card", () => {
 
   assert.equal(board.title, "A small room");
   assert.equal(board.introduction, "");
-  assert.deepEqual(board.cards, [
-    {
-      body: "Everything useful lives here.",
-      id: "overview-1",
-      kind: "welcome",
-      title: "Overview",
-    },
-  ]);
+  assert.deepEqual(
+    board.cards.map(({ body, id, kind, status, threadId, title, type }) => ({
+      body,
+      id,
+      kind,
+      status,
+      threadId,
+      title,
+      type,
+    })),
+    [
+      {
+        body: "Everything useful lives here.",
+        id: "overview-1",
+        kind: "welcome",
+        status: "backlog",
+        threadId: null,
+        title: "Overview",
+        type: "note",
+      },
+    ],
+  );
 });
 
 test("classifyCanvasBoardCard keeps stewardship language visible", () => {
   assert.equal(classifyCanvasBoardCard("People and stewards"), "people");
   assert.equal(classifyCanvasBoardCard("Source and story boundary"), "note");
+});
+
+test("classifyCanvasBoardCardType recognizes native workflow cards", () => {
+  assert.equal(
+    classifyCanvasBoardCardType("Decision: use one source"),
+    "decision",
+  );
+  assert.equal(classifyCanvasBoardCardType("Ora Mirror project"), "project");
+  assert.equal(classifyCanvasBoardCardType("Agent: Fizz"), "agent");
+  assert.equal(classifyCanvasBoardCardType("A plain thought"), "note");
 });
 
 test("appendCanvasBoardCard preserves the board preamble and adds one card", () => {
@@ -114,8 +142,12 @@ Read the welcome.
 `;
 
   const updated = appendCanvasBoardCard(content, {
+    author: "a".repeat(64),
     body: "Bring one seed.",
+    id: "fresh-card-id",
+    status: "doing",
     title: "Next action",
+    type: "task",
   });
   const board = parseCanvasBoard(updated);
 
@@ -128,6 +160,11 @@ Read the welcome.
       { body: "Bring one seed.", title: "Next action" },
     ],
   );
+  assert.match(updated, /<!-- buzz-board-card /u);
+  assert.equal(board.cards[1].id, "fresh-card-id");
+  assert.equal(board.cards[1].type, "task");
+  assert.equal(board.cards[1].status, "doing");
+  assert.equal(board.cards[1].author, "a".repeat(64));
 });
 
 test("updateCanvasBoardCard edits only the selected source section", () => {
@@ -220,6 +257,64 @@ Keep this too.
   );
   assert.match(board.cards[1].body, /## Not a card/u);
   assert.match(board.cards[2].body, /Ship the proof/u);
+});
+
+test("card metadata gives cards durable identity, workflow state, and a thread", () => {
+  const threadId = "b".repeat(64);
+  const content = `# Dispatch
+
+## Ship the proof
+<!-- buzz-board-card {"id":"card-123","type":"task","status":"doing","thread":"${threadId}","author":"author-pubkey"} -->
+
+Keep the visible body clean.
+`;
+
+  const [card] = parseCanvasBoard(content).cards;
+  assert.equal(card.id, "card-123");
+  assert.equal(card.type, "task");
+  assert.equal(card.status, "doing");
+  assert.equal(card.threadId, threadId);
+  assert.equal(card.author, "author-pubkey");
+  assert.equal(card.body, "Keep the visible body clean.");
+  assert.equal(card.hasExplicitMetadata, true);
+});
+
+test("metadata updates preserve the human Markdown and materialize legacy cards", () => {
+  const threadId = "c".repeat(64);
+  const content = `# Dispatch
+
+## Next action
+
+Ship the proof.
+`;
+  const updated = updateCanvasBoardCardMetadata(content, "next-action-1", {
+    status: "done",
+    threadId,
+    type: "decision",
+  });
+  assert.ok(updated);
+
+  const [card] = parseCanvasBoard(updated).cards;
+  assert.equal(card.id, "next-action-1");
+  assert.equal(card.type, "decision");
+  assert.equal(card.status, "done");
+  assert.equal(card.threadId, threadId);
+  assert.equal(card.body, "Ship the proof.");
+  assert.match(updated, /<!-- buzz-board-card /u);
+});
+
+test("card conversations use a deterministic marker and readable opener", () => {
+  const [card] = parseCanvasBoard(
+    "## Decide next step\n\nChoose the small loop.\n",
+  ).cards;
+  assert.equal(
+    canvasBoardCardConversationMarker(card.id),
+    "magic-board-card:decide-next-step-1",
+  );
+  assert.equal(
+    buildCanvasBoardCardConversationOpener(card, "Dispatch"),
+    "## Decide next step\n\nChoose the small loop.\n\n_Conversation attached to the Dispatch board._",
+  );
 });
 
 test("canvas card draft validation rejects nested level-two card headings", () => {
